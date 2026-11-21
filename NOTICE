@@ -1,0 +1,43 @@
+Dubhe 服务端代理内核
+Copyright (C) 2026 NyxAuden <https://github.com/NyxAuden>
+
+本程序是自由软件：你可以依据自由软件基金会发布的 GNU 通用公共许可证
+第 3 版（或你选择的任何更新版本）的条款重新分发和/或修改它。
+
+本程序按"原样"分发，不提供任何担保，甚至不提供适销性或特定用途适用性的
+默示担保。详见根目录 `LICENSE`（GNU GPL v3 官方标准文本）。
+
+源代码：https://github.com/NyxAuden/Dubhe
+
+---
+
+## 第三方组件版权声明
+
+本仓库内嵌（vendored）了以下第三方源码，其版权归各自作者所有，
+许可与本地修改记录见 `THIRD-PARTY.md`：
+
+| 组件 | 版权 | 许可 |
+|---|---|---|
+| Nowhere（`vendor/nowhere`） | Copyright (C) 2026 NodePassProject | GPL-3.0-only |
+| rustls（`vendor/rustls`） | Copyright (C) rustls contributors | Apache-2.0 OR ISC OR MIT |
+| shadowsocks-rust 协议层（`vendor/shadowsocks`） | Copyright (C) shadowsocks-rust contributors | MIT |
+| h3 / h3-quinn / h3-datagram（`vendor/h3*`） | Copyright (C) h3 contributors | MIT |
+| blake3（`vendor/blake3`） | Copyright (C) blake3 contributors | Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR CC0-1.0 |
+
+### 为什么本项目是 GPL-3.0-only
+
+NW3（Nowhere Protocol v3）的服务端 Portal 与 Egress 直接整包复用
+`NodePassProject/Nowhere` 3.3.0 的源码，该源码以 **GPL-3.0-only** 分发。
+链接并分发含该代码的程序必须整体采用 GPL-3.0-only，因此本项目选择该许可，
+不采用 GPL-3.0-or-later。
+
+### 分发义务
+
+以二进制形式分发本程序时，必须同时提供：
+
+1. 对应的完整源代码（含 `vendor/` 下所有内嵌组件）；
+2. `LICENSE`（GPL-3.0 正文）；
+3. 本 `NOTICE` 文件；
+4. `THIRD-PARTY.md` 所列各组件的原始许可文本。
+
+`vendor/` 下各目录保留原始版权头与许可文件，不得移除。
