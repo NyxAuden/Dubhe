@@ -16,6 +16,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -32,6 +33,12 @@ const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 const SNELL_PSK: &str = "snell-reference-test-psk";
 const WRONG_PSK: &str = "deliberately-wrong-snell-psk";
 const WRONG_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30812";
+/// ShadowTLS 只是 TLS 伪装层，必须叠加内层协议；这里固定内层为
+/// Shadowsocks 2022（两家参考客户端都支持，且与 Mihomo `ss + shadow-tls`
+/// 插件的常规形态一致）。密码是 16 字节 0x5a 的标准 Base64。
+const SHADOWTLS_INNER_TAG: &str = "shadowtls-inner";
+const SHADOWTLS_INNER_METHOD: &str = "2022-blake3-aes-128-gcm";
+const SHADOWTLS_INNER_PASSWORD: &str = "WlpaWlpaWlpaWlpaWlpaWg==";
 
 #[derive(Clone, Copy)]
 enum Protocol {
@@ -44,6 +51,7 @@ enum Protocol {
     Snell,
     AnyTls,
     Naive,
+    ShadowTls,
 }
 
 impl Protocol {
@@ -57,6 +65,7 @@ impl Protocol {
             Self::Snell => "snell",
             Self::AnyTls => "anytls",
             Self::Naive => "naive",
+            Self::ShadowTls => "shadowtls",
         }
     }
 
@@ -70,12 +79,23 @@ impl Protocol {
     fn credential(self, scenario: Scenario) -> &'static str {
         match (self, scenario) {
             (
-                Self::Trojan | Self::Hysteria2 | Self::Tuic | Self::AnyTls | Self::Naive,
+                Self::Trojan
+                | Self::Hysteria2
+                | Self::Tuic
+                | Self::AnyTls
+                | Self::Naive
+                | Self::ShadowTls,
                 Scenario::WrongCredential,
             ) => WRONG_PASSWORD,
-            (Self::Trojan | Self::Hysteria2 | Self::Tuic | Self::AnyTls | Self::Naive, _) => {
-                PASSWORD
-            }
+            (
+                Self::Trojan
+                | Self::Hysteria2
+                | Self::Tuic
+                | Self::AnyTls
+                | Self::Naive
+                | Self::ShadowTls,
+                _,
+            ) => PASSWORD,
             (Self::Snell, Scenario::WrongCredential) => WRONG_PSK,
             (Self::Snell, _) => SNELL_PSK,
             (Self::Vless | Self::VlessXudp | Self::Vmess, Scenario::WrongCredential) => WRONG_UUID,
@@ -92,6 +112,8 @@ impl Protocol {
             // sing-box 实机报 "UDP is not supported by outbound: kernel"；
             // naive 出站只能 TCP CONNECT。
             (Self::Naive, _) => false,
+            // ShadowTLS 只承载内层 TCP 字节流，两家客户端都没有 UDP 通路。
+            (Self::ShadowTls, _) => false,
             _ => true,
         }
     }
@@ -114,6 +136,8 @@ impl Protocol {
             // Mihomo v1.19.33 没有 naive 代理类型（实机报 unsupport proxy type）。
             Self::Hysteria2 | Self::Tuic | Self::Snell | Self::AnyTls => client != "xray",
             Self::Naive => client == "sing-box",
+            // Xray v26.10.31 没有 ShadowTLS（协议、传输、出站均无），显式跳过。
+            Self::ShadowTls => client != "xray",
             _ => true,
         }
     }
@@ -172,8 +196,51 @@ impl Protocol {
                 inbound["users"] = json!([{"name": "test", "password": PASSWORD}]);
             }
             Self::Trojan => {}
+            Self::ShadowTls => {
+                // ShadowTLS 只做 TLS 握手伪装，不终端代理：入站必须带真实
+                // 握手目标和同配置内的内层明文入口，因此由 `inbounds` 生成两条。
+                unreachable!("ShadowTLS 入站需要握手目标与内层入口")
+            }
         }
         inbound
+    }
+
+    /// ShadowTLS 的两个入站：外层 ShadowTLS + 内层 Shadowsocks 2022。
+    ///
+    /// 内层选 Shadowsocks 2022 是因为它同时是 Mihomo（`ss + shadow-tls`
+    /// 插件）和 sing-box（`shadowsocks` 出站 + `detour`）的常规组合，
+    /// 且本内核 `detour` 允许列表里包含 shadowsocks。
+    fn shadowtls_inbounds(handshake: SocketAddr, password: &str) -> Value {
+        json!([
+            {
+                "type": "shadowtls",
+                "tag": Self::ShadowTls.mode(),
+                "listen": "127.0.0.1:0",
+                "version": 3,
+                "users": [{"name": "test", "password": password}],
+                "handshake": {"server": "127.0.0.1", "server_port": handshake.port()},
+                "strict_mode": true,
+                "detour": SHADOWTLS_INNER_TAG
+            },
+            {
+                "type": "shadowsocks",
+                "tag": SHADOWTLS_INNER_TAG,
+                "listen": "127.0.0.1:0",
+                "method": SHADOWTLS_INNER_METHOD,
+                "password": SHADOWTLS_INNER_PASSWORD
+            }
+        ])
+    }
+
+    /// 一个场景所需的全部入站；其余协议仍只有一条。
+    fn inbounds(self, certificate: &Certificate, handshake: Option<SocketAddr>) -> Value {
+        match self {
+            Self::ShadowTls => Self::shadowtls_inbounds(
+                handshake.expect("ShadowTLS 缺少本地 TLS 握手目标"),
+                PASSWORD,
+            ),
+            _ => json!([self.inbound(certificate)]),
+        }
     }
 
     fn configure_command(self, client: &str, command: &mut Command) {
@@ -188,6 +255,91 @@ impl Protocol {
 
 fn project() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// ShadowTLS 需要一个真实的外部 TLS 服务器完成握手伪装。
+///
+/// `tests/shadowtls.rs` 用只回 ServerHello 的假服务器覆盖服务端行为，但真实
+/// 客户端（Mihomo/sing-box）执行的是完整 TLS 1.3 握手，必须有一个真的 TLS
+/// 服务端。这里沿用 `tests/shadowtls_outbound.rs` 的做法：本地 rustls TLS 1.3
+/// 监听，自签 `localhost` 证书，握手后只排空数据。
+struct TlsHandshakeTarget {
+    address: SocketAddr,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+    stop: tokio_util::sync::CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TlsHandshakeTarget {
+    async fn start(certificate: &Certificate) -> Result<Self> {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+        let certificates = CertificateDer::pem_file_iter(certificate.dir.path().join("cert.pem"))
+            .context("读取握手目标证书失败")?
+            .collect::<Result<Vec<_>, _>>()?;
+        let key = PrivateKeyDer::from_pem_file(certificate.dir.path().join("key.pem"))
+            .context("读取握手目标私钥失败")?;
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("握手目标仅支持 TLS 1.3")?
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)
+        .context("握手目标证书无效")?;
+        // ShadowTLS 认证后不再需要握手服务器的会话票据；关闭以保持流量形状简单。
+        config.send_tls13_tickets = 0;
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_count = connections.clone();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let cancel = stop.clone();
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let Ok((tcp, _)) = accepted else { break };
+                        accepted_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let acceptor = acceptor.clone();
+                        connections.spawn(async move {
+                            let Ok(mut tls) = acceptor.accept(tcp).await else { return };
+                            let mut buffer = [0u8; 1024];
+                            while let Ok(count) = tls.read(&mut buffer).await {
+                                if count == 0 {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
+            }
+            connections.abort_all();
+        });
+        Ok(Self {
+            address,
+            connections,
+            stop,
+            task: Some(task),
+        })
+    }
+
+    /// 本场景开始以来握手目标被拨号的次数。
+    fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for TlsHandshakeTarget {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -292,7 +444,8 @@ impl Scenario {
                 | Protocol::Hysteria2
                 | Protocol::Tuic
                 | Protocol::AnyTls
-                | Protocol::Naive,
+                | Protocol::Naive
+                | Protocol::ShadowTls,
             ) => "wrong-password",
             (Self::WrongCredential, Protocol::Snell) => "wrong-psk",
             (Self::WrongCredential, Protocol::Vless | Protocol::VlessXudp | Protocol::Vmess) => {
@@ -330,6 +483,9 @@ fn client_config(
     fingerprint: &str,
 ) -> Result<Value> {
     let pem = fs::read_to_string(trust_path)?;
+    if matches!(protocol, Protocol::ShadowTls) {
+        return shadowtls_client_config(name, listen, server, trust_path, credential);
+    }
     Ok(match name {
         "mihomo" => {
             let mut proxy = json!({
@@ -392,6 +548,7 @@ fn client_config(
                     proxy["sni"] = json!("localhost");
                 }
                 Protocol::Naive => unreachable!("Mihomo v1.19.33 无 naive 代理类型"),
+                Protocol::ShadowTls => unreachable!("由 shadowtls_client_config 处理"),
             }
             json!({
                 "socks-port": listen.port(), "bind-address": "127.0.0.1", "allow-lan": false,
@@ -470,6 +627,7 @@ fn client_config(
                     outbound["password"] = json!(credential);
                     outbound["udp_over_tcp"] = json!({"enabled": true, "version": 2});
                 }
+                Protocol::ShadowTls => unreachable!("由 shadowtls_client_config 处理"),
             }
             // Snell 没有 TLS；sing-box 的 snell 出站不接受 tls 字段，
             // 而公共模板带上了它，必须移除。
@@ -504,7 +662,8 @@ fn client_config(
                 | Protocol::Tuic
                 | Protocol::Snell
                 | Protocol::AnyTls
-                | Protocol::Naive => unreachable!("Xray 不支持该协议"),
+                | Protocol::Naive
+                | Protocol::ShadowTls => unreachable!("Xray 不支持该协议"),
             };
             let mux = match protocol {
                 // XUDP 模式保留默认 cone，只将 UDP（非 53/443）改为命令 3；
@@ -517,7 +676,8 @@ fn client_config(
                 | Protocol::Tuic
                 | Protocol::Snell
                 | Protocol::AnyTls
-                | Protocol::Naive => json!({"enabled": false}),
+                | Protocol::Naive
+                | Protocol::ShadowTls => json!({"enabled": false}),
                 Protocol::Vless => json!({"enabled": false, "concurrency": -1,
                     "xudpConcurrency": -1}),
             };
@@ -535,6 +695,74 @@ fn client_config(
                     "mux": mux}]
             })
         }
+        _ => bail!("未知参考客户端"),
+    })
+}
+
+/// ShadowTLS 的客户端出站形态与其它协议不同：它不终端代理。
+///
+/// - Mihomo：ShadowTLS 是 shadowsocks 出站的 `plugin: shadow-tls` +
+///   `plugin-opts`，证书校验开关（`skip-cert-verify`）必须在 `plugin-opts` 内。
+/// - sing-box：`shadowtls` 单独一条出站，真正的内层 `shadowsocks` 出站用
+///   `detour` 指向它；`shadowtls` 自身不承载目标。
+/// - Xray v26.10.31 没有 ShadowTLS，由 `supported_by` 在生成用例前拦下。
+fn shadowtls_client_config(
+    name: &str,
+    listen: SocketAddr,
+    server: SocketAddr,
+    trust_path: &Path,
+    credential: &str,
+) -> Result<Value> {
+    let pem = fs::read_to_string(trust_path)?;
+    Ok(match name {
+        "mihomo" => json!({
+            "socks-port": listen.port(), "bind-address": "127.0.0.1", "allow-lan": false,
+            "mode": "rule", "log-level": "warning", "ipv6": false,
+            "find-process-mode": "off", "geo-auto-update": false, "geodata-mode": false,
+            "geox-url": {
+                "geoip": "http://127.0.0.1:9/download-disabled",
+                "geosite": "http://127.0.0.1:9/download-disabled",
+                "mmdb": "http://127.0.0.1:9/download-disabled",
+                "asn": "http://127.0.0.1:9/download-disabled"
+            },
+            "external-controller": "", "external-ui": "", "external-ui-url": "",
+            "dns": {"enable": false}, "tun": {"enable": false},
+            "sniffer": {"enable": false}, "ntp": {"enable": false},
+            "profile": {"store-selected": false, "store-fake-ip": false},
+            "tls": {"custom-certifactes": [pem]},
+            "proxies": [{
+                "name": "kernel", "type": "ss", "server": "127.0.0.1",
+                "port": server.port(), "cipher": SHADOWTLS_INNER_METHOD,
+                "password": SHADOWTLS_INNER_PASSWORD, "udp": false,
+                "plugin": "shadow-tls",
+                "plugin-opts": {
+                    "host": "localhost", "password": credential, "version": 3,
+                    "skip-cert-verify": false
+                }
+            }],
+            "rules": ["MATCH,kernel"]
+        }),
+        "sing-box" => json!({
+            "log": {"level": "warn", "timestamp": false},
+            "inbounds": [{"type": "socks", "tag": "local", "listen": "127.0.0.1",
+                "listen_port": listen.port()}],
+            "outbounds": [
+                {
+                    "type": "shadowtls", "tag": "kernel", "server": "127.0.0.1",
+                    "server_port": server.port(), "version": 3, "password": credential,
+                    "tls": {"enabled": true, "server_name": "localhost", "insecure": false,
+                        "certificate_path": trust_path}
+                },
+                {
+                    "type": "shadowsocks", "tag": "inner", "server": "127.0.0.1",
+                    "server_port": server.port(), "method": SHADOWTLS_INNER_METHOD,
+                    "password": SHADOWTLS_INNER_PASSWORD, "network": ["tcp"],
+                    "detour": "kernel"
+                }
+            ],
+            "route": {"final": "inner"}
+        }),
+        "xray" => unreachable!("Xray 不支持 ShadowTLS"),
         _ => bail!("未知参考客户端"),
     })
 }
@@ -733,7 +961,8 @@ async fn positive_udp(proxy: SocketAddr, protocol: Protocol) -> Result<Value> {
         | Protocol::Tuic
         | Protocol::Snell
         | Protocol::AnyTls
-        | Protocol::Naive => 2,
+        | Protocol::Naive
+        | Protocol::ShadowTls => 2,
     };
     if matches!(protocol, Protocol::VlessXudp) {
         // 固定 Xray 的 cone 路径对 53/443 端口例外，确保测试数据报实际走 XUDP。
@@ -962,6 +1191,55 @@ async fn negative_traffic(proxy: SocketAddr, server: &Running, udp: bool) -> Res
         "target_untouched": true, "server_stats": snapshot}))
 }
 
+/// ShadowTLS 的「错误密码」不是服务端拒绝，而是协议规定的回落。
+///
+/// 上游行为：ClientHello 的 v3 HMAC 不匹配时，服务端把缓存的 ClientHello
+/// 原样转给伪装握手目标并进入双向复制。因此不能复用 `negative_traffic`
+/// 去等 `stats.rejected` 增长——那样会错误判定测试失败。
+///
+/// 正确的断言是：
+/// 1. 客户端无法到达业务目标（没有内层转发）；
+/// 2. 握手目标确实收到了回落连接（证明走的是 ShadowTLS 回落路径，
+///    而不是客户端根本没连上）；
+/// 3. 服务端没有记录业务字节。
+async fn shadowtls_wrong_password_falls_back(
+    proxy: SocketAddr,
+    server: &Running,
+    handshake: &TlsHandshakeTarget,
+) -> Result<Value> {
+    let target = TcpListener::bind("127.0.0.1:0").await?;
+    let before = handshake.connections();
+    // 客户端会为这个 TCP 请求完成 SOCKS 握手并尝试内层协议；
+    // 期望在 SOCKS 层就失败或被关闭，绝不产生目标流量。
+    let _ = tcp_denied(proxy, target.local_addr()?).await;
+    // 回落是异步的：等到伪装目标确实被拨号。
+    timeout(DEADLINE, async {
+        while handshake.connections() <= before {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("错误密码时未观察到到伪装握手目标的回落连接")?;
+    ensure!(
+        timeout(Duration::from_millis(200), target.accept())
+            .await
+            .is_err(),
+        "错误密码仍连接到业务 TCP 目标"
+    );
+    let snapshot = server.stats.snapshot();
+    ensure!(
+        snapshot.uplink == 0 && snapshot.downlink == 0,
+        "错误密码场景产生了项目转发载荷"
+    );
+    Ok(json!({
+        "scenario": "wrong-password",
+        "behavior": "shadowtls v3 fallback to handshake target",
+        "fallback_observed": true,
+        "inner_target_untouched": true,
+        "server_stats": snapshot
+    }))
+}
+
 async fn run_scenarios(
     client: &ReferenceClient,
     protocol: Protocol,
@@ -969,6 +1247,12 @@ async fn run_scenarios(
 ) -> Result<Value> {
     let certificate = Certificate::new();
     let unrelated = Certificate::new();
+    // ShadowTLS 的握手伪装目标：真实 TLS 1.3 服务端，独立于协议入站证书。
+    let handshake = if matches!(protocol, Protocol::ShadowTls) {
+        Some(TlsHandshakeTarget::start(&certificate).await?)
+    } else {
+        None
+    };
     let mut results = serde_json::Map::new();
     let mut scenarios = vec![Scenario::Valid, Scenario::WrongCredential];
     if protocol.uses_tls() {
@@ -994,20 +1278,31 @@ async fn run_scenarios(
             &certificate
         };
         private_write(&trust_path, &fs::read(trust.dir.path().join("cert.pem"))?)?;
-        let mut inbound = protocol.inbound(&certificate);
-        // Snell 没有 TLS，不接受 certificate/private_key。
-        if !matches!(protocol, Protocol::Snell) {
-            inbound["certificate"] = json!(cert_path);
-            inbound["private_key"] = json!(key_path);
-        }
-        // Naive 的 cronet 客户端会把 server 当域名解析（上游硬编码
-        // `RemoteIsDomain: true`），本机 localhost 同时解析出 127.0.0.1
-        // 与 ::1，happy-eyeballs 优先尝试 ::1。用 [::] 双栈监听同时接住。
-        if matches!(protocol, Protocol::Naive) {
-            inbound["listen"] = json!("[::]:0");
-        }
-        let mut config = socks_config();
-        config["inbounds"] = json!([inbound]);
+        let config = if matches!(protocol, Protocol::ShadowTls) {
+            // ShadowTLS 的入站由外层 ShadowTLS + 内层 Shadowsocks 组成；
+            // 两者都不使用证书字段（握手目标自带 TLS）。
+            let mut config = socks_config();
+            config["inbounds"] =
+                protocol.inbounds(&certificate, handshake.as_ref().map(|h| h.address));
+            config
+        } else {
+            let mut inbound = protocol.inbound(&certificate);
+            // Snell 没有 TLS，不接受 certificate/private_key。
+            if !matches!(protocol, Protocol::Snell) {
+                inbound["certificate"] = json!(cert_path);
+                inbound["private_key"] = json!(key_path);
+            }
+            // Naive 的 cronet 客户端会把 server 当域名解析（上游硬编码
+            // `RemoteIsDomain: true`），本机 localhost 同时解析出 127.0.0.1
+            // 与 ::1，happy-eyeballs 优先尝试 ::1。用 [::] 双栈监听同时接住。
+            if matches!(protocol, Protocol::Naive) {
+                inbound["listen"] = json!("[::]:0");
+            }
+            let mut config = socks_config();
+            config["inbounds"] = json!([inbound]);
+            config
+        };
+        let mut config = config;
         config["limits"]["handshake_timeout_ms"] = json!(3000);
         config["limits"]["udp_idle_timeout_ms"] = json!(3000);
         config["limits"]["shutdown_timeout_ms"] = json!(300);
@@ -1030,8 +1325,36 @@ async fn run_scenarios(
         .await?;
         let udp = protocol.udp_supported(&client.name);
         let result = match scenario {
-            Scenario::Valid => positive_traffic(process.address, &server, protocol, udp).await,
-            Scenario::WrongCredential => negative_traffic(process.address, &server, udp).await,
+            Scenario::Valid => {
+                let result = positive_traffic(process.address, &server, protocol, udp).await;
+                match (&result, &handshake) {
+                    (Ok(_), Some(handshake)) => {
+                        // 真实客户端认证路径必须实际拨过伪装握手目标；
+                        // 仅“内层通了”不足以证明外层是真实 TLS。
+                        ensure!(
+                            handshake.connections() > 0,
+                            "ShadowTLS 认证成功但未拨伪装握手目标"
+                        );
+                        result.map(|mut value| {
+                            value["handshake_target_connections"] = json!(handshake.connections());
+                            value
+                        })
+                    }
+                    _ => result,
+                }
+            }
+            Scenario::WrongCredential => match protocol {
+                // ShadowTLS 错误密码按协议回落到伪装握手目标，不是服务端拒绝。
+                Protocol::ShadowTls => {
+                    shadowtls_wrong_password_falls_back(
+                        process.address,
+                        &server,
+                        handshake.as_ref().expect("ShadowTLS 缺少握手目标"),
+                    )
+                    .await
+                }
+                _ => negative_traffic(process.address, &server, udp).await,
+            },
             Scenario::UntrustedCertificate => match protocol {
                 // QUIC 协议在握手期就失败，服务端看不到连接。
                 Protocol::Hysteria2 | Protocol::Tuic => {
@@ -1284,7 +1607,7 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                 Protocol::Trojan => "password",
                 Protocol::Hysteria2 | Protocol::Tuic => "password",
                 Protocol::Snell => "psk",
-                Protocol::AnyTls | Protocol::Naive => "password",
+                Protocol::AnyTls | Protocol::Naive | Protocol::ShadowTls => "password",
                 Protocol::Vless | Protocol::VlessXudp | Protocol::Vmess => "uuid",
             };
             assert_eq!(
@@ -1324,7 +1647,8 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                             | Protocol::Tuic
                             | Protocol::Snell
                             | Protocol::AnyTls
-                            | Protocol::Naive => unreachable!("Xray 不支持该协议"),
+                            | Protocol::Naive
+                            | Protocol::ShadowTls => unreachable!("Xray 不支持该协议"),
                         };
                         (identity.clone(), json!(fs::read_to_string(outbound["streamSettings"]["tlsSettings"]["certificates"][0]["certificateFile"].as_str().unwrap())?))
                     }
@@ -1898,4 +2222,120 @@ async fn sing_box_vless_xudp_tcp_udp_authentication() -> Result<()> {
 #[ignore = "需要已校验官方客户端和执行许可；VLESS XUDP 模式"]
 async fn xray_vless_xudp_tcp_udp_authentication() -> Result<()> {
     real_interop("xray", Protocol::VlessXudp).await
+}
+
+// ShadowTLS v3 不是完整代理协议，只是 TLS 握手伪装层：入站必须带真实
+// 握手目标 `handshake` 与同配置内的内层明文入口 `detour`。本文件统一选
+// 内层 Shadowsocks 2022（上面 `SHADOWTLS_INNER_*`），因为 Mihomo 的
+// `ss + shadow-tls` 插件形态和 sing-box 的 `shadowsocks + detour` 形态
+// 都能直接表达，且本内核 detour 允许列表包含 shadowsocks。
+//
+// 握手目标用本地 rustls TLS 1.3 服务端（`TlsHandshakeTarget`）。这与
+// `tests/shadowtls.rs` 的假 ServerHello 不同：真实客户端执行完整 TLS 1.3，
+// 必须有真实握手目标；`tests/shadowtls_outbound.rs` 已用同一做法。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可；ShadowTLS v3 + 内层 Shadowsocks 2022"]
+async fn mihomo_shadowtls_tcp_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::ShadowTls).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可；ShadowTLS v3 + 内层 Shadowsocks 2022"]
+async fn sing_box_shadowtls_tcp_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::ShadowTls).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Xray v26.10.31 没有 ShadowTLS；此用例应显式跳过"]
+async fn xray_shadowtls_is_explicitly_skipped() -> Result<()> {
+    real_interop("xray", Protocol::ShadowTls).await
+}
+
+#[test]
+fn configuration_generation_shadowtls_wraps_inner_outbound_and_skips_xray() -> Result<()> {
+    let certificate = Certificate::new();
+    let trust = certificate.dir.path().join("cert.pem");
+    let listen = "127.0.0.1:1080".parse()?;
+    let server = "127.0.0.1:1443".parse()?;
+    assert_eq!(Protocol::ShadowTls.name(), "shadowtls");
+    assert_eq!(
+        Scenario::WrongCredential.name(Protocol::ShadowTls),
+        "wrong-password"
+    );
+    assert!(Protocol::ShadowTls.uses_tls());
+    assert!(!Protocol::ShadowTls.udp_supported("mihomo"));
+    assert!(!Protocol::ShadowTls.udp_supported("sing-box"));
+    assert!(Protocol::ShadowTls.supported_by("mihomo"));
+    assert!(Protocol::ShadowTls.supported_by("sing-box"));
+    assert!(!Protocol::ShadowTls.supported_by("xray"));
+
+    let handshake = "127.0.0.1:9443".parse()?;
+    let inbounds = Protocol::ShadowTls.inbounds(&certificate, Some(handshake));
+    let inbounds = inbounds.as_array().expect("数组");
+    assert_eq!(inbounds.len(), 2, "ShadowTLS 必须由外层与内层两条入站组成");
+    assert_eq!(inbounds[0]["type"], "shadowtls");
+    assert_eq!(inbounds[0]["version"], 3);
+    assert_eq!(inbounds[0]["detour"], SHADOWTLS_INNER_TAG);
+    assert_eq!(inbounds[0]["handshake"]["server_port"], 9443);
+    assert_eq!(inbounds[0]["users"][0]["password"], PASSWORD);
+    assert_eq!(inbounds[1]["type"], "shadowsocks");
+    assert_eq!(inbounds[1]["tag"], SHADOWTLS_INNER_TAG);
+    assert_eq!(inbounds[1]["method"], SHADOWTLS_INNER_METHOD);
+    // 入站必须能被正式配置校验接受（含 detour 指向检查）。
+    let mut config = socks_config();
+    config["inbounds"] = json!(inbounds);
+    dubhe::Config::from_json(&config.to_string())?;
+
+    let mihomo = client_config(
+        "mihomo",
+        Protocol::ShadowTls,
+        listen,
+        server,
+        &trust,
+        PASSWORD,
+        "AA:BB",
+    )?;
+    assert_eq!(
+        mihomo["proxies"][0],
+        json!({
+            "name": "kernel", "type": "ss", "server": "127.0.0.1", "port": 1443,
+            "cipher": SHADOWTLS_INNER_METHOD, "password": SHADOWTLS_INNER_PASSWORD,
+            "udp": false, "plugin": "shadow-tls",
+            "plugin-opts": {"host": "localhost", "password": PASSWORD, "version": 3,
+                "skip-cert-verify": false}
+        })
+    );
+    assert_eq!(
+        mihomo["tls"]["custom-certifactes"],
+        json!([fs::read_to_string(&trust)?])
+    );
+
+    let sing_box = client_config(
+        "sing-box",
+        Protocol::ShadowTls,
+        listen,
+        server,
+        &trust,
+        PASSWORD,
+        "AA:BB",
+    )?;
+    assert_eq!(
+        sing_box["outbounds"],
+        json!([
+            {
+                "type": "shadowtls", "tag": "kernel", "server": "127.0.0.1",
+                "server_port": 1443, "version": 3, "password": PASSWORD,
+                "tls": {"enabled": true, "server_name": "localhost", "insecure": false,
+                    "certificate_path": trust}
+            },
+            {
+                "type": "shadowsocks", "tag": "inner", "server": "127.0.0.1",
+                "server_port": 1443, "method": SHADOWTLS_INNER_METHOD,
+                "password": SHADOWTLS_INNER_PASSWORD, "network": ["tcp"],
+                "detour": "kernel"
+            }
+        ])
+    );
+    assert_eq!(sing_box["route"]["final"], "inner");
+    Ok(())
 }
