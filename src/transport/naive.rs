@@ -179,6 +179,9 @@ async fn handle_stream(
     if credentials.next().is_some()
         || proxy_http::authenticate_header(authorization, users).is_err()
     {
+        // 认证失败必须计入 rejected：运维需要区分「无人连接」与
+        // 「有人在反复猜密码」。与 Hysteria2/TUIC 的同类修复保持一致。
+        ctx.stats.reject();
         let _ = respond.send_response(
             Response::builder()
                 .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)

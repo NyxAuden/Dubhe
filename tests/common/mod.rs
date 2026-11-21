@@ -41,10 +41,16 @@ pub struct Certificate {
 impl Certificate {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        std::fs::write(dir.path().join("cert.pem"), certified.cert.pem()).unwrap();
+        // Chromium（NaiveProxy 客户端）拒绝 rcgen 默认的 1975..4096 有效期，
+        // 报 `cert validity too long`；显式设为一年。
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2027, 1, 1);
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let certified = params.self_signed(&key_pair).unwrap();
+        std::fs::write(dir.path().join("cert.pem"), certified.pem()).unwrap();
         let key = dir.path().join("key.pem");
-        std::fs::write(&key, certified.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&key, key_pair.serialize_pem()).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -52,7 +58,7 @@ impl Certificate {
         }
         Self {
             dir,
-            der: certified.cert.der().clone(),
+            der: certified.der().clone(),
         }
     }
     pub fn inbound(&self) -> Value {

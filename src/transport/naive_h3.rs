@@ -208,9 +208,16 @@ async fn serve_connection(
     }
 }
 
-async fn reject(stream: &mut Stream, status: StatusCode) -> io::Result<()> {
+async fn reject(
+    stream: &mut Stream,
+    status: StatusCode,
+    ctx: &crate::forward::Context,
+) -> io::Result<()> {
     let mut response = Response::builder().status(status);
     if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        // 认证失败计入 rejected：运维需要区分「无人连接」与
+        // 「有人在反复猜密码」。与 H1/H2 及 Hysteria2/TUIC 的修复一致。
+        ctx.stats.reject();
         response = response.header("proxy-authenticate", "Basic realm=\"proxy\"");
     }
     stream
@@ -237,7 +244,7 @@ async fn handle(
         || request.uri().scheme().is_some()
         || !request.uri().path().is_empty()
     {
-        return reject(&mut stream, StatusCode::BAD_REQUEST).await;
+        return reject(&mut stream, StatusCode::BAD_REQUEST, &ctx).await;
     }
     let target = match request
         .uri()
@@ -245,16 +252,18 @@ async fn handle(
         .and_then(|authority| super::naive::authority_target(authority.as_str()).ok())
     {
         Some(target) => target,
-        None => return reject(&mut stream, StatusCode::BAD_REQUEST).await,
+        None => return reject(&mut stream, StatusCode::BAD_REQUEST, &ctx).await,
     };
     let mut auth = request.headers().get_all("proxy-authorization").iter();
     let authorization = auth.next().and_then(|value| value.to_str().ok());
     if auth.next().is_some() {
-        return reject(&mut stream, StatusCode::PROXY_AUTHENTICATION_REQUIRED).await;
+        return reject(&mut stream, StatusCode::PROXY_AUTHENTICATION_REQUIRED, &ctx).await;
     }
     let user = match proxy_http::authenticate_header(authorization, users) {
         Ok(user) => user,
-        Err(_) => return reject(&mut stream, StatusCode::PROXY_AUTHENTICATION_REQUIRED).await,
+        Err(_) => {
+            return reject(&mut stream, StatusCode::PROXY_AUTHENTICATION_REQUIRED, &ctx).await;
+        }
     };
     let padding = request
         .headers()
@@ -268,7 +277,7 @@ async fn handle(
     } else {
         match ctx.connect(tag, &target).await {
             Ok(target) => Some(target),
-            Err(_) => return reject(&mut stream, StatusCode::BAD_GATEWAY).await,
+            Err(_) => return reject(&mut stream, StatusCode::BAD_GATEWAY, &ctx).await,
         }
     };
     let mut response = Response::builder().status(StatusCode::OK);

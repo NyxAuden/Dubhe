@@ -89,6 +89,9 @@ impl Protocol {
             // xudp:false 也会被覆盖；此基线只能验收 VLESS TCP，不能声称原生 UDP 通过。
             // https://github.com/MetaCubeX/mihomo/blob/3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8/adapter/outbound/vless.go#L474-L485
             (Self::Vless, "mihomo") => false,
+            // sing-box 实机报 "UDP is not supported by outbound: kernel"；
+            // naive 出站只能 TCP CONNECT。
+            (Self::Naive, _) => false,
             _ => true,
         }
     }
@@ -139,6 +142,12 @@ impl Protocol {
             }
             Self::Naive => {
                 // Naive 必须真实 TLS（HTTP CONNECT over TLS）。
+                //
+                // 监听 [::] 而非 127.0.0.1：上游 naive 出站硬编码
+                // `RemoteIsDomain: true`（protocol/naive/outbound.go），
+                // 即使 server 写 127.0.0.1 也会走 resolver；本机 /etc/hosts
+                // 的 `localhost` 同时映射 127.0.0.1 与 ::1，cronet 按
+                // happy-eyeballs 优先尝试 ::1。双栈监听才能同时接住两种结果。
                 inbound["type"] = json!("naive");
                 inbound["tag"] = json!(self.mode());
                 inbound["users"] = json!([{"name": "test", "password": PASSWORD}]);
@@ -455,8 +464,11 @@ fn client_config(
                 }
                 Protocol::Naive => {
                     // sing-box naive 需要 username + password，走公共 tls 段。
+                    // 上游 protocol/naive/outbound.go 的 DialContext：
+                    // UDP 只有 uotClient != nil（即启用 udp_over_tcp）时可用。
                     outbound["username"] = json!("test");
                     outbound["password"] = json!(credential);
+                    outbound["udp_over_tcp"] = json!({"enabled": true, "version": 2});
                 }
             }
             // Snell 没有 TLS；sing-box 的 snell 出站不接受 tls 字段，
@@ -987,6 +999,12 @@ async fn run_scenarios(
         if !matches!(protocol, Protocol::Snell) {
             inbound["certificate"] = json!(cert_path);
             inbound["private_key"] = json!(key_path);
+        }
+        // Naive 的 cronet 客户端会把 server 当域名解析（上游硬编码
+        // `RemoteIsDomain: true`），本机 localhost 同时解析出 127.0.0.1
+        // 与 ::1，happy-eyeballs 优先尝试 ::1。用 [::] 双栈监听同时接住。
+        if matches!(protocol, Protocol::Naive) {
+            inbound["listen"] = json!("[::]:0");
         }
         let mut config = socks_config();
         config["inbounds"] = json!([inbound]);
@@ -1837,16 +1855,23 @@ async fn xray_anytls_is_explicitly_skipped() -> Result<()> {
     real_interop("xray", Protocol::AnyTls).await
 }
 
-/// Naive 走 Chromium 的网络栈，它的证书有效期校验比 rustls 严格得多。
+/// Naive 的 sing-box 互通。三个场景均已通过。
 ///
-/// `rcgen::generate_simple_self_signed` 生成的证书有效期远超 Chromium 的
-/// 上限，客户端直接报 `cert validity too long` 并拒绝握手。这不是 Naive
-/// 实现的问题，是测试证书生成的限制；本机回环测试（`tests/naive*.rs`）
-/// 不走 Chromium 因此不受影响。
+/// 两处上游行为需要在测试侧适配，都不是 dubhe 的问题：
 ///
-/// 要真正跑通此用例，需要改用带短有效期的证书生成方式，属测试基建改动。
+/// 1. **证书有效期**：NaiveProxy 走 Chromium 网络栈，`rcgen` 默认的
+///    1975..4096 有效期被拒为 `cert validity too long`。
+///    `tests/common/mod.rs` 已改为显式一年期。
+/// 2. **地址族**：上游 `protocol/naive/outbound.go` 硬编码
+///    `RemoteIsDomain: true`，即使 `server` 写 `127.0.0.1` 也走 resolver；
+///    本机 localhost 同时解析出 `127.0.0.1` 与 `::1`，happy-eyeballs
+///    优先尝试 `::1`。测试侧用 `[::]:0` 双栈监听同时接住两种结果。
+///
+/// 另外按上游确认的两条硬限制：
+/// - `insecure is not supported on naive outbound`（无法绕过证书校验）
+/// - UDP 只有 `udp_over_tcp` 启用时才可用，已按此配置
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "测试证书有效期超出 Chromium 上限（cert validity too long）；需改测试证书生成"]
+#[ignore = "需要已校验官方客户端和执行许可"]
 async fn sing_box_naive_tcp_udp_authentication() -> Result<()> {
     real_interop("sing-box", Protocol::Naive).await
 }
