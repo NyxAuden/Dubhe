@@ -42,6 +42,8 @@ enum Protocol {
     Hysteria2,
     Tuic,
     Snell,
+    AnyTls,
+    Naive,
 }
 
 impl Protocol {
@@ -53,6 +55,8 @@ impl Protocol {
             Self::Hysteria2 => "hysteria2",
             Self::Tuic => "tuic",
             Self::Snell => "snell",
+            Self::AnyTls => "anytls",
+            Self::Naive => "naive",
         }
     }
 
@@ -65,10 +69,13 @@ impl Protocol {
 
     fn credential(self, scenario: Scenario) -> &'static str {
         match (self, scenario) {
-            (Self::Trojan | Self::Hysteria2 | Self::Tuic, Scenario::WrongCredential) => {
-                WRONG_PASSWORD
+            (
+                Self::Trojan | Self::Hysteria2 | Self::Tuic | Self::AnyTls | Self::Naive,
+                Scenario::WrongCredential,
+            ) => WRONG_PASSWORD,
+            (Self::Trojan | Self::Hysteria2 | Self::Tuic | Self::AnyTls | Self::Naive, _) => {
+                PASSWORD
             }
-            (Self::Trojan | Self::Hysteria2 | Self::Tuic, _) => PASSWORD,
             (Self::Snell, Scenario::WrongCredential) => WRONG_PSK,
             (Self::Snell, _) => SNELL_PSK,
             (Self::Vless | Self::VlessXudp | Self::Vmess, Scenario::WrongCredential) => WRONG_UUID,
@@ -101,7 +108,9 @@ impl Protocol {
     fn supported_by(self, client: &str) -> bool {
         match self {
             // Xray v26.10.31 的协议列表里没有 hysteria2 / tuic。
-            Self::Hysteria2 | Self::Tuic | Self::Snell => client != "xray",
+            // Mihomo v1.19.33 没有 naive 代理类型（实机报 unsupport proxy type）。
+            Self::Hysteria2 | Self::Tuic | Self::Snell | Self::AnyTls => client != "xray",
+            Self::Naive => client == "sing-box",
             _ => true,
         }
     }
@@ -127,6 +136,18 @@ impl Protocol {
                     "psk": SNELL_PSK,
                     "version": 4
                 });
+            }
+            Self::Naive => {
+                // Naive 必须真实 TLS（HTTP CONNECT over TLS）。
+                inbound["type"] = json!("naive");
+                inbound["tag"] = json!(self.mode());
+                inbound["users"] = json!([{"name": "test", "password": PASSWORD}]);
+            }
+            Self::AnyTls => {
+                // AnyTLS 必须真实 TLS，凭据在 users 数组。
+                inbound["type"] = json!("anytls");
+                inbound["tag"] = json!(self.mode());
+                inbound["users"] = json!([{"name": "test", "password": PASSWORD}]);
             }
             Self::Tuic => {
                 // TUIC 入站需要证书 + users（uuid/password）。
@@ -256,9 +277,14 @@ impl Scenario {
     fn name(self, protocol: Protocol) -> &'static str {
         match (self, protocol) {
             (Self::Valid, _) => "valid",
-            (Self::WrongCredential, Protocol::Trojan | Protocol::Hysteria2 | Protocol::Tuic) => {
-                "wrong-password"
-            }
+            (
+                Self::WrongCredential,
+                Protocol::Trojan
+                | Protocol::Hysteria2
+                | Protocol::Tuic
+                | Protocol::AnyTls
+                | Protocol::Naive,
+            ) => "wrong-password",
             (Self::WrongCredential, Protocol::Snell) => "wrong-psk",
             (Self::WrongCredential, Protocol::Vless | Protocol::VlessXudp | Protocol::Vmess) => {
                 "wrong-uuid"
@@ -352,6 +378,11 @@ fn client_config(
                     proxy["psk"] = json!(credential);
                     proxy["version"] = json!(4);
                 }
+                Protocol::AnyTls => {
+                    proxy["password"] = json!(credential);
+                    proxy["sni"] = json!("localhost");
+                }
+                Protocol::Naive => unreachable!("Mihomo v1.19.33 无 naive 代理类型"),
             }
             json!({
                 "socks-port": listen.port(), "bind-address": "127.0.0.1", "allow-lan": false,
@@ -418,6 +449,15 @@ fn client_config(
                     outbound["psk"] = json!(credential);
                     outbound["reuse"] = json!(false);
                 }
+                Protocol::AnyTls => {
+                    // AnyTLS 必须真实 TLS，走公共 tls 段。
+                    outbound["password"] = json!(credential);
+                }
+                Protocol::Naive => {
+                    // sing-box naive 需要 username + password，走公共 tls 段。
+                    outbound["username"] = json!("test");
+                    outbound["password"] = json!(credential);
+                }
             }
             // Snell 没有 TLS；sing-box 的 snell 出站不接受 tls 字段，
             // 而公共模板带上了它，必须移除。
@@ -448,9 +488,11 @@ fn client_config(
                 }
                 // Xray v26.10.31 的协议列表里没有 hysteria2 / tuic；此分支不可达，
                 // 由 Protocol::supported_by 在生成用例前拦下。
-                Protocol::Hysteria2 | Protocol::Tuic | Protocol::Snell => {
-                    unreachable!("Xray 不支持 Hysteria2 / TUIC / Snell")
-                }
+                Protocol::Hysteria2
+                | Protocol::Tuic
+                | Protocol::Snell
+                | Protocol::AnyTls
+                | Protocol::Naive => unreachable!("Xray 不支持该协议"),
             };
             let mux = match protocol {
                 // XUDP 模式保留默认 cone，只将 UDP（非 53/443）改为命令 3；
@@ -461,7 +503,9 @@ fn client_config(
                 | Protocol::Vmess
                 | Protocol::Hysteria2
                 | Protocol::Tuic
-                | Protocol::Snell => json!({"enabled": false}),
+                | Protocol::Snell
+                | Protocol::AnyTls
+                | Protocol::Naive => json!({"enabled": false}),
                 Protocol::Vless => json!({"enabled": false, "concurrency": -1,
                     "xudpConcurrency": -1}),
             };
@@ -675,7 +719,9 @@ async fn positive_udp(proxy: SocketAddr, protocol: Protocol) -> Result<Value> {
         | Protocol::Vmess
         | Protocol::Hysteria2
         | Protocol::Tuic
-        | Protocol::Snell => 2,
+        | Protocol::Snell
+        | Protocol::AnyTls
+        | Protocol::Naive => 2,
     };
     if matches!(protocol, Protocol::VlessXudp) {
         // 固定 Xray 的 cone 路径对 53/443 端口例外，确保测试数据报实际走 XUDP。
@@ -1220,6 +1266,7 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                 Protocol::Trojan => "password",
                 Protocol::Hysteria2 | Protocol::Tuic => "password",
                 Protocol::Snell => "psk",
+                Protocol::AnyTls | Protocol::Naive => "password",
                 Protocol::Vless | Protocol::VlessXudp | Protocol::Vmess => "uuid",
             };
             assert_eq!(
@@ -1255,9 +1302,11 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                             Protocol::Vless | Protocol::VlessXudp => &outbound["settings"]["id"],
                             // Xray 的 VMess 出站用 vnext[].users[].id。
                             Protocol::Vmess => &outbound["settings"]["vnext"][0]["users"][0]["id"],
-                            Protocol::Hysteria2 | Protocol::Tuic | Protocol::Snell => {
-                                unreachable!("Xray 不支持 Hysteria2 / TUIC / Snell")
-                            }
+                            Protocol::Hysteria2
+                            | Protocol::Tuic
+                            | Protocol::Snell
+                            | Protocol::AnyTls
+                            | Protocol::Naive => unreachable!("Xray 不支持该协议"),
                         };
                         (identity.clone(), json!(fs::read_to_string(outbound["streamSettings"]["tlsSettings"]["certificates"][0]["certificateFile"].as_str().unwrap())?))
                     }
@@ -1768,6 +1817,44 @@ async fn sing_box_snell_v4_authentication() -> Result<()> {
 #[ignore = "Xray v26.10.31 没有 snell 协议；此用例应显式跳过"]
 async fn xray_snell_is_explicitly_skipped() -> Result<()> {
     real_interop("xray", Protocol::Snell).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn mihomo_anytls_tcp_udp_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::AnyTls).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_anytls_tcp_udp_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::AnyTls).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Xray v26.10.31 没有 anytls 协议；此用例应显式跳过"]
+async fn xray_anytls_is_explicitly_skipped() -> Result<()> {
+    real_interop("xray", Protocol::AnyTls).await
+}
+
+/// Naive 走 Chromium 的网络栈，它的证书有效期校验比 rustls 严格得多。
+///
+/// `rcgen::generate_simple_self_signed` 生成的证书有效期远超 Chromium 的
+/// 上限，客户端直接报 `cert validity too long` 并拒绝握手。这不是 Naive
+/// 实现的问题，是测试证书生成的限制；本机回环测试（`tests/naive*.rs`）
+/// 不走 Chromium 因此不受影响。
+///
+/// 要真正跑通此用例，需要改用带短有效期的证书生成方式，属测试基建改动。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "测试证书有效期超出 Chromium 上限（cert validity too long）；需改测试证书生成"]
+async fn sing_box_naive_tcp_udp_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::Naive).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Mihomo v1.19.33 没有 naive 代理类型；此用例应显式跳过"]
+async fn mihomo_naive_is_explicitly_skipped() -> Result<()> {
+    real_interop("mihomo", Protocol::Naive).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

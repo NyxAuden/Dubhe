@@ -6,12 +6,15 @@
 > **仓库内真正 fork 并驱动第三方客户端二进制的测试只有 `tests/reference_clients.rs`，
 > 且 `enum Protocol` 的变体数量有限**（另加 Shadowsocks 的宏生成用例）。
 >
-> - **有可复现第三方客户端证据的协议**：Trojan、VLESS（含 XUDP）、
->   Shadowsocks、**VMess**、**Hysteria2**、**TUIC**、**Snell v4**
->   （后四项 2026-11-21 补齐，均在各客户端实际跑通）。
->   客户端不支持时（如 Xray 无 hysteria2/tuic/snell）用例**显式报告跳过**，
->   不计为通过。
-> - **其余协议**（ShadowTLS、Naive、AnyTLS、WireGuard、Vision、REALITY、
+> - **有可复现第三方客户端证据的协议**（2026-11-21 起逐项补齐）：
+>   Trojan、VLESS（含 XUDP）、Shadowsocks、VMess、Hysteria2、TUIC、
+>   Snell v4、**AnyTLS**。客户端不支持时（Xray 无 hysteria2/tuic/snell/
+>   anytls，Mihomo 无 naive）用例**显式报告跳过**，不计为通过。
+> - **Naive**：sing-box 用例已写好，但被**测试证书限制**阻塞——
+>   NaiveProxy 走 Chromium 网络栈，`rcgen::generate_simple_self_signed`
+>   的默认有效期（1975–4096）被拒为 `cert validity too long`，
+>   缩短有效期后仍被拒。属测试基建问题，不计为通过。
+> - **其余协议**（ShadowTLS、WireGuard、Vision、REALITY、
 >   VLESS Encryption、WS/WSS、gRPC、XHTTP、HTTPUpgrade、mKCP、
 >   NW3 的官方二进制方向）**只有本机回环测试**。
 >   正文中的「与官方客户端互通」均为历史人工记录，当前工作区无可复现测试，
