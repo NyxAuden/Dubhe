@@ -4,13 +4,16 @@
 >
 > 本文件此前多处写有「已与官方 X 客户端双向互通」的完成态措辞。经全仓核对，
 > **仓库内真正 fork 并驱动第三方客户端二进制的测试只有 `tests/reference_clients.rs`，
-> 且 `enum Protocol` 仅含 `Trojan` / `Vless` / `VlessXudp` 三个变体**
-> （另加 Shadowsocks 的宏生成用例）。因此：
+> 且 `enum Protocol` 的变体数量有限**（另加 Shadowsocks 的宏生成用例）。
 >
-> - **有可复现第三方客户端证据的协议**：Trojan、VLESS（含 XUDP）、Shadowsocks。
-> - **其余协议**（VMess、Hysteria2、TUIC、Snell、ShadowTLS、Naive、AnyTLS、
->   WireGuard、Vision、REALITY、VLESS Encryption、WS/WSS、gRPC、XHTTP、
->   HTTPUpgrade、mKCP、NW3 的官方二进制方向）**只有本机回环测试**。
+> - **有可复现第三方客户端证据的协议**：Trojan、VLESS（含 XUDP）、
+>   Shadowsocks、**VMess**、**Hysteria2**、**TUIC**、**Snell v4**
+>   （后四项 2026-11-21 补齐，均在各客户端实际跑通）。
+>   客户端不支持时（如 Xray 无 hysteria2/tuic/snell）用例**显式报告跳过**，
+>   不计为通过。
+> - **其余协议**（ShadowTLS、Naive、AnyTLS、WireGuard、Vision、REALITY、
+>   VLESS Encryption、WS/WSS、gRPC、XHTTP、HTTPUpgrade、mKCP、
+>   NW3 的官方二进制方向）**只有本机回环测试**。
 >   正文中的「与官方客户端互通」均为历史人工记录，当前工作区无可复现测试，
 >   亦无脚本可重跑。
 >

@@ -443,6 +443,9 @@ async fn handle_connection(
             result
         }
         _ => {
+            // 认证失败必须计入 rejected，否则运维无法从指标区分
+            // 「无人连接」与「有人在反复猜密码」。
+            ctx.stats.reject();
             connection.close(VarInt::from_u32(0), b"auth failed");
             Ok(())
         }

@@ -27,6 +27,10 @@ use tokio::{
 const DEADLINE: Duration = Duration::from_secs(5);
 const WRONG_PASSWORD: &str = "deliberately-wrong-reference-test-password";
 const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+/// Snell v4 的 psk。Mihomo 支持 v1–v5 但拒绝 v6；
+/// sing-box 1.14.4 只支持 v4/v6。交集只有 v4。
+const SNELL_PSK: &str = "snell-reference-test-psk";
+const WRONG_PSK: &str = "deliberately-wrong-snell-psk";
 const WRONG_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30812";
 
 #[derive(Clone, Copy)]
@@ -34,6 +38,10 @@ enum Protocol {
     Trojan,
     Vless,
     VlessXudp,
+    Vmess,
+    Hysteria2,
+    Tuic,
+    Snell,
 }
 
 impl Protocol {
@@ -41,6 +49,10 @@ impl Protocol {
         match self {
             Self::Trojan => "trojan",
             Self::Vless | Self::VlessXudp => "vless",
+            Self::Vmess => "vmess",
+            Self::Hysteria2 => "hysteria2",
+            Self::Tuic => "tuic",
+            Self::Snell => "snell",
         }
     }
 
@@ -53,29 +65,83 @@ impl Protocol {
 
     fn credential(self, scenario: Scenario) -> &'static str {
         match (self, scenario) {
-            (Self::Trojan, Scenario::WrongCredential) => WRONG_PASSWORD,
-            (Self::Trojan, _) => PASSWORD,
-            (Self::Vless | Self::VlessXudp, Scenario::WrongCredential) => WRONG_UUID,
-            (Self::Vless | Self::VlessXudp, _) => UUID,
+            (Self::Trojan | Self::Hysteria2 | Self::Tuic, Scenario::WrongCredential) => {
+                WRONG_PASSWORD
+            }
+            (Self::Trojan | Self::Hysteria2 | Self::Tuic, _) => PASSWORD,
+            (Self::Snell, Scenario::WrongCredential) => WRONG_PSK,
+            (Self::Snell, _) => SNELL_PSK,
+            (Self::Vless | Self::VlessXudp | Self::Vmess, Scenario::WrongCredential) => WRONG_UUID,
+            (Self::Vless | Self::VlessXudp | Self::Vmess, _) => UUID,
         }
     }
 
     fn udp_supported(self, client: &str) -> bool {
-        // Mihomo v1.19.33 的 NewVless 强制在 XUDP / packetaddr 之间选择，
-        // xudp:false 也会被覆盖；此基线只能验收 VLESS TCP，不能声称原生 UDP 通过。
-        // https://github.com/MetaCubeX/mihomo/blob/3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8/adapter/outbound/vless.go#L474-L485
-        !matches!((self, client), (Self::Vless, "mihomo"))
+        match (self, client) {
+            // Mihomo v1.19.33 的 NewVless 强制在 XUDP / packetaddr 之间选择，
+            // xudp:false 也会被覆盖；此基线只能验收 VLESS TCP，不能声称原生 UDP 通过。
+            // https://github.com/MetaCubeX/mihomo/blob/3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8/adapter/outbound/vless.go#L474-L485
+            (Self::Vless, "mihomo") => false,
+            _ => true,
+        }
+    }
+
+    /// 该协议的入站是否使用 TLS。
+    ///
+    /// Snell 是纯对称加密握手，没有 TLS，所以 `untrusted-certificate`
+    /// 场景对它不适用——那边测的是证书校验，不是协议本身。
+    fn uses_tls(self) -> bool {
+        !matches!(self, Self::Snell)
+    }
+
+    /// 该参考客户端是否实现了此协议。
+    ///
+    /// 为 false 时不生成该客户端的测试用例——**不要**让它在客户端配置阶段
+    /// 失败，那样报告的是「配置无效」而不是「该客户端不支持」。
+    fn supported_by(self, client: &str) -> bool {
+        match self {
+            // Xray v26.10.31 的协议列表里没有 hysteria2 / tuic。
+            Self::Hysteria2 | Self::Tuic | Self::Snell => client != "xray",
+            _ => true,
+        }
     }
 
     fn inbound(self, certificate: &Certificate) -> Value {
         let mut inbound = certificate.inbound();
-        if matches!(self, Self::Vless | Self::VlessXudp) {
-            inbound["type"] = json!(self.name());
-            inbound["tag"] = json!(self.mode());
-            inbound["users"] = json!([{"name": "test", "uuid": UUID}]);
-            if matches!(self, Self::VlessXudp) {
-                inbound["xudp"] = json!(true);
+        match self {
+            Self::Vless | Self::VlessXudp | Self::Vmess => {
+                inbound["type"] = json!(self.name());
+                inbound["tag"] = json!(self.mode());
+                inbound["users"] = json!([{"name": "test", "uuid": UUID}]);
+                if matches!(self, Self::VlessXudp) {
+                    inbound["xudp"] = json!(true);
+                }
             }
+            Self::Snell => {
+                // Snell 用 psk，无证书/TLS；不能复用 trojan 模板里的
+                // certificate/private_key/password 字段，必须整体重建。
+                inbound = json!({
+                    "type": "snell",
+                    "tag": self.mode(),
+                    "listen": "127.0.0.1:0",
+                    "psk": SNELL_PSK,
+                    "version": 4
+                });
+            }
+            Self::Tuic => {
+                // TUIC 入站需要证书 + users（uuid/password）。
+                inbound["type"] = json!("tuic");
+                inbound["tag"] = json!(self.mode());
+                inbound["users"] = json!([{"name": "test", "uuid": UUID,
+                    "password": PASSWORD}]);
+            }
+            Self::Hysteria2 => {
+                // Hysteria2 入站必须带证书，凭据在 users 数组里而不是顶层字段。
+                inbound["type"] = json!("hysteria2");
+                inbound["tag"] = json!(self.mode());
+                inbound["users"] = json!([{"name": "test", "password": PASSWORD}]);
+            }
+            Self::Trojan => {}
         }
         inbound
     }
@@ -190,11 +256,33 @@ impl Scenario {
     fn name(self, protocol: Protocol) -> &'static str {
         match (self, protocol) {
             (Self::Valid, _) => "valid",
-            (Self::WrongCredential, Protocol::Trojan) => "wrong-password",
-            (Self::WrongCredential, Protocol::Vless | Protocol::VlessXudp) => "wrong-uuid",
+            (Self::WrongCredential, Protocol::Trojan | Protocol::Hysteria2 | Protocol::Tuic) => {
+                "wrong-password"
+            }
+            (Self::WrongCredential, Protocol::Snell) => "wrong-psk",
+            (Self::WrongCredential, Protocol::Vless | Protocol::VlessXudp | Protocol::Vmess) => {
+                "wrong-uuid"
+            }
             (Self::UntrustedCertificate, _) => "untrusted-certificate",
         }
     }
+}
+
+/// 计算证书的 SHA-256 指纹，格式与 `openssl x509 -fingerprint -sha256` 一致。
+///
+/// Mihomo 的 Hysteria2 走 QUIC，不读全局 `tls.custom-certifactes`，
+/// 只能用出站级 `fingerprint` 固定证书。
+fn certificate_fingerprint(certificate: &Certificate) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(certificate.der.as_ref());
+    let mut out = String::with_capacity(digest.len() * 3);
+    for (index, byte) in digest.iter().enumerate() {
+        if index > 0 {
+            out.push(':');
+        }
+        out.push_str(&format!("{byte:02X}"));
+    }
+    out
 }
 
 fn client_config(
@@ -204,6 +292,7 @@ fn client_config(
     server: SocketAddr,
     trust_path: &Path,
     credential: &str,
+    fingerprint: &str,
 ) -> Result<Value> {
     let pem = fs::read_to_string(trust_path)?;
     Ok(match name {
@@ -229,6 +318,39 @@ fn client_config(
                     if matches!(protocol, Protocol::VlessXudp) {
                         proxy["xudp"] = json!(true);
                     }
+                }
+                Protocol::Vmess => {
+                    // Mihomo 的 VMess 必须显式给 alterId 与 cipher（文档标 Required），
+                    // 与 VLESS 不同；缺省会走旧协议或拒绝加载。
+                    proxy["uuid"] = json!(credential);
+                    proxy["alterId"] = json!(0);
+                    proxy["cipher"] = json!("auto");
+                    proxy["tls"] = json!(true);
+                    proxy["servername"] = json!("localhost");
+                }
+                Protocol::Hysteria2 => {
+                    // Mihomo 用 sni（不是 servername），密码字段是 password。
+                    // QUIC 路径不读全局 tls.custom-certifactes，必须用出站级
+                    // fingerprint 固定证书，否则报 unknown authority。
+                    proxy["password"] = json!(credential);
+                    proxy["sni"] = json!("localhost");
+                    proxy["fingerprint"] = json!(fingerprint);
+                }
+                Protocol::Tuic => {
+                    // TUIC v5 要 uuid + password；Mihomo 默认 alpn=[h3]，
+                    // 而本内核入站 alpn 为空，必须显式清空才协商成功。
+                    proxy["uuid"] = json!(UUID);
+                    proxy["password"] = json!(credential);
+                    proxy["sni"] = json!("localhost");
+                    proxy["fingerprint"] = json!(fingerprint);
+                    proxy["alpn"] = json!([]);
+                    proxy["udp-relay-mode"] = json!("native");
+                    proxy["reduce-rtt"] = json!(false);
+                }
+                Protocol::Snell => {
+                    // v4 是 Mihomo（v1–v5）与 sing-box 1.14.4（v4/v6）的交集。
+                    proxy["psk"] = json!(credential);
+                    proxy["version"] = json!(4);
                 }
             }
             json!({
@@ -272,6 +394,35 @@ fn client_config(
                     });
                     outbound["multiplex"] = json!({"enabled": false});
                 }
+                Protocol::Vmess => {
+                    // sing-box 的 VMess 需要 security 与 alter_id；
+                    // packet_encoding 空字符串为原生 UDP。
+                    outbound["uuid"] = json!(credential);
+                    outbound["security"] = json!("auto");
+                    outbound["alter_id"] = json!(0);
+                    outbound["packet_encoding"] = json!("");
+                }
+                Protocol::Hysteria2 => {
+                    // sing-box 的 Hysteria2 用顶层 password，TLS 走公共 tls 段。
+                    outbound["password"] = json!(credential);
+                }
+                Protocol::Tuic => {
+                    outbound["uuid"] = json!(UUID);
+                    outbound["password"] = json!(credential);
+                    outbound["udp_relay_mode"] = json!("native");
+                    outbound["zero_rtt_handshake"] = json!(false);
+                }
+                Protocol::Snell => {
+                    // sing-box 的 Snell 走公共 tls 段（本内核入站无 TLS）。
+                    outbound["version"] = json!(4);
+                    outbound["psk"] = json!(credential);
+                    outbound["reuse"] = json!(false);
+                }
+            }
+            // Snell 没有 TLS；sing-box 的 snell 出站不接受 tls 字段，
+            // 而公共模板带上了它，必须移除。
+            if matches!(protocol, Protocol::Snell) {
+                outbound.as_object_mut().expect("对象").remove("tls");
             }
             json!({
                 "log": {"level": "warn", "timestamp": false},
@@ -289,12 +440,28 @@ fn client_config(
                     json!({"address": "127.0.0.1", "port": server.port(),
                     "id": credential, "flow": "", "encryption": "none"})
                 }
+                Protocol::Vmess => {
+                    // Xray 的 VMess 出站用 vnext/servers 形状，且 security 必填
+                    // （auto/aes-128-gcm/chacha20-poly1305/none/zero）。
+                    json!({"vnext": [{"address": "127.0.0.1", "port": server.port(),
+                        "users": [{"id": credential, "security": "auto", "alterId": 0}]}]})
+                }
+                // Xray v26.10.31 的协议列表里没有 hysteria2 / tuic；此分支不可达，
+                // 由 Protocol::supported_by 在生成用例前拦下。
+                Protocol::Hysteria2 | Protocol::Tuic | Protocol::Snell => {
+                    unreachable!("Xray 不支持 Hysteria2 / TUIC / Snell")
+                }
             };
             let mux = match protocol {
                 // XUDP 模式保留默认 cone，只将 UDP（非 53/443）改为命令 3；
                 // 普通 TCP 仍用命令 1，不开启通用 TCP mux。
                 // https://github.com/XTLS/Xray-core/blob/a4a3dff5b20c2faae567b742c172c7b95e75c083/proxy/vless/outbound/outbound.go#L303-L320
-                Protocol::Trojan | Protocol::VlessXudp => json!({"enabled": false}),
+                Protocol::Trojan
+                | Protocol::VlessXudp
+                | Protocol::Vmess
+                | Protocol::Hysteria2
+                | Protocol::Tuic
+                | Protocol::Snell => json!({"enabled": false}),
                 Protocol::Vless => json!({"enabled": false, "concurrency": -1,
                     "xudpConcurrency": -1}),
             };
@@ -330,6 +497,7 @@ impl ClientProcess {
         server: SocketAddr,
         trust_path: &Path,
         credential: &str,
+        fingerprint: &str,
     ) -> Result<Self> {
         Self::start_configured(
             client,
@@ -342,6 +510,7 @@ impl ClientProcess {
                     server,
                     trust_path,
                     credential,
+                    fingerprint,
                 )
             },
             |command| protocol.configure_command(&client.name, command),
@@ -499,10 +668,14 @@ fn relay_address(mut relay: SocketAddr) -> Result<SocketAddr> {
 async fn positive_udp(proxy: SocketAddr, protocol: Protocol) -> Result<Value> {
     let first_udp = Echo::udp("127.0.0.1").await;
     let second_udp = Echo::udp("127.0.0.1").await;
-    // Trojan/XUDP 在同一 SOCKS 关联内切换目标；原生 VLESS 每个关联固定一个目标。
+    // Trojan/XUDP 在同一 SOCKS 关联内切换目标；原生 VLESS/VMess 每个关联固定一个目标。
     let association_count = match protocol {
         Protocol::Trojan | Protocol::VlessXudp => 1,
-        Protocol::Vless => 2,
+        Protocol::Vless
+        | Protocol::Vmess
+        | Protocol::Hysteria2
+        | Protocol::Tuic
+        | Protocol::Snell => 2,
     };
     if matches!(protocol, Protocol::VlessXudp) {
         // 固定 Xray 的 cone 路径对 53/443 端口例外，确保测试数据报实际走 XUDP。
@@ -654,6 +827,37 @@ async fn wait_rejected(server: &Running, before: u64) -> Result<()> {
     .context("项目服务端没有观察到拒绝，不能仅凭客户端超时判断成功")
 }
 
+/// QUIC 协议（Hysteria2/TUIC）的证书不受信任场景。
+///
+/// 客户端在 QUIC/TLS 握手阶段就因证书校验失败放弃，**连连接都不会建立**，
+/// 服务端观察不到任何握手尝试，因此 `stats.rejected` 不会增长。
+/// 这与 TCP 协议不同：TCP 的 TLS 失败仍会到达服务端并计入 rejected。
+///
+/// 正确的断言是「服务端零流量」：客户端确实拒绝了该证书，且没有把业务
+/// 数据发给目标。
+async fn quic_untrusted_certificate_denies(proxy: SocketAddr, server: &Running) -> Result<Value> {
+    let target = TcpListener::bind("127.0.0.1:0").await?;
+    let before = server.stats.snapshot();
+    // 客户端会尝试发起代理请求；期望失败且不产生任何业务字节。
+    let _ = tcp_denied(proxy, target.local_addr()?).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ensure!(
+        timeout(Duration::from_millis(200), target.accept())
+            .await
+            .is_err(),
+        "证书不受信任时仍连接到 TCP 目标"
+    );
+    let after = server.stats.snapshot();
+    ensure!(
+        after.uplink == before.uplink && after.downlink == before.downlink,
+        "证书不受信任时服务端仍记录了业务字节"
+    );
+    Ok(
+        json!({"scenario": "untrusted-certificate", "protocol_family": "quic",
+        "assertion": "zero business bytes; handshake rejected client-side"}),
+    )
+}
+
 async fn negative_traffic(proxy: SocketAddr, server: &Running, udp: bool) -> Result<Value> {
     let target = TcpListener::bind("127.0.0.1:0").await?;
     let before = server.stats.snapshot().rejected;
@@ -708,11 +912,11 @@ async fn run_scenarios(
     let certificate = Certificate::new();
     let unrelated = Certificate::new();
     let mut results = serde_json::Map::new();
-    for scenario in [
-        Scenario::Valid,
-        Scenario::WrongCredential,
-        Scenario::UntrustedCertificate,
-    ] {
+    let mut scenarios = vec![Scenario::Valid, Scenario::WrongCredential];
+    if protocol.uses_tls() {
+        scenarios.push(Scenario::UntrustedCertificate);
+    }
+    for scenario in scenarios {
         let directory = artifacts.join(scenario.name(protocol));
         fs::create_dir(&directory)?;
         let cert_path = directory.join("server-cert.pem");
@@ -733,8 +937,11 @@ async fn run_scenarios(
         };
         private_write(&trust_path, &fs::read(trust.dir.path().join("cert.pem"))?)?;
         let mut inbound = protocol.inbound(&certificate);
-        inbound["certificate"] = json!(cert_path);
-        inbound["private_key"] = json!(key_path);
+        // Snell 没有 TLS，不接受 certificate/private_key。
+        if !matches!(protocol, Protocol::Snell) {
+            inbound["certificate"] = json!(cert_path);
+            inbound["private_key"] = json!(key_path);
+        }
         let mut config = socks_config();
         config["inbounds"] = json!([inbound]);
         config["limits"]["handshake_timeout_ms"] = json!(3000);
@@ -752,15 +959,22 @@ async fn run_scenarios(
             server.address,
             &trust_path,
             protocol.credential(scenario),
+            // 指纹必须跟随客户端实际信任的那张证书：不信任场景下客户端配的是
+            // `unrelated`，若仍传服务端证书指纹就等于绕过该负向用例。
+            &certificate_fingerprint(trust),
         )
         .await?;
         let udp = protocol.udp_supported(&client.name);
         let result = match scenario {
             Scenario::Valid => positive_traffic(process.address, &server, protocol, udp).await,
             Scenario::WrongCredential => negative_traffic(process.address, &server, udp).await,
-            Scenario::UntrustedCertificate => {
-                negative_traffic(process.address, &server, false).await
-            }
+            Scenario::UntrustedCertificate => match protocol {
+                // QUIC 协议在握手期就失败，服务端看不到连接。
+                Protocol::Hysteria2 | Protocol::Tuic => {
+                    quic_untrusted_certificate_denies(process.address, &server).await
+                }
+                _ => negative_traffic(process.address, &server, false).await,
+            },
         }
         .with_context(|| {
             format!(
@@ -786,6 +1000,12 @@ async fn run_scenarios(
 }
 
 async fn real_interop(name: &str, protocol: Protocol) -> Result<()> {
+    // 客户端未实现该协议时显式跳过：报告「该客户端不支持」，
+    // 而不是让它去解析一份自己不认识的出站配置。
+    if !protocol.supported_by(name) {
+        eprintln!("跳过：{name} 不支持 {} 协议", protocol.name());
+        return Ok(());
+    }
     let client = reference_client(name)?;
     let root = project().join(".test-artifacts");
     fs::create_dir_all(&root)?;
@@ -831,7 +1051,15 @@ fn configuration_generation_vless_transport_and_udp_scope() -> Result<()> {
     let trust = certificate.dir.path().join("cert.pem");
     let listen = "127.0.0.1:1080".parse()?;
     let server = "127.0.0.1:1443".parse()?;
-    let mihomo = client_config("mihomo", Protocol::Vless, listen, server, &trust, UUID)?;
+    let mihomo = client_config(
+        "mihomo",
+        Protocol::Vless,
+        listen,
+        server,
+        &trust,
+        UUID,
+        "AA:BB",
+    )?;
     assert_eq!(
         mihomo["proxies"][0],
         json!({
@@ -846,7 +1074,15 @@ fn configuration_generation_vless_transport_and_udp_scope() -> Result<()> {
     );
     assert!(!Protocol::Vless.udp_supported("mihomo"));
 
-    let sing_box = client_config("sing-box", Protocol::Vless, listen, server, &trust, UUID)?;
+    let sing_box = client_config(
+        "sing-box",
+        Protocol::Vless,
+        listen,
+        server,
+        &trust,
+        UUID,
+        "AA:BB",
+    )?;
     assert_eq!(
         sing_box["outbounds"][0],
         json!({
@@ -858,7 +1094,15 @@ fn configuration_generation_vless_transport_and_udp_scope() -> Result<()> {
     );
     assert!(Protocol::Vless.udp_supported("sing-box"));
 
-    let xray = client_config("xray", Protocol::Vless, listen, server, &trust, UUID)?;
+    let xray = client_config(
+        "xray",
+        Protocol::Vless,
+        listen,
+        server,
+        &trust,
+        UUID,
+        "AA:BB",
+    )?;
     assert_eq!(
         xray["outbounds"][0],
         json!({
@@ -881,7 +1125,15 @@ fn configuration_generation_trojan_preserves_existing_outbounds() -> Result<()> 
     let trust = certificate.dir.path().join("cert.pem");
     let listen = "127.0.0.1:1080".parse()?;
     let server = "127.0.0.1:1443".parse()?;
-    let mihomo = client_config("mihomo", Protocol::Trojan, listen, server, &trust, PASSWORD)?;
+    let mihomo = client_config(
+        "mihomo",
+        Protocol::Trojan,
+        listen,
+        server,
+        &trust,
+        PASSWORD,
+        "AA:BB",
+    )?;
     assert_eq!(
         mihomo["proxies"][0],
         json!({
@@ -896,6 +1148,7 @@ fn configuration_generation_trojan_preserves_existing_outbounds() -> Result<()> 
         server,
         &trust,
         PASSWORD,
+        "AA:BB",
     )?;
     assert_eq!(
         sing_box["outbounds"][0],
@@ -905,7 +1158,15 @@ fn configuration_generation_trojan_preserves_existing_outbounds() -> Result<()> 
                 "insecure": false, "certificate_path": trust}
         })
     );
-    let xray = client_config("xray", Protocol::Trojan, listen, server, &trust, PASSWORD)?;
+    let xray = client_config(
+        "xray",
+        Protocol::Trojan,
+        listen,
+        server,
+        &trust,
+        PASSWORD,
+        "AA:BB",
+    )?;
     assert_eq!(
         xray["outbounds"][0],
         json!({
@@ -957,7 +1218,9 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
             let mut inbound = protocol.inbound(&certificate);
             let key = match protocol {
                 Protocol::Trojan => "password",
-                Protocol::Vless | Protocol::VlessXudp => "uuid",
+                Protocol::Hysteria2 | Protocol::Tuic => "password",
+                Protocol::Snell => "psk",
+                Protocol::Vless | Protocol::VlessXudp | Protocol::Vmess => "uuid",
             };
             assert_eq!(
                 inbound["users"][0][key],
@@ -969,7 +1232,9 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
             server_config["inbounds"] = json!([inbound]);
             dubhe::Config::from_json(&server_config.to_string())?;
             for client in ["mihomo", "sing-box", "xray"] {
-                let config = client_config(client, protocol, listen, server, &trust, credential)?;
+                let config = client_config(
+                    client, protocol, listen, server, &trust, credential, "AA:BB",
+                )?;
                 let (actual_credential, actual_trust) = match client {
                     "mihomo" => (
                         config["proxies"][0][key].clone(),
@@ -988,6 +1253,11 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                         let identity = match protocol {
                             Protocol::Trojan => &outbound["settings"]["servers"][0]["password"],
                             Protocol::Vless | Protocol::VlessXudp => &outbound["settings"]["id"],
+                            // Xray 的 VMess 出站用 vnext[].users[].id。
+                            Protocol::Vmess => &outbound["settings"]["vnext"][0]["users"][0]["id"],
+                            Protocol::Hysteria2 | Protocol::Tuic | Protocol::Snell => {
+                                unreachable!("Xray 不支持 Hysteria2 / TUIC / Snell")
+                            }
                         };
                         (identity.clone(), json!(fs::read_to_string(outbound["streamSettings"]["tlsSettings"]["certificates"][0]["certificateFile"].as_str().unwrap())?))
                     }
@@ -1025,9 +1295,17 @@ fn configuration_generation_xudp_enables_udp_without_tcp_mux() -> Result<()> {
 
     for client in ["mihomo", "sing-box", "xray"] {
         assert!(protocol.udp_supported(client));
-        let config = client_config(client, protocol, listen, server, &trust, UUID)?;
+        let config = client_config(client, protocol, listen, server, &trust, UUID, "AA:BB")?;
         // 对比已另行验证的基础配置，只允许这些 UDP 模式字段变化；TLS/身份不变。
-        let mut expected = client_config(client, Protocol::Vless, listen, server, &trust, UUID)?;
+        let mut expected = client_config(
+            client,
+            Protocol::Vless,
+            listen,
+            server,
+            &trust,
+            UUID,
+            "AA:BB",
+        )?;
         match client {
             "mihomo" => {
                 expected["proxies"][0]["udp"] = json!(true);
@@ -1418,6 +1696,78 @@ async fn sing_box_vless_tcp_udp_authentication() -> Result<()> {
 #[ignore = "需要已校验官方客户端和执行许可"]
 async fn xray_vless_tcp_udp_authentication() -> Result<()> {
     real_interop("xray", Protocol::Vless).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn mihomo_vmess_tcp_udp_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::Vmess).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_vmess_tcp_udp_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::Vmess).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn xray_vmess_tcp_udp_authentication() -> Result<()> {
+    real_interop("xray", Protocol::Vmess).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn mihomo_hysteria2_tcp_udp_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::Hysteria2).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_hysteria2_tcp_udp_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::Hysteria2).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Xray v26.10.31 没有 hysteria2 协议；此用例应显式跳过"]
+async fn xray_hysteria2_is_explicitly_skipped() -> Result<()> {
+    real_interop("xray", Protocol::Hysteria2).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn mihomo_tuic_tcp_udp_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::Tuic).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_tuic_tcp_udp_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::Tuic).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Xray v26.10.31 没有 tuic 协议；此用例应显式跳过"]
+async fn xray_tuic_is_explicitly_skipped() -> Result<()> {
+    real_interop("xray", Protocol::Tuic).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可；v4 是两边交集（Mihomo v1-5 / sing-box v4,v6）"]
+async fn mihomo_snell_v4_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::Snell).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_snell_v4_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::Snell).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Xray v26.10.31 没有 snell 协议；此用例应显式跳过"]
+async fn xray_snell_is_explicitly_skipped() -> Result<()> {
+    real_interop("xray", Protocol::Snell).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

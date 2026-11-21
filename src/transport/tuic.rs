@@ -433,6 +433,7 @@ async fn handle_connection(
         auth: auth_tx,
         handshake: handshake_tx,
         auth_claimed: AtomicU8::new(0),
+        reject_counted: AtomicBool::new(false),
         zero_rtt_streams: AtomicBool::new(false),
         udp: Mutex::new(HashMap::new()),
         cancel: cancel.clone(),
@@ -511,6 +512,9 @@ struct SessionShared {
     handshake: watch::Sender<bool>,
     /// 0 表示尚未收到认证帧；1 表示已接收过一次（无论成功）。
     auth_claimed: AtomicU8,
+    /// 认证失败是否已计入 `stats.rejected`；多条失败路径共享同一计数，
+    /// 必须去重，否则一次错误密码会按路径数量重复计数。
+    reject_counted: AtomicBool,
     /// 是否在握手完成前接受过带 0-RTT 标记的流；仅在认证成功后作为 debug
     /// 事件证据输出，不参与转发决策。
     zero_rtt_streams: AtomicBool,
@@ -520,6 +524,11 @@ struct SessionShared {
 
 impl SessionShared {
     fn fail(&self) {
+        // 认证失败必须计入 rejected：运维需要区分「无人连接」与
+        // 「有人在反复猜密码」。四条失败路径共享，用 swap 去重。
+        if !self.reject_counted.swap(true, Ordering::Relaxed) {
+            self.ctx.stats.reject();
+        }
         let _ = self.auth.send(AuthState::Failed);
     }
 
