@@ -764,8 +764,19 @@ async fn handle_stream(
     let destination = timeout(handshake, wire::read_tcp_request(&mut recv))
         .await
         .map_err(|_| timed_out())??;
-    let (host, port) = wire::parse_host_port(&destination)?;
-    let target = target_from_wire(&host, port)?;
+    // 规范：服务端 MUST 对每个 TCP 请求回 TCPResponse。地址解析失败也要回
+    // Error，否则客户端只会看到流被重置而没有原因。
+    let target = match wire::parse_host_port(&destination)
+        .and_then(|(host, port)| target_from_wire(&host, port))
+    {
+        Ok(target) => target,
+        Err(_) => {
+            let response = wire::encode_tcp_response(false, "invalid address", &[])?;
+            let _ = timeout(handshake, send.write_all(&response)).await;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
 
     match ctx.connect(tag, &target).await {
         Ok(upstream) => {

@@ -896,13 +896,13 @@ impl Config {
                                 "inbounds[{index}].obfs 的 min/max_packet_size 仅适用于 gecko"
                             ),
                             Hysteria2ObfsType::Gecko => {
+                                // 对齐官方 `WrapPacketConnGecko`：仅要求
+                                // min > 0、min <= max、max <= 2048。
                                 let min = obfs.min_packet_size.unwrap_or(512);
                                 let max = obfs.max_packet_size.unwrap_or(1200);
                                 ensure!(
-                                    (256..=1400).contains(&min)
-                                        && (256..=1400).contains(&max)
-                                        && min <= max,
-                                    "inbounds[{index}].obfs 的 gecko 分片长度必须在 256-1400 且 min<=max"
+                                    min > 0 && min <= max && max <= 2048,
+                                    "inbounds[{index}].obfs 的 gecko 分片长度必须满足 min>0、min<=max、max<=2048"
                                 );
                             }
                         }
@@ -1354,13 +1354,12 @@ impl Config {
                                         "outbounds[{index}].hysteria2.obfs 的 gecko 字段仅适用于 gecko"
                                     ),
                                     Hysteria2ObfsType::Gecko => {
+                                        // 对齐官方 `WrapPacketConnGecko` 的约束。
                                         let min = obfs.min_packet_size.unwrap_or(512);
                                         let max = obfs.max_packet_size.unwrap_or(1200);
                                         ensure!(
-                                            (256..=1400).contains(&min)
-                                                && (256..=1400).contains(&max)
-                                                && min <= max,
-                                            "outbounds[{index}].hysteria2.obfs gecko 分片长度必须在 256-1400 且 min<=max"
+                                            min > 0 && min <= max && max <= 2048,
+                                            "outbounds[{index}].hysteria2.obfs gecko 分片长度必须满足 min>0、min<=max、max<=2048"
                                         );
                                     }
                                 }

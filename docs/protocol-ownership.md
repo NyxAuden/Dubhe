@@ -114,7 +114,7 @@ sing-box 的地位是「高质量第三方实现 + 常用配置基线」，适�
 
 | 优先级 | 任务 | 权威来源 | 当前依据 | 已核对 |
 |---|---|---|---|---|
-| 1 | Hysteria 2 帧格式、认证、UDP 分片、拥塞控制、obfs | `apernet/hysteria` `PROTOCOL.md` | sing-box 实现 + 本内核自测 | **部分核对**：`0x401` TCP 请求/响应、UDP `sessionID｜packetID｜fragmentID｜fragmentCount｜addr｜payload`、`Hysteria-CC-RX` 的 0/auto 语义、`Hysteria-UDP` 均已确认一致。**obfs 未逐字节核对** |
+| 1 | Hysteria 2 帧格式、认证、UDP 分片、拥塞控制、obfs | `apernet/hysteria` `PROTOCOL.md` + 官方 `extras/obfs/*` | sing-box 实现 + 本内核自测 | **已核对**：`0x401` 请求/响应、UDP 八字段、`Hysteria-CC-RX` 0/auto、`Hysteria-UDP`、Salamander（salt 8 + BLAKE2b-256(key‖salt) + XOR）、UDP 分片全到齐才交付/缺片丢弃/未分片 total=1、空闲回收与未知 Session 新建，全部一致。**修正两处**：①Gecko `min/max_packet_size` 原先限制 256–1400，官方只要求 `min>0 && min<=max && max<=2048`，已放宽；②非法地址原先不回 TCPResponse，规范要求 MUST 回，已改为回 `invalid address` Error。**Gecko 说明**：v2.6.5 的 `PROTOCOL.md` 不含 Gecko，它在 `app/v2.9.2` 引入且官方标注 experimental，依据为官方文档站 Protocol.md 与 `extras/obfs/gecko.go` |
 | 2 | TUIC v5 帧类型、认证、UDP 两种承载、0-RTT | `tuic-protocol/tuic` SPEC.md | sing-box 实现 | **已核对**：五种命令、`Packet` 字段顺序 `ASSOC_ID\|PKT_ID\|FRAG_TOTAL\|FRAG_ID\|SIZE\|ADDR` 一致；Address `0xff/0x00/0x01/0x02` 一致；认证前命令暂停后恢复一致；Connect 无响应一致；UDP full-cone 一致（`tuic.rs:1099-1113`）；回程镜像首包载体一致。**两处偏差**：①客户端无周期性 `Heartbeat` 命令，改用 QUIC PING `keep_alive_interval`（`tuic_client.rs:152`）；②`Address::None` 非首分片约束只对发送侧强制，接收侧宽松接受（`tuic.rs:1352-1461`） |
 | 3 | AnyTLS 帧命令、paddingScheme、复用要求、v2 特性 | `anytls/anytls-go` protocol.md | `sing-anytls` 源码 | **已核对**：11 个命令编号一致；默认 paddingScheme 逐字节一致；认证为 `sha256(password)` + BE uint16 padding 长度 |
 | 4 | Naive padding 层是否与 naiveproxy 非正式规范逐字节一致 | naiveproxy README | `forwardproxy` 源码 | 未核对 |
@@ -126,7 +126,7 @@ sing-box 的地位是「高质量第三方实现 + 常用配置基线」，适�
 
 1. Naive padding 层是否与 naiveproxy 非正式规范逐字节一致（未逐字节比对）。
 2. TUIC 的 QUIC 传输细节（Heartbeat 周期、0-RTT 复用）未与 SPEC 逐条比对，仅核对了命令与帧布局。
-3. Hysteria 2 的 Salamander/Gecko obfs 未逐字节核对。
+3. Hysteria 2 的 Gecko 分片/填充**分布**属发送端自由选择，规范明确不协商，无法也不应逐字节核对；只核对了区间与帧布局。
 4. Surge 的 Snell 是否存在任何公开的部分规范。
 5. `NodePassProject/Nowhere-Protocol` 的 PROTOCOL.md 内容未读。
 6. Hysteria 2 的 TCPResponse `Message` 字段语义、错误分类未与规范逐条比对。

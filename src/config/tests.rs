@@ -1770,3 +1770,32 @@ fn dns_config_and_domain_rule_fields_validate() {
         );
     }
 }
+
+#[test]
+fn hysteria2_gecko_packet_size_matches_upstream_constraints() {
+    // 官方 `WrapPacketConnGecko` 只在 min<=0 || min>max || max>2048 时拒绝。
+    // 此前本地限制 256..=1400，会把 max=1401..2048 的合法官方配置拒绝启动。
+    let base = |min: u64, max: u64| {
+        json!({
+            "version": 1,
+            "inbounds": [{
+                "type": "hysteria2", "tag": "hy2", "listen": "127.0.0.1:443",
+                "users": [{"name": "a", "password": "pw"}],
+                "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem",
+                "obfs": {"type": "gecko", "password": "o",
+                         "min_packet_size": min, "max_packet_size": max}
+            }],
+            "outbounds": [{"tag": "direct", "type": "direct"}],
+            "route": {"default": "direct"}
+        })
+    };
+
+    for (min, max) in [(1u64, 1u64), (128, 2048), (512, 2000), (1401, 2048)] {
+        let text = base(min, max).to_string();
+        Config::from_json(&text).expect("官方允许的取值不应被拒绝");
+    }
+    for (min, max) in [(0u64, 1200u64), (1200, 512), (512, 2049)] {
+        let text = base(min, max).to_string();
+        Config::from_json(&text).expect_err("越界取值必须拒绝");
+    }
+}

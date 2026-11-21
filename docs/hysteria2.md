@@ -175,8 +175,8 @@ fragmentTotal  1 字节
   - 最多 64 个条目、每项最多 4 KiB、TTL 8 s；
   - 重复/越界分片、`fragmentTotal` 不一致、总长超过 4096：丢弃整条消息；
   - `fragmentTotal > 16`：丢弃。
-- 会话空闲超时按 `limits.udp_idle_timeout_ms`（或入口 `idle_timeout` 中较小者
-  由调用方决定）回收；任一方向活动都会刷新。
+- 会话空闲超时取入口 `idle_timeout_ms`（缺省 30 s），**不使用**
+  `limits.udp_idle_timeout_ms`；任一方向活动都会刷新。
 - 队列载荷同时占用 `limits.udp_queue_bytes` 额度，慢消费者不会无限占内存。
 
 ## 6. salamander / gecko obfs
@@ -209,7 +209,8 @@ ciphertext[i] = plaintext[i] XOR key[i mod 32]
 - 接收端按 `(来源地址, msgID)` 重组，条目 TTL 8 秒、全局最多 4096 条、
   每来源最多 8 条；重复分片、total 不一致、越界帧丢弃；
 - 配置：`"obfs": {"type": "gecko", "password": "...", "min_packet_size": 512,
-  "max_packet_size": 1200}`；`min/max` 只允许 gecko，范围 256–1400 且 min<=max；
+  "max_packet_size": 1200}`；`min/max` 只允许 gecko，约束对齐官方
+  `WrapPacketConnGecko`：`min>0 && min<=max && max<=2048`；
 - 实现位于 `gecko.rs`（纯分片/重组）与 `socket.rs`（与 salamander 组合）。
 
 ## 7. 填充
