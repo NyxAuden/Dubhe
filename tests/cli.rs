@@ -311,10 +311,14 @@ async fn shadowsocks_protocol_library_identity_logs_are_not_published() {
     );
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     socket.send_to(&wire, address).await.unwrap();
+    // SS-UDP 的认证失败计入 rejected（与 TCP 侧一致）；此前计入 dropped，
+    // 会让口令猜测混在「队列拥塞丢包」里。两种都算「被内核拒绝」。
     process
         .wait_event(|event| {
             event["fields"]["event"] == "stats"
-                && event["fields"]["dropped"].as_u64().is_some_and(|n| n >= 1)
+                && ["dropped", "rejected"]
+                    .iter()
+                    .any(|field| event["fields"][field].as_u64().is_some_and(|n| n >= 1))
         })
         .await;
     let output = process.output();

@@ -254,7 +254,9 @@ impl Dispatcher {
             &mut packet.wire,
             self.prepared.keys.users.as_deref(),
         )
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "UDP认证失败"))?;
+        // PermissionDenied 与 TCP 侧及其它协议一致，供调用方区分
+        // 「认证失败」与「载荷过长 / 路由拒绝」等业务失败。
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "UDP认证失败"))?;
         let target = target(address)?;
         if length > self.ctx.limits.max_udp_payload {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "UDP载荷过长"));
@@ -621,6 +623,23 @@ fn address(target: &Target) -> io::Result<Address> {
     })
 }
 
+/// UDP 失败按类型分流：认证失败计入 rejected（与 TCP 侧一致），
+/// 其余（载荷过长、路由拒绝、超时）计入 dropped。
+///
+/// 此前一律计入 dropped，导致 SS-UDP 的口令猜测混在「队列拥塞丢包」里，
+/// 运维无法区分两类事件。
+fn count_udp_failure<E>(ctx: &Arc<Context>, result: &Result<io::Result<()>, E>) {
+    let authentication_failed = matches!(
+        result,
+        Ok(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied
+    );
+    if authentication_failed {
+        ctx.stats.reject();
+    } else {
+        ctx.stats.drop_packet();
+    }
+}
+
 pub(crate) async fn serve(
     socket: UdpSocket,
     prepared: Arc<Prepared>,
@@ -668,15 +687,15 @@ pub(crate) async fn serve(
                 Some(packet) = rx.recv() => {
                     let accepting = !stop.is_cancelled();
                     let result = tokio::select! { biased; _ = force.cancelled() => return Ok(()), result = timeout(dial, dispatcher.process(packet, accepting)) => result };
-                    if !matches!(result, Ok(Ok(()))) { ctx.stats.drop_packet(); }
+                    if !matches!(result, Ok(Ok(()))) { count_udp_failure(&ctx, &result); }
                 }
                 Some(packet) = legacy_rx.recv() => {
                     let result = tokio::select! { biased; _ = force.cancelled() => return Ok(()), result = timeout(dial, dispatcher.legacy_reply(packet)) => result };
-                    if !matches!(result, Ok(Ok(()))) { ctx.stats.drop_packet(); }
+                    if !matches!(result, Ok(Ok(()))) { count_udp_failure(&ctx, &result); }
                 }
                 Some(packet) = modern_rx.recv() => {
                     let result = tokio::select! { biased; _ = force.cancelled() => return Ok(()), result = timeout(dial, dispatcher.modern_reply(packet)) => result };
-                    if !matches!(result, Ok(Ok(()))) { ctx.stats.drop_packet(); }
+                    if !matches!(result, Ok(Ok(()))) { count_udp_failure(&ctx, &result); }
                 }
             }
         }

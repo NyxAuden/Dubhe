@@ -255,12 +255,19 @@ impl Harness {
     }
 
     async fn rejects(&self, packets: &[Vec<u8>]) {
-        let before = self.kernel.stats.snapshot().dropped;
+        // 认证失败计入 rejected（与 TCP 侧一致），格式/载荷类失败计入 dropped。
+        // 此前一律计入 dropped，导致 SS-UDP 的口令猜测混在「队列拥塞丢包」里。
+        // 这里两种都算「被内核拒绝」，只要总数达到报文数即可。
+        let before = self.kernel.stats.snapshot();
+        let baseline = before.rejected + before.dropped;
         for packet in packets {
             self.send(packet).await;
         }
         timeout(WAIT, async {
-            while self.kernel.stats.snapshot().dropped < before + packets.len() as u64 {
+            while {
+                let now = self.kernel.stats.snapshot();
+                now.rejected + now.dropped < baseline + packets.len() as u64
+            } {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         })

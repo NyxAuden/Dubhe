@@ -396,18 +396,20 @@ async fn negative_traffic(proxy: SocketAddr, server: &Running) -> Result<Value> 
     let local = UdpSocket::bind("127.0.0.1:0").await?;
     let (control, relay) = socks(3, address("0.0.0.0:0".parse()?), proxy).await;
     let relay = relay_address(relay)?;
-    let before = server.stats.snapshot().dropped;
+    // UDP 认证失败与 TCP 一致计入 rejected：此前一律计入 dropped，
+    // 会让 SS-UDP 的口令猜测混在「队列拥塞丢包」里，运维无法区分。
+    let before = server.stats.snapshot().rejected;
     let mut packet = vec![0, 0, 0];
     packet.extend(address(udp_target.local_addr()?));
     packet.extend_from_slice(b"negative-ss-udp\0\xff");
     local.send_to(&packet, relay).await?;
     timeout(DEADLINE, async {
-        while server.stats.snapshot().dropped <= before {
+        while server.stats.snapshot().rejected <= before {
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .context("SS UDP 未观察到内核 dropped，不能仅凭客户端超时判断负向通过")?;
+    .context("SS UDP 认证失败未计入 rejected，不能仅凭客户端超时判断负向通过")?;
     let mut target_buffer = [0; 256];
     let mut client_buffer = [0; 256];
     ensure!(
