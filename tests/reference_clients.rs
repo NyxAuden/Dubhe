@@ -1,0 +1,1439 @@
+//! 使用预先校验的官方客户端执行显式启用的真实互操作测试。
+//! 运行：cargo test --locked --test reference_clients -- --ignored --nocapture
+mod common;
+#[path = "reference_support/shadowsocks.rs"]
+mod shadowsocks_reference;
+
+use anyhow::{Context, Result, bail, ensure};
+use common::{Certificate, Echo, PASSWORD, Running, address, exchange, socks, socks_config};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpListener as PortReservation, UdpSocket as UdpReservation},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+    time::{sleep, timeout},
+};
+
+const DEADLINE: Duration = Duration::from_secs(5);
+const WRONG_PASSWORD: &str = "deliberately-wrong-reference-test-password";
+const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+const WRONG_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30812";
+
+#[derive(Clone, Copy)]
+enum Protocol {
+    Trojan,
+    Vless,
+    VlessXudp,
+}
+
+impl Protocol {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Trojan => "trojan",
+            Self::Vless | Self::VlessXudp => "vless",
+        }
+    }
+
+    fn mode(self) -> &'static str {
+        match self {
+            Self::VlessXudp => "vless-xudp",
+            _ => self.name(),
+        }
+    }
+
+    fn credential(self, scenario: Scenario) -> &'static str {
+        match (self, scenario) {
+            (Self::Trojan, Scenario::WrongCredential) => WRONG_PASSWORD,
+            (Self::Trojan, _) => PASSWORD,
+            (Self::Vless | Self::VlessXudp, Scenario::WrongCredential) => WRONG_UUID,
+            (Self::Vless | Self::VlessXudp, _) => UUID,
+        }
+    }
+
+    fn udp_supported(self, client: &str) -> bool {
+        // Mihomo v1.19.33 的 NewVless 强制在 XUDP / packetaddr 之间选择，
+        // xudp:false 也会被覆盖；此基线只能验收 VLESS TCP，不能声称原生 UDP 通过。
+        // https://github.com/MetaCubeX/mihomo/blob/3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8/adapter/outbound/vless.go#L474-L485
+        !matches!((self, client), (Self::Vless, "mihomo"))
+    }
+
+    fn inbound(self, certificate: &Certificate) -> Value {
+        let mut inbound = certificate.inbound();
+        if matches!(self, Self::Vless | Self::VlessXudp) {
+            inbound["type"] = json!(self.name());
+            inbound["tag"] = json!(self.mode());
+            inbound["users"] = json!([{"name": "test", "uuid": UUID}]);
+            if matches!(self, Self::VlessXudp) {
+                inbound["xudp"] = json!(true);
+            }
+        }
+        inbound
+    }
+
+    fn configure_command(self, client: &str, command: &mut Command) {
+        if matches!((self, client), (Self::Vless, "xray")) {
+            // 空 flow / mux.enabled=false 不足以阻止 VLESS 出站默认使用 XUDP。
+            // core/xray.go 的 cone 上下文读取 common/platform/platform.go 中的此开关。
+            // https://github.com/XTLS/Xray-core/blob/a4a3dff5b20c2faae567b742c172c7b95e75c083/core/xray.go#L195-L196
+            command.env("XRAY_CONE_DISABLED", "true");
+        }
+    }
+}
+
+fn project() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+#[derive(Deserialize)]
+struct Manifest {
+    clients: Vec<ReferenceClient>,
+}
+
+#[derive(Deserialize)]
+struct ReferenceClient {
+    name: String,
+    path: PathBuf,
+    version: String,
+    platform: String,
+    sha256: String,
+    upstream_checksum_verified: bool,
+    status: String,
+}
+
+fn reference_client(name: &str) -> Result<ReferenceClient> {
+    let manifest_path = std::env::var_os("REFERENCE_CLIENTS_MANIFEST")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project().join(".test-artifacts/reference-clients.json"));
+    let manifest: Manifest =
+        serde_json::from_slice(&fs::read(&manifest_path).with_context(|| {
+            format!(
+                "缺少或无法读取已校验客户端 manifest: {}",
+                manifest_path.display()
+            )
+        })?)?;
+    let mut matching = manifest
+        .clients
+        .into_iter()
+        .filter(|client| client.name == name);
+    let client = matching.next().context("manifest 缺少所需客户端")?;
+    ensure!(matching.next().is_none(), "manifest 客户端条目重复");
+    verify_reference_binary(&client)?;
+    Ok(client)
+}
+
+fn verify_reference_binary(client: &ReferenceClient) -> Result<()> {
+    let pinned = match client.name.as_str() {
+        "mihomo" => "v1.19.33",
+        "sing-box" => "v1.14.4",
+        "xray" => "v26.10.31",
+        _ => bail!("未知参考客户端"),
+    };
+    ensure!(client.version == pinned, "参考客户端版本不符合固定版本");
+    ensure!(
+        client.status == "ready" && client.upstream_checksum_verified,
+        "参考客户端尚未通过下载和官方摘要校验"
+    );
+    ensure!(client.platform == "darwin-arm64", "参考客户端平台不匹配");
+    ensure!(
+        std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64",
+        "这组固定参考客户端仅适用于 macOS ARM64"
+    );
+    ensure!(
+        client.path.is_absolute() && fs::symlink_metadata(&client.path)?.is_file(),
+        "参考客户端路径必须是绝对路径普通文件"
+    );
+    let mut binary = File::open(&client.path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 65536];
+    loop {
+        let size = binary.read(&mut buffer)?;
+        if size == 0 {
+            break;
+        }
+        digest.update(&buffer[..size]);
+    }
+    ensure!(
+        format!("{:x}", digest.finalize()) == client.sha256,
+        "参考客户端二进制 SHA-256 已改变，拒绝运行"
+    );
+    Ok(())
+}
+
+fn private_write(path: &Path, contents: &[u8]) -> Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(contents)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum Scenario {
+    Valid,
+    WrongCredential,
+    UntrustedCertificate,
+}
+
+impl Scenario {
+    fn name(self, protocol: Protocol) -> &'static str {
+        match (self, protocol) {
+            (Self::Valid, _) => "valid",
+            (Self::WrongCredential, Protocol::Trojan) => "wrong-password",
+            (Self::WrongCredential, Protocol::Vless | Protocol::VlessXudp) => "wrong-uuid",
+            (Self::UntrustedCertificate, _) => "untrusted-certificate",
+        }
+    }
+}
+
+fn client_config(
+    name: &str,
+    protocol: Protocol,
+    listen: SocketAddr,
+    server: SocketAddr,
+    trust_path: &Path,
+    credential: &str,
+) -> Result<Value> {
+    let pem = fs::read_to_string(trust_path)?;
+    Ok(match name {
+        "mihomo" => {
+            let mut proxy = json!({
+                "name": "kernel", "type": protocol.name(), "server": "127.0.0.1",
+                "port": server.port(), "skip-cert-verify": false,
+                "udp": protocol.udp_supported(name)
+            });
+            match protocol {
+                Protocol::Trojan => {
+                    proxy["password"] = json!(credential);
+                    proxy["sni"] = json!("localhost");
+                }
+                Protocol::Vless | Protocol::VlessXudp => {
+                    // VlessOption 使用 servername，而 TrojanOption 使用 sni。
+                    // 同一固定源码的 adapter/parser.go 按 smux.enabled 控制复用包装。
+                    proxy["uuid"] = json!(credential);
+                    proxy["flow"] = json!("");
+                    proxy["tls"] = json!(true);
+                    proxy["servername"] = json!("localhost");
+                    proxy["smux"] = json!({"enabled": false});
+                    if matches!(protocol, Protocol::VlessXudp) {
+                        proxy["xudp"] = json!(true);
+                    }
+                }
+            }
+            json!({
+                "socks-port": listen.port(), "bind-address": "127.0.0.1", "allow-lan": false,
+                "mode": "rule", "log-level": "warning", "ipv6": false,
+                "find-process-mode": "off", "geo-auto-update": false, "geodata-mode": false,
+                // 不使用地理规则或远端 provider；意外地理数据请求也只到回环地址。
+                "geox-url": {
+                    "geoip": "http://127.0.0.1:9/download-disabled",
+                    "geosite": "http://127.0.0.1:9/download-disabled",
+                    "mmdb": "http://127.0.0.1:9/download-disabled",
+                    "asn": "http://127.0.0.1:9/download-disabled"
+                },
+                "external-controller": "", "external-ui": "", "external-ui-url": "",
+                "dns": {"enable": false}, "tun": {"enable": false},
+                "sniffer": {"enable": false}, "ntp": {"enable": false},
+                "profile": {"store-selected": false, "store-fake-ip": false},
+                // 此拼写是上游 v1.19.33 实际的 JSON/YAML 字段。
+                "tls": {"custom-certifactes": [pem]},
+                "proxies": [proxy], "rules": ["MATCH,kernel"]
+            })
+        }
+        "sing-box" => {
+            let mut outbound = json!({
+                "type": protocol.name(), "tag": "kernel", "server": "127.0.0.1",
+                "server_port": server.port(),
+                "tls": {"enabled": true, "server_name": "localhost", "insecure": false,
+                    "certificate_path": trust_path}
+            });
+            match protocol {
+                Protocol::Trojan => outbound["password"] = json!(credential),
+                Protocol::Vless | Protocol::VlessXudp => {
+                    // *string: 省略/null 会默认 XUDP；必须显式空字符串才走原生 UDP。
+                    // https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/option/vless.go
+                    // https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/protocol/vless/outbound.go
+                    outbound["uuid"] = json!(credential);
+                    outbound["flow"] = json!("");
+                    outbound["packet_encoding"] = json!(match protocol {
+                        Protocol::VlessXudp => "xudp",
+                        _ => "",
+                    });
+                    outbound["multiplex"] = json!({"enabled": false});
+                }
+            }
+            json!({
+                "log": {"level": "warn", "timestamp": false},
+                "inbounds": [{"type": "socks", "tag": "local", "listen": "127.0.0.1",
+                    "listen_port": listen.port()}],
+                "outbounds": [outbound], "route": {"final": "kernel"}
+            })
+        }
+        "xray" => {
+            // https://github.com/XTLS/Xray-core/blob/a4a3dff5b20c2faae567b742c172c7b95e75c083/infra/conf/vless.go
+            let settings = match protocol {
+                Protocol::Trojan => json!({"servers": [{"address": "127.0.0.1",
+                    "port": server.port(), "password": credential}]}),
+                Protocol::Vless | Protocol::VlessXudp => {
+                    json!({"address": "127.0.0.1", "port": server.port(),
+                    "id": credential, "flow": "", "encryption": "none"})
+                }
+            };
+            let mux = match protocol {
+                // XUDP 模式保留默认 cone，只将 UDP（非 53/443）改为命令 3；
+                // 普通 TCP 仍用命令 1，不开启通用 TCP mux。
+                // https://github.com/XTLS/Xray-core/blob/a4a3dff5b20c2faae567b742c172c7b95e75c083/proxy/vless/outbound/outbound.go#L303-L320
+                Protocol::Trojan | Protocol::VlessXudp => json!({"enabled": false}),
+                Protocol::Vless => json!({"enabled": false, "concurrency": -1,
+                    "xudpConcurrency": -1}),
+            };
+            json!({
+                "log": {"loglevel": "warning", "access": "none"},
+                "inbounds": [{"tag": "local", "listen": "127.0.0.1", "port": listen.port(),
+                    "protocol": "socks", "settings": {"auth": "noauth", "udp": true,
+                        "ip": "127.0.0.1"}}],
+                "outbounds": [{"tag": "kernel", "protocol": protocol.name(),
+                    "settings": settings,
+                    "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {
+                        "serverName": "localhost", "allowInsecure": false, "disableSystemRoot": true,
+                        "certificates": [{"certificateFile": trust_path, "usage": "verify",
+                            "oneTimeLoading": true}]}},
+                    "mux": mux}]
+            })
+        }
+        _ => bail!("未知参考客户端"),
+    })
+}
+
+struct ClientProcess {
+    child: Child,
+    address: SocketAddr,
+    log_path: PathBuf,
+}
+
+impl ClientProcess {
+    async fn start(
+        client: &ReferenceClient,
+        protocol: Protocol,
+        directory: &Path,
+        server: SocketAddr,
+        trust_path: &Path,
+        credential: &str,
+    ) -> Result<Self> {
+        Self::start_configured(
+            client,
+            directory,
+            |listen| {
+                client_config(
+                    &client.name,
+                    protocol,
+                    listen,
+                    server,
+                    trust_path,
+                    credential,
+                )
+            },
+            |command| protocol.configure_command(&client.name, command),
+        )
+        .await
+    }
+
+    async fn start_shadowsocks(
+        client: &ReferenceClient,
+        mode: shadowsocks_reference::Mode,
+        scenario: shadowsocks_reference::Scenario,
+        directory: &Path,
+        server: SocketAddr,
+    ) -> Result<Self> {
+        Self::start_configured(
+            client,
+            directory,
+            |listen| {
+                shadowsocks_reference::client_config(&client.name, mode, scenario, listen, server)
+            },
+            |_| {},
+        )
+        .await
+    }
+
+    // 旧协议和 SS 必须共用同一条端口预留、私有配置、最小环境与进程守卫路径。
+    async fn start_configured(
+        client: &ReferenceClient,
+        directory: &Path,
+        config: impl FnOnce(SocketAddr) -> Result<Value>,
+        configure_command: impl FnOnce(&mut Command),
+    ) -> Result<Self> {
+        let (tcp_reservation, udp_reservation, listen) = reserve_port()?;
+        let config_path = directory.join("client.json");
+        private_write(&config_path, &serde_json::to_vec_pretty(&config(listen)?)?)?;
+        let working = directory.join("work");
+        fs::create_dir(&working)?; // Empty and separate from the preserved configuration.
+        let log_path = directory.join("client.log");
+        let log = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&log_path)?;
+        let mut command = Command::new(&client.path);
+        match client.name.as_str() {
+            "mihomo" => {
+                command.arg("-d").arg(&working).arg("-f").arg(&config_path);
+            }
+            "sing-box" => {
+                command.arg("run").arg("-c").arg(&config_path);
+            }
+            "xray" => {
+                command.arg("run").arg("-config").arg(&config_path);
+            }
+            _ => bail!("未知参考客户端"),
+        }
+        command
+            .current_dir(&working)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &working)
+            .env("XDG_CONFIG_HOME", &working)
+            .env("XDG_CACHE_HOME", &working)
+            .env("TMPDIR", &working)
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .env("DISABLE_SYSTEM_CA", "true")
+            .env("DISABLE_EMBED_CA", "true")
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log);
+        configure_command(&mut command);
+        // 每次场景启动前重新核对普通文件、固定平台/版本及二进制摘要。
+        verify_reference_binary(client)?;
+        // 客户端通过配置绑定端口，不接受继承的监听描述符。
+        drop(tcp_reservation);
+        drop(udp_reservation);
+        let mut process = Self {
+            child: command.spawn()?,
+            address: listen,
+            log_path,
+        };
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            process.assert_running()?;
+            if let Ok(mut probe) = TcpStream::connect(listen).await {
+                probe.write_all(&[5, 1, 0]).await?;
+                let mut response = [0; 2];
+                timeout(DEADLINE, probe.read_exact(&mut response)).await??;
+                ensure!(response == [5, 0], "参考客户端 SOCKS 就绪探针失败");
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "参考客户端未就绪，日志: {}",
+                process.log_path.display()
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        Ok(process)
+    }
+
+    fn assert_running(&mut self) -> Result<()> {
+        ensure!(
+            self.child.try_wait()?.is_none(),
+            "参考客户端提前退出，日志: {}",
+            self.log_path.display()
+        );
+        Ok(())
+    }
+
+    fn stop(mut self) -> Result<()> {
+        self.child.kill().context("终止参考客户端失败")?;
+        self.child.wait().context("回收参考客户端失败")?;
+        // 等待进程退出后验证 TCP/UDP 监听端口都已释放。
+        let _tcp = PortReservation::bind(self.address).context("参考客户端 TCP 监听未释放")?;
+        let _udp = UdpReservation::bind(self.address).context("参考客户端 UDP 监听未释放")?;
+        Ok(())
+    }
+}
+
+impl Drop for ClientProcess {
+    fn drop(&mut self) {
+        // 错误、panic、取消和超时路径均回收子进程。
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn reserve_port() -> Result<(PortReservation, UdpReservation, SocketAddr)> {
+    for _ in 0..16 {
+        let tcp = PortReservation::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let listen = tcp.local_addr()?;
+        if listen.port() < 1024 {
+            continue;
+        }
+        if let Ok(udp) = UdpReservation::bind(listen) {
+            return Ok((tcp, udp, listen));
+        }
+    }
+    bail!("无法为本机 SOCKS 同时保留 TCP/UDP 动态端口")
+}
+
+fn relay_address(mut relay: SocketAddr) -> Result<SocketAddr> {
+    if relay.ip().is_unspecified() {
+        relay.set_ip(Ipv4Addr::LOCALHOST.into());
+    }
+    ensure!(
+        relay.ip().is_loopback() && relay.port() >= 1024,
+        "SOCKS UDP relay 不是本机高端口"
+    );
+    Ok(relay)
+}
+
+async fn positive_udp(proxy: SocketAddr, protocol: Protocol) -> Result<Value> {
+    let first_udp = Echo::udp("127.0.0.1").await;
+    let second_udp = Echo::udp("127.0.0.1").await;
+    // Trojan/XUDP 在同一 SOCKS 关联内切换目标；原生 VLESS 每个关联固定一个目标。
+    let association_count = match protocol {
+        Protocol::Trojan | Protocol::VlessXudp => 1,
+        Protocol::Vless => 2,
+    };
+    if matches!(protocol, Protocol::VlessXudp) {
+        // 固定 Xray 的 cone 路径对 53/443 端口例外，确保测试数据报实际走 XUDP。
+        ensure!(
+            [first_udp.address.port(), second_udp.address.port()]
+                .iter()
+                .all(|port| !matches!(*port, 53 | 443)),
+            "XUDP 回显目标不能使用 Xray cone 路径的例外端口"
+        );
+    }
+    positive_udp_targets(proxy, &first_udp, &second_udp, association_count).await
+}
+
+async fn positive_udp_targets(
+    proxy: SocketAddr,
+    first_udp: &Echo,
+    second_udp: &Echo,
+    association_count: usize,
+) -> Result<Value> {
+    ensure!(
+        (1..=2).contains(&association_count),
+        "UDP 探针关联数超出范围"
+    );
+    let mut associations = Vec::new();
+    for _ in 0..association_count {
+        let (control, relay) = socks(3, address("0.0.0.0:0".parse()?), proxy).await;
+        associations.push((
+            control,
+            relay_address(relay)?,
+            UdpSocket::bind("127.0.0.1:0").await?,
+        ));
+    }
+    let mut received = [0; 2048];
+    for (target_index, destination, payload) in [
+        (0, first_udp.address, b"first-udp\0\xff".as_slice()),
+        (1, second_udp.address, b"second-target".as_slice()),
+        (0, first_udp.address, b"return-to-first".as_slice()),
+    ] {
+        let (_, relay, datagrams) = &associations[target_index % association_count];
+        let mut packet = vec![0, 0, 0];
+        packet.extend(address(destination));
+        packet.extend(payload);
+        datagrams.send_to(&packet, *relay).await?;
+        let (length, sender) = timeout(DEADLINE, datagrams.recv_from(&mut received))
+            .await
+            .context("参考客户端 UDP 回显超时")??;
+        ensure!(sender == *relay, "UDP 响应来源不是参考客户端 relay");
+        ensure!(received[..length] == packet, "UDP 响应地址或载荷改变");
+    }
+    Ok(
+        json!({"udp": "passed", "udp_datagrams": 3, "udp_targets": 2,
+        "udp_socks_associations": association_count}),
+    )
+}
+
+async fn positive_traffic(
+    proxy: SocketAddr,
+    server: &Running,
+    protocol: Protocol,
+    udp: bool,
+) -> Result<Value> {
+    let tcp = Echo::tcp("127.0.0.1", false).await;
+    let payload = format!("official-client-{}-tcp", protocol.name());
+    let payload = [payload.as_bytes(), b"\0\xff"].concat();
+    let (mut stream, _) = socks(1, address(tcp.address), proxy).await;
+    exchange(&mut stream, &payload).await;
+    drop(stream);
+    let mut result = if udp {
+        positive_udp(proxy, protocol).await?
+    } else {
+        json!({"udp": "unsupported_by_client_baseline"})
+    };
+    let snapshot = server.stats.snapshot();
+    ensure!(
+        snapshot.uplink > 0 && snapshot.downlink > 0,
+        "项目服务端未统计到真实转发流量"
+    );
+    result["tcp"] = json!("passed");
+    result["server_stats"] = json!(snapshot);
+    Ok(result)
+}
+
+async fn tcp_denied(proxy: SocketAddr, target: SocketAddr) -> Result<()> {
+    let mut stream = TcpStream::connect(proxy).await?;
+    stream.write_all(&[5, 1, 0]).await?;
+    let mut greeting = [0; 2];
+    timeout(DEADLINE, stream.read_exact(&mut greeting)).await??;
+    ensure!(greeting == [5, 0], "负向测试的 SOCKS 入口不可用");
+    let mut request = vec![5, 1, 0];
+    request.extend(address(target));
+    // 某些 SOCKS 实现在完成上游协议握手前先返回乐观成功应答。
+    request.extend(b"negative-auth-probe");
+    stream.write_all(&request).await?;
+    timeout(DEADLINE, async {
+        let mut header = [0; 4];
+        match stream.read_exact(&mut header).await {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        ensure!(header[0] == 5 && header[2] == 0, "无效 SOCKS 回复");
+        if header[1] != 0 {
+            ensure!((1..=8).contains(&header[1]), "无效 SOCKS 拒绝码");
+            return Ok(());
+        }
+        let size = match header[3] {
+            1 => 4,
+            4 => 16,
+            3 => stream.read_u8().await? as usize,
+            _ => bail!("无效 SOCKS BND 地址"),
+        };
+        let mut bound = vec![0; size + 2];
+        stream.read_exact(&mut bound).await?;
+        let mut response = [0; 1];
+        match stream.read(&mut response).await {
+            Ok(0) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                Ok(())
+            }
+            Ok(_) => bail!("负向测试收到不应存在的代理载荷"),
+            Err(error) => Err(error.into()),
+        }
+    })
+    .await
+    .context("负向 TCP 请求没有明确关闭或 SOCKS 拒绝")?
+}
+
+async fn wait_rejected(server: &Running, before: u64) -> Result<()> {
+    timeout(DEADLINE, async {
+        while server.stats.snapshot().rejected <= before {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("项目服务端没有观察到拒绝，不能仅凭客户端超时判断成功")
+}
+
+async fn negative_traffic(proxy: SocketAddr, server: &Running, udp: bool) -> Result<Value> {
+    let target = TcpListener::bind("127.0.0.1:0").await?;
+    let before = server.stats.snapshot().rejected;
+    tcp_denied(proxy, target.local_addr()?).await?;
+    wait_rejected(server, before).await?;
+    ensure!(
+        timeout(Duration::from_millis(150), target.accept())
+            .await
+            .is_err(),
+        "负向认证/TLS 场景仍连接到 TCP 目标"
+    );
+    if udp {
+        let target = UdpSocket::bind("127.0.0.1:0").await?;
+        let local = UdpSocket::bind("127.0.0.1:0").await?;
+        let (control, relay) = socks(3, address("0.0.0.0:0".parse()?), proxy).await;
+        let relay = relay_address(relay)?;
+        let before = server.stats.snapshot().rejected;
+        let mut packet = vec![0, 0, 0];
+        packet.extend(address(target.local_addr()?));
+        packet.extend(b"negative-udp-probe");
+        local.send_to(&packet, relay).await?;
+        wait_rejected(server, before).await?;
+        let mut target_buffer = [0; 256];
+        let mut client_buffer = [0; 256];
+        let unexpected = timeout(Duration::from_millis(300), async {
+            tokio::select! {
+                result = target.recv_from(&mut target_buffer) => result,
+                result = local.recv_from(&mut client_buffer) => result,
+            }
+        })
+        .await;
+        ensure!(
+            unexpected.is_err(),
+            "错误身份仍产生 UDP 目标流量或客户端数据"
+        );
+        drop(control);
+    }
+    let snapshot = server.stats.snapshot();
+    ensure!(
+        snapshot.uplink == 0 && snapshot.downlink == 0,
+        "拒绝场景产生了项目转发载荷"
+    );
+    Ok(json!({"tcp_rejected": true, "udp_rejected": udp,
+        "target_untouched": true, "server_stats": snapshot}))
+}
+
+async fn run_scenarios(
+    client: &ReferenceClient,
+    protocol: Protocol,
+    artifacts: &Path,
+) -> Result<Value> {
+    let certificate = Certificate::new();
+    let unrelated = Certificate::new();
+    let mut results = serde_json::Map::new();
+    for scenario in [
+        Scenario::Valid,
+        Scenario::WrongCredential,
+        Scenario::UntrustedCertificate,
+    ] {
+        let directory = artifacts.join(scenario.name(protocol));
+        fs::create_dir(&directory)?;
+        let cert_path = directory.join("server-cert.pem");
+        let key_path = directory.join("server-key.pem");
+        private_write(
+            &cert_path,
+            &fs::read(certificate.dir.path().join("cert.pem"))?,
+        )?;
+        private_write(
+            &key_path,
+            &fs::read(certificate.dir.path().join("key.pem"))?,
+        )?;
+        let trust_path = directory.join("trusted-cert.pem");
+        let trust = if matches!(scenario, Scenario::UntrustedCertificate) {
+            &unrelated
+        } else {
+            &certificate
+        };
+        private_write(&trust_path, &fs::read(trust.dir.path().join("cert.pem"))?)?;
+        let mut inbound = protocol.inbound(&certificate);
+        inbound["certificate"] = json!(cert_path);
+        inbound["private_key"] = json!(key_path);
+        let mut config = socks_config();
+        config["inbounds"] = json!([inbound]);
+        config["limits"]["handshake_timeout_ms"] = json!(3000);
+        config["limits"]["udp_idle_timeout_ms"] = json!(3000);
+        config["limits"]["shutdown_timeout_ms"] = json!(300);
+        private_write(
+            &directory.join("server.json"),
+            &serde_json::to_vec_pretty(&config)?,
+        )?;
+        let server = Running::start(config).await;
+        let mut process = ClientProcess::start(
+            client,
+            protocol,
+            &directory,
+            server.address,
+            &trust_path,
+            protocol.credential(scenario),
+        )
+        .await?;
+        let udp = protocol.udp_supported(&client.name);
+        let result = match scenario {
+            Scenario::Valid => positive_traffic(process.address, &server, protocol, udp).await,
+            Scenario::WrongCredential => negative_traffic(process.address, &server, udp).await,
+            Scenario::UntrustedCertificate => {
+                negative_traffic(process.address, &server, false).await
+            }
+        }
+        .with_context(|| {
+            format!(
+                "{} {}；保留日志 {}",
+                client.name,
+                scenario.name(protocol),
+                directory.display()
+            )
+        });
+        process.assert_running()?;
+        process.stop()?;
+        server.shutdown().await;
+        results.insert(scenario.name(protocol).to_owned(), result?);
+        eprintln!(
+            "{} {} {} {}: passed",
+            client.name,
+            client.version,
+            protocol.mode(),
+            scenario.name(protocol)
+        );
+    }
+    Ok(Value::Object(results))
+}
+
+async fn real_interop(name: &str, protocol: Protocol) -> Result<()> {
+    let client = reference_client(name)?;
+    let root = project().join(".test-artifacts");
+    fs::create_dir_all(&root)?;
+    let artifacts = tempfile::Builder::new()
+        .prefix(&format!("interop-{name}-{}-", protocol.mode()))
+        .tempdir_in(&root)?
+        .keep();
+    eprintln!(
+        "{} {} artifacts: {}",
+        client.name,
+        client.version,
+        artifacts.display()
+    );
+    let result = timeout(
+        Duration::from_secs(60),
+        run_scenarios(&client, protocol, &artifacts),
+    )
+    .await
+    .context("真实客户端互通测试超过 60 秒")
+    .and_then(|result| result);
+    let mut report = match &result {
+        Ok(scenarios) => json!({"client": name, "version": client.version,
+            "protocol": protocol.name(), "mode": protocol.mode(), "status": "passed",
+            "certificate_verification": "custom trust with localhost verification; unrelated certificate rejected",
+            "scenarios": scenarios}),
+        Err(error) => json!({"client": name, "version": client.version,
+            "protocol": protocol.name(), "mode": protocol.mode(), "status": "failed", "error": format!("{error:#}")}),
+    };
+    if !protocol.udp_supported(name) {
+        report["udp"] = json!("unsupported_by_client_baseline");
+    }
+    private_write(
+        &artifacts.join("result.json"),
+        &serde_json::to_vec_pretty(&report)?,
+    )?;
+    result.map(|_| ())
+}
+
+// 以下配置生成测试只读取临时证书和检查 JSON/Command，不读取 manifest 或启动进程。
+#[test]
+fn configuration_generation_vless_transport_and_udp_scope() -> Result<()> {
+    let certificate = Certificate::new();
+    let trust = certificate.dir.path().join("cert.pem");
+    let listen = "127.0.0.1:1080".parse()?;
+    let server = "127.0.0.1:1443".parse()?;
+    let mihomo = client_config("mihomo", Protocol::Vless, listen, server, &trust, UUID)?;
+    assert_eq!(
+        mihomo["proxies"][0],
+        json!({
+            "name": "kernel", "type": "vless", "server": "127.0.0.1", "port": 1443,
+            "uuid": UUID, "flow": "", "tls": true, "servername": "localhost",
+            "skip-cert-verify": false, "udp": false, "smux": {"enabled": false}
+        })
+    );
+    assert_eq!(
+        mihomo["tls"]["custom-certifactes"],
+        json!([fs::read_to_string(&trust)?])
+    );
+    assert!(!Protocol::Vless.udp_supported("mihomo"));
+
+    let sing_box = client_config("sing-box", Protocol::Vless, listen, server, &trust, UUID)?;
+    assert_eq!(
+        sing_box["outbounds"][0],
+        json!({
+            "type": "vless", "tag": "kernel", "server": "127.0.0.1", "server_port": 1443,
+            "uuid": UUID, "flow": "", "packet_encoding": "", "multiplex": {"enabled": false},
+            "tls": {"enabled": true, "server_name": "localhost", "insecure": false,
+                "certificate_path": trust}
+        })
+    );
+    assert!(Protocol::Vless.udp_supported("sing-box"));
+
+    let xray = client_config("xray", Protocol::Vless, listen, server, &trust, UUID)?;
+    assert_eq!(
+        xray["outbounds"][0],
+        json!({
+            "tag": "kernel", "protocol": "vless",
+            "settings": {"address": "127.0.0.1", "port": 1443, "id": UUID,
+                "flow": "", "encryption": "none"},
+            "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {
+                "serverName": "localhost", "allowInsecure": false, "disableSystemRoot": true,
+                "certificates": [{"certificateFile": trust, "usage": "verify", "oneTimeLoading": true}]}},
+            "mux": {"enabled": false, "concurrency": -1, "xudpConcurrency": -1}
+        })
+    );
+    assert!(Protocol::Vless.udp_supported("xray"));
+    Ok(())
+}
+
+#[test]
+fn configuration_generation_trojan_preserves_existing_outbounds() -> Result<()> {
+    let certificate = Certificate::new();
+    let trust = certificate.dir.path().join("cert.pem");
+    let listen = "127.0.0.1:1080".parse()?;
+    let server = "127.0.0.1:1443".parse()?;
+    let mihomo = client_config("mihomo", Protocol::Trojan, listen, server, &trust, PASSWORD)?;
+    assert_eq!(
+        mihomo["proxies"][0],
+        json!({
+            "name": "kernel", "type": "trojan", "server": "127.0.0.1", "port": 1443,
+            "password": PASSWORD, "sni": "localhost", "skip-cert-verify": false, "udp": true
+        })
+    );
+    let sing_box = client_config(
+        "sing-box",
+        Protocol::Trojan,
+        listen,
+        server,
+        &trust,
+        PASSWORD,
+    )?;
+    assert_eq!(
+        sing_box["outbounds"][0],
+        json!({
+            "type": "trojan", "tag": "kernel", "server": "127.0.0.1", "server_port": 1443,
+            "password": PASSWORD, "tls": {"enabled": true, "server_name": "localhost",
+                "insecure": false, "certificate_path": trust}
+        })
+    );
+    let xray = client_config("xray", Protocol::Trojan, listen, server, &trust, PASSWORD)?;
+    assert_eq!(
+        xray["outbounds"][0],
+        json!({
+            "tag": "kernel", "protocol": "trojan",
+            "settings": {"servers": [{"address": "127.0.0.1", "port": 1443, "password": PASSWORD}]},
+            "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {
+                "serverName": "localhost", "allowInsecure": false, "disableSystemRoot": true,
+                "certificates": [{"certificateFile": trust, "usage": "verify", "oneTimeLoading": true}]}},
+            "mux": {"enabled": false}
+        })
+    );
+    assert_eq!(
+        Protocol::Trojan.inbound(&certificate),
+        certificate.inbound()
+    );
+    Ok(())
+}
+
+#[test]
+fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Result<()> {
+    let certificate = Certificate::new();
+    let unrelated = Certificate::new();
+    let listen = "127.0.0.1:1080".parse()?;
+    let server = "127.0.0.1:1443".parse()?;
+    assert_ne!(UUID, WRONG_UUID);
+    assert_eq!(
+        Scenario::WrongCredential.name(Protocol::Vless),
+        "wrong-uuid"
+    );
+    assert_eq!(
+        Scenario::WrongCredential.name(Protocol::Trojan),
+        "wrong-password"
+    );
+    for protocol in [Protocol::Trojan, Protocol::Vless, Protocol::VlessXudp] {
+        for scenario in [
+            Scenario::Valid,
+            Scenario::WrongCredential,
+            Scenario::UntrustedCertificate,
+        ] {
+            let credential = protocol.credential(scenario);
+            let trust = if matches!(scenario, Scenario::UntrustedCertificate) {
+                &unrelated
+            } else {
+                &certificate
+            }
+            .dir
+            .path()
+            .join("cert.pem");
+            let mut inbound = protocol.inbound(&certificate);
+            let key = match protocol {
+                Protocol::Trojan => "password",
+                Protocol::Vless | Protocol::VlessXudp => "uuid",
+            };
+            assert_eq!(
+                inbound["users"][0][key],
+                protocol.credential(Scenario::Valid)
+            );
+            // 两个 UUID 都必须通过正式配置校验，错误用例才能验证服务端认证失败。
+            inbound["users"][0][key] = json!(credential);
+            let mut server_config = socks_config();
+            server_config["inbounds"] = json!([inbound]);
+            dubhe::Config::from_json(&server_config.to_string())?;
+            for client in ["mihomo", "sing-box", "xray"] {
+                let config = client_config(client, protocol, listen, server, &trust, credential)?;
+                let (actual_credential, actual_trust) = match client {
+                    "mihomo" => (
+                        config["proxies"][0][key].clone(),
+                        config["tls"]["custom-certifactes"][0].clone(),
+                    ),
+                    "sing-box" => (
+                        config["outbounds"][0][key].clone(),
+                        json!(fs::read_to_string(
+                            config["outbounds"][0]["tls"]["certificate_path"]
+                                .as_str()
+                                .unwrap()
+                        )?),
+                    ),
+                    "xray" => {
+                        let outbound = &config["outbounds"][0];
+                        let identity = match protocol {
+                            Protocol::Trojan => &outbound["settings"]["servers"][0]["password"],
+                            Protocol::Vless | Protocol::VlessXudp => &outbound["settings"]["id"],
+                        };
+                        (identity.clone(), json!(fs::read_to_string(outbound["streamSettings"]["tlsSettings"]["certificates"][0]["certificateFile"].as_str().unwrap())?))
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(actual_credential, credential);
+                assert_eq!(actual_trust, fs::read_to_string(&trust)?);
+                assert_eq!(
+                    credential == protocol.credential(Scenario::Valid),
+                    !matches!(scenario, Scenario::WrongCredential)
+                );
+                assert_eq!(
+                    actual_trust == fs::read_to_string(certificate.dir.path().join("cert.pem"))?,
+                    !matches!(scenario, Scenario::UntrustedCertificate)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn configuration_generation_xudp_enables_udp_without_tcp_mux() -> Result<()> {
+    let certificate = Certificate::new();
+    let trust = certificate.dir.path().join("cert.pem");
+    let listen = "127.0.0.1:1080".parse()?;
+    let server = "127.0.0.1:1443".parse()?;
+    let protocol = Protocol::VlessXudp;
+    assert_eq!(protocol.mode(), "vless-xudp");
+    assert_eq!(Scenario::WrongCredential.name(protocol), "wrong-uuid");
+    let inbound = protocol.inbound(&certificate);
+    assert_eq!(inbound["type"], "vless");
+    assert_eq!(inbound["xudp"], true);
+    assert!(Protocol::Vless.inbound(&certificate).get("xudp").is_none());
+
+    for client in ["mihomo", "sing-box", "xray"] {
+        assert!(protocol.udp_supported(client));
+        let config = client_config(client, protocol, listen, server, &trust, UUID)?;
+        // 对比已另行验证的基础配置，只允许这些 UDP 模式字段变化；TLS/身份不变。
+        let mut expected = client_config(client, Protocol::Vless, listen, server, &trust, UUID)?;
+        match client {
+            "mihomo" => {
+                expected["proxies"][0]["udp"] = json!(true);
+                expected["proxies"][0]["xudp"] = json!(true);
+                assert_eq!(config["proxies"][0]["smux"]["enabled"], false);
+            }
+            "sing-box" => {
+                expected["outbounds"][0]["packet_encoding"] = json!("xudp");
+                assert_eq!(config["outbounds"][0]["multiplex"]["enabled"], false);
+            }
+            "xray" => {
+                expected["outbounds"][0]["mux"] = json!({"enabled": false});
+                assert_eq!(config["outbounds"][0]["mux"]["enabled"], false);
+                assert_eq!(config["outbounds"][0]["settings"]["flow"], "");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(config, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn configuration_generation_xray_disables_implicit_xudp() {
+    for protocol in [Protocol::Trojan, Protocol::Vless, Protocol::VlessXudp] {
+        for client in ["mihomo", "sing-box", "xray"] {
+            // 仅检查命令环境，不调用 spawn/status/output，也不访问下载的二进制。
+            let mut command = Command::new("never-executed");
+            command.env_clear();
+            protocol.configure_command(client, &mut command);
+            let variables: Vec<_> = command.get_envs().collect();
+            if matches!((protocol, client), (Protocol::Vless, "xray")) {
+                assert_eq!(
+                    variables,
+                    vec![(
+                        std::ffi::OsStr::new("XRAY_CONE_DISABLED"),
+                        Some(std::ffi::OsStr::new("true"))
+                    )]
+                );
+            } else {
+                assert!(variables.is_empty());
+            }
+        }
+    }
+}
+
+// SS 7.1 只生成配置，不读取 manifest，不保留/执行任何客户端命令。
+#[test]
+fn configuration_generation_shadowsocks_24_modes_native_udp_without_tls_or_extensions() -> Result<()>
+{
+    use shadowsocks_reference::{CLIENTS, MODES, client_config};
+    let listen = "127.0.0.1:1080".parse()?;
+    let server = "127.0.0.1:1443".parse()?;
+    let mut combinations = std::collections::HashSet::new();
+    let mut scenario_configs = std::collections::HashSet::new();
+    for mode in MODES {
+        let server_config = mode.server_config()?;
+        let inbound = &server_config["inbounds"][0];
+        assert_eq!(inbound["type"], "shadowsocks");
+        assert_eq!(inbound["method"], serde_json::to_value(mode.method)?);
+        assert_eq!(inbound["listen"], "127.0.0.1:0");
+        assert_eq!(inbound.get("users").is_some(), mode.eih);
+        assert!(inbound.get("certificate").is_none());
+        assert!(inbound.get("private_key").is_none());
+        for client in CLIENTS {
+            assert!(combinations.insert((client, mode.name())));
+            for &scenario in mode.scenarios() {
+                assert!(scenario_configs.insert((client, mode.name(), scenario.name())));
+                let credential = mode.credential(scenario)?;
+                let config = client_config(client, mode, scenario, listen, server)?;
+                match client {
+                    "mihomo" => {
+                        assert_eq!(config["socks-port"], 1080);
+                        assert_eq!(config["bind-address"], "127.0.0.1");
+                        assert_eq!(config["allow-lan"], false);
+                        assert_eq!(config["dns"]["enable"], false);
+                        assert_eq!(config["tun"]["enable"], false);
+                        assert_eq!(config["external-controller"], "");
+                        assert!(config.get("tls").is_none());
+                        assert_eq!(
+                            config["proxies"],
+                            json!([{
+                                "name":"kernel", "type":"ss", "server":"127.0.0.1", "port":1443,
+                                "cipher":mode.method.cipher().to_string(), "password":credential,
+                                "udp":true, "udp-over-tcp":false, "smux":{"enabled":false}
+                            }])
+                        );
+                        assert_eq!(config["rules"], json!(["MATCH,kernel"]));
+                        for url in config["geox-url"].as_object().unwrap().values() {
+                            assert_eq!(url, "http://127.0.0.1:9/download-disabled");
+                        }
+                    }
+                    "sing-box" => {
+                        assert_eq!(
+                            config["inbounds"],
+                            json!([{
+                                "type":"socks", "tag":"local", "listen":"127.0.0.1", "listen_port":1080
+                            }])
+                        );
+                        assert_eq!(
+                            config["outbounds"],
+                            json!([{
+                                "type":"shadowsocks", "tag":"kernel", "server":"127.0.0.1", "server_port":1443,
+                                "method":mode.method.cipher().to_string(), "password":credential,
+                                "network":["tcp", "udp"], "udp_over_tcp":false, "multiplex":{"enabled":false}
+                            }])
+                        );
+                        assert_eq!(config["route"]["final"], "kernel");
+                    }
+                    "xray" => {
+                        assert_eq!(
+                            config["inbounds"],
+                            json!([{
+                                "tag":"local", "listen":"127.0.0.1", "port":1080, "protocol":"socks",
+                                "settings":{"auth":"noauth", "udp":true, "ip":"127.0.0.1"}
+                            }])
+                        );
+                        assert_eq!(
+                            config["outbounds"],
+                            json!([{
+                                "tag":"kernel", "protocol":"shadowsocks",
+                                "settings":{"address":"127.0.0.1", "port":1443,
+                                    "method":mode.method.cipher().to_string(), "password":credential},
+                                "streamSettings":{"network":"tcp", "security":"none"},
+                                "mux":{"enabled":false}
+                            }])
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                // 严格比较出站字段之外，递归禁止把其他协议的 TLS/UoT/插件字段带进来。
+                fn no_tls_or_plugin(value: &Value) {
+                    match value {
+                        Value::Object(object) => {
+                            for (key, value) in object {
+                                assert!(!matches!(
+                                    key.as_str(),
+                                    "tls"
+                                        | "tlsSettings"
+                                        | "certificate"
+                                        | "certificate_path"
+                                        | "certificateFile"
+                                        | "private_key"
+                                        | "plugin"
+                                        | "plugin-opts"
+                                        | "plugin_opts"
+                                        | "packet_encoding"
+                                        | "xudp"
+                                        | "flow"
+                                        | "sni"
+                                        | "servername"
+                                        | "skip-cert-verify"
+                                ));
+                                no_tls_or_plugin(value);
+                            }
+                        }
+                        Value::Array(values) => values.iter().for_each(no_tls_or_plugin),
+                        _ => {}
+                    }
+                }
+                no_tls_or_plugin(&config);
+            }
+        }
+    }
+    assert_eq!(combinations.len(), 24);
+    assert_eq!(scenario_configs.len(), 60);
+    Ok(())
+}
+
+#[test]
+fn configuration_generation_shadowsocks_users_and_negative_keys_remain_well_formed() -> Result<()> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use shadowsocks_reference::{MODES, Scenario};
+    for mode in MODES {
+        let config = mode.server_config()?;
+        let inbound = &config["inbounds"][0];
+        let mut scenario_names = std::collections::HashSet::new();
+        if mode.eih {
+            let users = inbound["users"].as_array().unwrap();
+            assert_eq!(users.len(), 2);
+            assert_ne!(users[0]["name"], users[1]["name"]);
+            assert_ne!(users[0]["password"], users[1]["password"]);
+        }
+        for &scenario in mode.scenarios() {
+            assert!(scenario_names.insert(scenario.name()));
+            let credential = mode.credential(scenario)?;
+            if !mode.method.is_2022() {
+                assert!(!credential.is_empty());
+                assert_eq!(credential == PASSWORD, scenario.accepted());
+                assert_eq!(mode.scenarios().len(), 2);
+                continue;
+            }
+            let components: Vec<_> = credential.split(':').collect();
+            assert_eq!(components.len(), if mode.eih { 2 } else { 1 });
+            for component in &components {
+                let key = STANDARD.decode(component)?;
+                assert_eq!(key.len(), mode.method.cipher().key_len());
+                assert_eq!(STANDARD.encode(key), *component);
+            }
+            if mode.eih {
+                let identity = inbound["password"].as_str().unwrap();
+                let user0 = inbound["users"][0]["password"].as_str().unwrap();
+                let user1 = inbound["users"][1]["password"].as_str().unwrap();
+                assert_ne!(identity, user0);
+                assert_ne!(identity, user1);
+                match scenario {
+                    Scenario::Valid => assert_eq!(components, [identity, user0]),
+                    Scenario::SecondUser => assert_eq!(components, [identity, user1]),
+                    Scenario::WrongIdentity => {
+                        assert_ne!(components[0], identity);
+                        assert_eq!(components[1], user0);
+                    }
+                    Scenario::UnknownUser => {
+                        assert_eq!(components[0], identity);
+                        assert_ne!(components[1], user0);
+                        assert_ne!(components[1], user1);
+                        assert_ne!(components[1], identity);
+                    }
+                    Scenario::WrongCredential => unreachable!(),
+                }
+                assert_eq!(
+                    scenario.accepted(),
+                    matches!(scenario, Scenario::Valid | Scenario::SecondUser)
+                );
+                assert_eq!(mode.scenarios().len(), 4);
+            } else {
+                assert_eq!(
+                    components[0] == inbound["password"].as_str().unwrap(),
+                    scenario.accepted()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn configuration_generation_shadowsocks_rejects_out_of_scope_modes_scenarios_and_addresses()
+-> Result<()> {
+    use dubhe::config::ShadowsocksMethod;
+    use shadowsocks_reference::{MODES, Mode, Scenario, client_config};
+    let listen = "127.0.0.1:1080".parse()?;
+    let server = "127.0.0.1:1443".parse()?;
+    for method in [
+        ShadowsocksMethod::Aes128Gcm,
+        ShadowsocksMethod::Aes256Gcm,
+        ShadowsocksMethod::Chacha20Poly1305,
+        ShadowsocksMethod::Aead2022Chacha20Poly1305,
+    ] {
+        let mode = Mode { method, eih: true };
+        assert!(mode.server_config().is_err());
+        assert!(mode.credential(Scenario::Valid).is_err());
+    }
+    assert!(MODES[0].credential(Scenario::SecondUser).is_err());
+    assert!(MODES[6].credential(Scenario::WrongCredential).is_err());
+    assert!(client_config("unknown", MODES[0], Scenario::Valid, listen, server).is_err());
+    for (local, remote) in [
+        ("0.0.0.0:1080", "127.0.0.1:1443"),
+        ("127.0.0.1:1080", "192.0.2.1:1443"),
+        ("127.0.0.1:80", "127.0.0.1:1443"),
+        ("127.0.0.1:1080", "127.0.0.1:0"),
+        ("127.0.0.1:1080", "127.0.0.1:1080"),
+    ] {
+        assert!(
+            client_config(
+                "mihomo",
+                MODES[0],
+                Scenario::Valid,
+                local.parse()?,
+                remote.parse()?
+            )
+            .is_err()
+        );
+    }
+    Ok(())
+}
+
+// 注册表和所有 ignored 入口由同一声明产生，防止手工列表遗漏或换用不安全启动路径。
+macro_rules! shadowsocks_reference_cases {
+    ($(($test:ident, $client:literal, $mode:literal)),+ $(,)?) => {
+        const SHADOWSOCKS_CASES: &[(&str, &str, shadowsocks_reference::Mode)] = &[
+            $((stringify!($test), $client, shadowsocks_reference::MODES[$mode])),+
+        ];
+        $(
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[ignore = "需要单独授权并已校验的官方客户端；SS分方法TCP/原生UDP互通"]
+            async fn $test() -> Result<()> {
+                shadowsocks_reference::real_interop($client, shadowsocks_reference::MODES[$mode]).await
+            }
+        )+
+    };
+}
+
+shadowsocks_reference_cases!(
+    (mihomo_shadowsocks_aes_128_gcm_single, "mihomo", 0),
+    (mihomo_shadowsocks_aes_256_gcm_single, "mihomo", 1),
+    (
+        mihomo_shadowsocks_chacha20_ietf_poly1305_single,
+        "mihomo",
+        2
+    ),
+    (mihomo_shadowsocks_2022_aes_128_gcm_single, "mihomo", 3),
+    (mihomo_shadowsocks_2022_aes_256_gcm_single, "mihomo", 4),
+    (
+        mihomo_shadowsocks_2022_chacha20_poly1305_single,
+        "mihomo",
+        5
+    ),
+    (mihomo_shadowsocks_2022_aes_128_gcm_eih, "mihomo", 6),
+    (mihomo_shadowsocks_2022_aes_256_gcm_eih, "mihomo", 7),
+    (sing_box_shadowsocks_aes_128_gcm_single, "sing-box", 0),
+    (sing_box_shadowsocks_aes_256_gcm_single, "sing-box", 1),
+    (
+        sing_box_shadowsocks_chacha20_ietf_poly1305_single,
+        "sing-box",
+        2
+    ),
+    (sing_box_shadowsocks_2022_aes_128_gcm_single, "sing-box", 3),
+    (sing_box_shadowsocks_2022_aes_256_gcm_single, "sing-box", 4),
+    (
+        sing_box_shadowsocks_2022_chacha20_poly1305_single,
+        "sing-box",
+        5
+    ),
+    (sing_box_shadowsocks_2022_aes_128_gcm_eih, "sing-box", 6),
+    (sing_box_shadowsocks_2022_aes_256_gcm_eih, "sing-box", 7),
+    (xray_shadowsocks_aes_128_gcm_single, "xray", 0),
+    (xray_shadowsocks_aes_256_gcm_single, "xray", 1),
+    (xray_shadowsocks_chacha20_ietf_poly1305_single, "xray", 2),
+    (xray_shadowsocks_2022_aes_128_gcm_single, "xray", 3),
+    (xray_shadowsocks_2022_aes_256_gcm_single, "xray", 4),
+    (xray_shadowsocks_2022_chacha20_poly1305_single, "xray", 5),
+    (xray_shadowsocks_2022_aes_128_gcm_eih, "xray", 6),
+    (xray_shadowsocks_2022_aes_256_gcm_eih, "xray", 7),
+);
+
+#[test]
+fn configuration_generation_shadowsocks_ignored_registry_has_24_unique_safe_cases() {
+    use shadowsocks_reference::{CLIENTS, MODES};
+    let mut names = std::collections::HashSet::new();
+    let mut cases = std::collections::HashSet::new();
+    for &(name, client, mode) in SHADOWSOCKS_CASES {
+        assert!(names.insert(name));
+        assert!(cases.insert((client, mode.name())));
+        assert!(name.contains("shadowsocks"));
+    }
+    assert_eq!(names.len(), 24);
+    for client in CLIENTS {
+        for mode in MODES {
+            assert!(cases.contains(&(client, mode.name())));
+        }
+    }
+    // 不调用 async 函数；24 个宏生成入口只能走 real_interop -> reference_client
+    // -> start_shadowsocks -> start_configured，同一 SHA256/私有配置/RAII 启动实现。
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端"]
+async fn mihomo_trojan_tcp_udp_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::Trojan).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端"]
+async fn sing_box_trojan_tcp_udp_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::Trojan).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端"]
+async fn xray_trojan_tcp_udp_authentication() -> Result<()> {
+    real_interop("xray", Protocol::Trojan).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可；固定 Mihomo 不支持原生 VLESS UDP"]
+async fn mihomo_vless_tcp_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::Vless).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_vless_tcp_udp_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::Vless).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn xray_vless_tcp_udp_authentication() -> Result<()> {
+    real_interop("xray", Protocol::Vless).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可；VLESS XUDP 模式"]
+async fn mihomo_vless_xudp_tcp_udp_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::VlessXudp).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可；VLESS XUDP 模式"]
+async fn sing_box_vless_xudp_tcp_udp_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::VlessXudp).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可；VLESS XUDP 模式"]
+async fn xray_vless_xudp_tcp_udp_authentication() -> Result<()> {
+    real_interop("xray", Protocol::VlessXudp).await
+}

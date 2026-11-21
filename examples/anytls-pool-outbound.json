@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "inbounds": [
+    { "type": "socks5", "tag": "local", "listen": "127.0.0.1:1080" }
+  ],
+  "outbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-upstream",
+      "endpoint": "203.0.113.10:443",
+      "password": "REPLACE_WITH_A_RANDOM_ANYTLS_PASSWORD",
+      "tls": {
+        "ca_file": "/etc/ssl/private/anytls-ca.pem",
+        "server_name": "proxy.example"
+      },
+      "anytls": {
+        "disable_reuse": false,
+        "idle_session_check_interval_ms": 30000,
+        "idle_session_timeout_ms": 30000,
+        "min_idle_session": 0
+      }
+    },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "anytls-upstream" }
+}

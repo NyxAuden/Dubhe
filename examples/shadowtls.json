@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "shadowtls",
+      "tag": "shadowtls-in",
+      "listen": "127.0.0.1:8443",
+      "version": 3,
+      "users": [
+        { "name": "example-user", "password": "REPLACE_WITH_A_RANDOM_SHADOWTLS_PASSWORD" }
+      ],
+      "handshake": { "server": "www.example.com", "server_port": 443 },
+      "strict_mode": true,
+      "detour": "ss-in"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-in",
+      "listen": "127.0.0.1:8388",
+      "method": "chacha20-ietf-poly1305",
+      "password": "REPLACE_WITH_A_RANDOM_SHADOWSOCKS_PASSWORD"
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct" }
+}

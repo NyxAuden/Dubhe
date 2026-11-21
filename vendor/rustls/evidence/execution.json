@@ -1,0 +1,46 @@
+{
+  "tests": {
+    "command": [
+      "python3",
+      "-I",
+      "$PROJECT_ROOT/vendor/rustls/run-tests.py",
+      "--root",
+      "$PROJECT_ROOT"
+    ],
+    "exit_code": 0
+  },
+  "check": {
+    "command": [
+      "cargo",
+      "check",
+      "--manifest-path",
+      "$PROJECT_ROOT/Cargo.toml",
+      "-p",
+      "rustls",
+      "--lib",
+      "--offline",
+      "--locked"
+    ],
+    "exit_code": 0
+  },
+  "clippy": {
+    "command": [
+      "cargo",
+      "clippy",
+      "--manifest-path",
+      "$PROJECT_ROOT/Cargo.toml",
+      "-p",
+      "rustls",
+      "--lib",
+      "--offline",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0
+  },
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+  "recorded_at": "2026-11-05T07:11:18.150508+00:00",
+  "root_lock_sha256": "a6f70121acafa096472034013e9572754f8ad2d5adbd8a638a1f0507a3a4b2cd"
+}

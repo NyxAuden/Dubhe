@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vmess-xhttp",
+      "tag": "vmess-xhttp-tls-in",
+      "listen": "127.0.0.1:10446",
+      "users": [
+        {
+          "name": "vmess-xhttp-user",
+          "uuid": "REPLACE_WITH_A_RANDOM_VMESS_XHTTP_UUID_BEFORE_USE"
+        }
+      ],
+      "xhttp": {
+        "path": "/GunService/Tun",
+        "mode": "auto"
+      },
+      "certificate": "/absolute/path/to/vmess-xhttp/fullchain.pem",
+      "private_key": "/absolute/path/to/vmess-xhttp/private-key.pem"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "reject",
+      "tag": "reject"
+    }
+  ],
+  "route": {
+    "default": "direct",
+    "rules": []
+  }
+}

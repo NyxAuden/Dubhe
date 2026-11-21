@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "inbounds": [{
+    "type": "vmess",
+    "tag": "vmess-tls-in",
+    "listen": "127.0.0.1:8443",
+    "users": [{"name": "user", "uuid": "REPLACE_WITH_A_RANDOM_UUID_BEFORE_USE"}],
+    "certificate": "/absolute/path/to/fullchain.pem",
+    "private_key": "/absolute/path/to/private-key.pem",
+    "xudp": false,
+    "packetaddr": false,
+    "allow_insecure_body": false,
+    "allow_authenticated_length": false
+  }],
+  "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "reject", "tag": "reject"}],
+  "route": {"default": "direct"}
+}

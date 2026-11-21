@@ -1,0 +1,40 @@
+schema: spec-driven
+
+context: |
+  Language: zh-CN
+  All artifacts must be written in zh-CN.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+  Project: independent Rust server-side proxy kernel; rust-proxy-kernel is a working name.
+  Goal: one executable with native server protocol support across Xray-core, sing-box and Nowhere.
+  Existing Clash-family, sing-box-family, V2Ray-family and Anywhere clients connect using their own supported protocols.
+  No external-core subprocess wrappers, client GUI, client traffic capture or billing platform.
+  Rust owns the core; reviewed non-Rust dependencies are allowed. New protocols use compiled modules.
+  Follow current upstream capabilities; retired features are not a long-term compatibility goal.
+  Config-format and management-API parity are not implied by wire compatibility.
+  Read CONTEXT.md for terminology and docs/compatibility-matrix.md for scope and evidence status.
+  SOCKS5 and the limited Trojan/TCP+TLS combination are implemented; support claims must stay within recorded interoperability evidence.
+  Basic VLESS v0 over TCP+TLS and optional UDP-only XUDP have limited external interoperability evidence for fixed Mihomo, sing-box and Xray clients; nine explicit reference tests passed. See docs/vless-acceptance.md.
+  Other protocol families and remaining VLESS extensions are unimplemented; see the compatibility matrix and per-change reports for evidence.
+  The initial foundation change has entered authorized implementation; planning artifacts alone never prove task completion.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing

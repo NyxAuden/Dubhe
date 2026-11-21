@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vless-reality",
+      "tag": "reality-in",
+      "listen": "127.0.0.1:8443",
+      "xudp": true,
+      "users": [
+        {"name": "vision-user", "uuid": "REPLACE_WITH_A_RANDOM_UUID_BEFORE_USE", "flow": "xtls-rprx-vision"}
+      ],
+      "reality": {
+        "target": {"host": "127.0.0.1", "port": 9443},
+        "private_key": "REPLACE_WITH_UNPADDED_BASE64URL_32_BYTE_X25519_PRIVATE_KEY",
+        "server_names": ["localhost"],
+        "short_ids": ["REPLACE_WITH_HEX_SHORT_ID"],
+        "max_time_diff_ms": 120000,
+        "fallback_idle_timeout_ms": 10000,
+        "fallback_max_duration_ms": 60000
+      }
+    }
+  ],
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "reject", "tag": "reject"}
+  ],
+  "route": {"default": "direct"}
+}

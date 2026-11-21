@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "inbounds": [{
+    "type": "shadowsocks",
+    "tag": "ss-eih",
+    "listen": "127.0.0.1:8388",
+    "method": "2022-blake3-aes-256-gcm",
+    "password": "REPLACE_WITH_BASE64_OF_32_RANDOM_IDENTITY_BYTES",
+    "users": [
+      {"name": "user-a", "password": "REPLACE_WITH_BASE64_OF_32_RANDOM_USER_A_BYTES"},
+      {"name": "user-b", "password": "REPLACE_WITH_BASE64_OF_32_RANDOM_USER_B_BYTES"}
+    ]
+  }],
+  "outbounds": [{"type": "direct", "tag": "direct"}],
+  "route": {"default": "direct"}
+}

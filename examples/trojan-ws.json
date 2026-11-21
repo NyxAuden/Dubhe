@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "trojan-ws",
+      "tag": "trojan-ws-in",
+      "listen": "127.0.0.1:10083",
+      "users": [
+        { "name": "REPLACE_WITH_A_RANDOM_TROJAN_WS_PASSWORD_IN_PASSWORD_FIELD", "password": "" }
+      ],
+      "allow_insecure_transport": true,
+      "websocket": {
+        "path": "/proxy",
+        "early_data": { "mode": "header", "max_bytes": 2048, "header_name": "X-Proxy-Early-Data" }
+      }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct", "rules": [] }
+}

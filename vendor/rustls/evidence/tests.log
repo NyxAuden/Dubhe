@@ -1,0 +1,19 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s
+
+running 13 tests
+test record_plan_boundaries ... ok
+test ordinary_ring_tls12_no_hook ... ok
+test ordinary_ring_no_hook_real_certificate_and_finished ... ok
+test raw_server_hello_strict_validation_and_truncations ... ok
+test aead_limit_failure_is_fallible_and_atomic ... ok
+test insufficient_certificate_space_has_no_output ... ok
+test separated_layout_and_absent_ccs ... ok
+test invalid_client_finished_never_delivers_application ... ok
+test hybrid_aggregated_large_certificate ... ok
+test template_offers_session_and_provider_rechecked ... ok
+test callback_failure_key_swap_and_spki_mismatch_have_no_output ... ok
+test tls_inner_plaintext_exact_limit ... ok
+test x25519_aggregated_and_empty_app_all_suites ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+

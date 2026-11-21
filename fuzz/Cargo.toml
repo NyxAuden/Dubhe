@@ -1,0 +1,113 @@
+[package]
+name = "dubhe-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+futures = "0.3"
+libfuzzer-sys = "0.4"
+dubhe = { path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "vision"
+path = "fuzz_targets/vision.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "socks5_datagram"
+path = "fuzz_targets/socks5_datagram.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "http_authority"
+path = "fuzz_targets/http_authority.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "address_read"
+path = "fuzz_targets/address_read.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "xudp_read"
+path = "fuzz_targets/xudp_read.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "vless_datagram"
+path = "fuzz_targets/vless_datagram.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "trojan_datagram"
+path = "fuzz_targets/trojan_datagram.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "xhttp_head"
+path = "fuzz_targets/xhttp_head.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "xhttp_uplink"
+path = "fuzz_targets/xhttp_uplink.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "grpc_payload"
+path = "fuzz_targets/grpc_payload.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "vmess_header"
+path = "fuzz_targets/vmess_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "snell_request"
+path = "fuzz_targets/snell_request.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "snell_udp"
+path = "fuzz_targets/snell_udp.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tuic_wire"
+path = "fuzz_targets/tuic_wire.rs"
+test = false
+doc = false
+
+# 与根 workspace 保持相同的 vendored 补丁；fuzz 包有独立 lock。
+[patch.crates-io]
+blake3 = { path = "../vendor/blake3" }
+rustls = { path = "../vendor/rustls" }
+shadowsocks = { path = "../vendor/shadowsocks" }
+h3 = { path = "../vendor/h3" }
+h3-quinn = { path = "../vendor/h3-quinn" }

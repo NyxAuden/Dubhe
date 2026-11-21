@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vless-ws",
+      "tag": "vless-ws-in",
+      "listen": "127.0.0.1:10081",
+      "users": [
+        { "name": "vless-ws-user", "uuid": "REPLACE_WITH_A_RANDOM_VLESS_WS_UUID_BEFORE_USE" }
+      ],
+      "xudp": false,
+      "allow_insecure_transport": true,
+      "websocket": { "path": "/proxy" }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct", "rules": [] }
+}

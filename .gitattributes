@@ -1,0 +1,12 @@
+# 统一行尾，避免 Windows 贡献者提交 CRLF 触发无关 diff。
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制与生成物
+*.png binary
+*.jpg binary
+*.ico binary
+*.gz binary
+*.tar binary

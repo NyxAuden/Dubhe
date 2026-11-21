@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "socks5",
+      "tag": "local",
+      "listen": "127.0.0.1:1080"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "snell",
+      "tag": "snell-upstream",
+      "endpoint": "203.0.113.10:8388",
+      "snell": {
+        "psk": "REPLACE_WITH_RANDOM_PSK_12_TO_255_BYTES",
+        "version": 6,
+        "userkey": "REPLACE_WITH_USER_KEY",
+        "mode": "default"
+      }
+    },
+    {
+      "type": "reject",
+      "tag": "reject"
+    }
+  ],
+  "route": {
+    "default": "snell-upstream",
+    "rules": []
+  }
+}

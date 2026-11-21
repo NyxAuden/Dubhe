@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vless-grpc",
+      "tag": "vless-grpc-plain-in",
+      "listen": "127.0.0.1:10091",
+      "users": [
+        { "name": "vless-grpc-user", "uuid": "REPLACE_WITH_A_RANDOM_VLESS_GRPC_UUID" }
+      ],
+      "xudp": false,
+      "allow_insecure_transport": true,
+      "grpc": { "path": "/GunService/Tun" }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct", "rules": [] }
+}

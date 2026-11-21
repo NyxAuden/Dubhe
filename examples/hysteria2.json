@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2-in",
+      "listen": "127.0.0.1:10449",
+      "users": [
+        { "name": "example-user", "password": "REPLACE_WITH_A_RANDOM_HYSTERIA2_PASSWORD" }
+      ],
+      "certificate": "/absolute/path/to/fullchain.pem",
+      "private_key": "/absolute/path/to/private-key.pem",
+      "udp": true,
+      "obfs": {
+        "type": "salamander",
+        "password": "REPLACE_WITH_A_RANDOM_HYSTERIA2_OBFS_PASSWORD"
+      }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct" }
+}

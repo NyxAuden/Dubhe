@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "127.0.0.1:10447",
+      "users": [
+        { "name": "example-user", "password": "REPLACE_WITH_A_RANDOM_ANYTLS_PASSWORD" }
+      ],
+      "certificate": "/absolute/path/to/fullchain.pem",
+      "private_key": "/absolute/path/to/private-key.pem"
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct" }
+}

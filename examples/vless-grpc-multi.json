@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vless-grpc",
+      "tag": "vless-grpc-multi-in",
+      "listen": "127.0.0.1:10444",
+      "users": [
+        { "name": "vless-grpc-multi-user", "uuid": "REPLACE_WITH_A_RANDOM_VLESS_GRPC_UUID" }
+      ],
+      "xudp": true,
+      "grpc": {
+        "path": "/GunService/Tun",
+        "multi_path": "/GunService/TunMulti"
+      },
+      "certificate": "/absolute/path/to/vless-grpc-multi/fullchain.pem",
+      "private_key": "/absolute/path/to/vless-grpc-multi/private-key.pem"
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct", "rules": [] }
+}

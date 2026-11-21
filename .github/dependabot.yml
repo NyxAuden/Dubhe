@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # 主 crate 使用 = 精确锁定；Dependabot 的升级必须通过 CI 全绿才合并。
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      patch-updates:
+        applies-to: version-updates
+        update-types: ["patch"]
+
+  # fuzz 包有独立 lock 与 workspace。
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3

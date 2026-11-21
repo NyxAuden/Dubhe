@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "inbounds": [
+    { "type": "socks5", "tag": "local", "listen": "127.0.0.1:1080" }
+  ],
+  "outbounds": [
+    {
+      "type": "snell",
+      "tag": "snell-upstream",
+      "endpoint": "127.0.0.1:10448",
+      "snell": {
+        "psk": "REPLACE_WITH_A_RANDOM_SNELL_PSK",
+        "version": 5,
+        "userkey": "REPLACE_WITH_A_RANDOM_SNELL_USERKEY",
+        "obfs_mode": "tls",
+        "obfs_host": "cloudfront.net"
+      }
+    },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "snell-upstream" }
+}

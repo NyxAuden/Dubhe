@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vmess-ws",
+      "tag": "vmess-wss-in",
+      "listen": "127.0.0.1:10442",
+      "users": [
+        { "name": "vmess-wss-user", "uuid": "REPLACE_WITH_A_RANDOM_VMESS_WSS_UUID_BEFORE_USE" }
+      ],
+      "xudp": false,
+      "packetaddr": false,
+      "allow_insecure_body": false,
+      "allow_authenticated_length": false,
+      "certificate": "/absolute/path/to/vmess-wss/fullchain.pem",
+      "private_key": "/absolute/path/to/vmess-wss/private-key.pem",
+      "websocket": { "path": "/proxy" }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct", "rules": [] }
+}

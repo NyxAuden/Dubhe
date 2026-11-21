@@ -1,0 +1,85 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # 每周一 03:17 UTC，错开整点。
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Show toolchain
+        run: rustup show
+      - name: Install lint components
+        run: rustup component add rustfmt clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-targets
+      - name: Release build
+        run: cargo build --locked --release --bin dubhe
+
+  supply-chain:
+    name: supply-chain
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny
+        run: cargo +stable install cargo-deny --locked
+      - name: Deny advisories, licenses, sources
+        run: cargo deny check
+
+  reproducibility:
+    name: reproducibility
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build twice and compare
+        run: SOURCE_DATE_EPOCH=1700000000 ./tools/repro-check.sh
+
+  fuzz-smoke:
+    name: fuzz-smoke
+    # 定时冒烟 + 手动触发；不进 push/PR，避免每次提交都跑十分钟以上。
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly and cargo-fuzz
+        run: |
+          rustup toolchain install nightly
+          cargo +nightly install cargo-fuzz --locked
+      - name: Smoke fuzz public parsers
+        working-directory: fuzz
+        run: |
+          for target in config vision socks5_datagram http_authority address_read xudp_read vless_datagram trojan_datagram xhttp_head xhttp_uplink grpc_payload vmess_header snell_request snell_udp tuic_wire; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=30 -rss_limit_mb=2048
+          done

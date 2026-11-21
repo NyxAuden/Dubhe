@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "trojan-ws",
+      "tag": "trojan-wss-in",
+      "listen": "127.0.0.1:10443",
+      "users": [
+        { "name": "REPLACE_WITH_A_RANDOM_TROJAN_WSS_PASSWORD_IN_PASSWORD_FIELD", "password": "" }
+      ],
+      "certificate": "/absolute/path/to/trojan-wss/fullchain.pem",
+      "private_key": "/absolute/path/to/trojan-wss/private-key.pem",
+      "websocket": {
+        "path": "/proxy/",
+        "early_data": { "mode": "path", "max_bytes": 2048 }
+      }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct", "rules": [] }
+}

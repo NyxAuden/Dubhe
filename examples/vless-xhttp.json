@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vless-xhttp",
+      "tag": "vless-xhttp-in",
+      "listen": "127.0.0.1:10085",
+      "users": [
+        {
+          "name": "vless-xhttp-user",
+          "uuid": "REPLACE_WITH_A_RANDOM_VLESS_XHTTP_UUID_BEFORE_USE"
+        }
+      ],
+      "xudp": false,
+      "allow_insecure_transport": true,
+      "xhttp": {
+        "path": "/GunService/Tun",
+        "mode": "auto"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "reject",
+      "tag": "reject"
+    }
+  ],
+  "route": {
+    "default": "direct",
+    "rules": []
+  }
+}

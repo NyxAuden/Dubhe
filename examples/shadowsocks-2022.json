@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "inbounds": [{
+    "type": "shadowsocks",
+    "tag": "ss-2022",
+    "listen": "127.0.0.1:8388",
+    "method": "2022-blake3-aes-128-gcm",
+    "password": "REPLACE_WITH_BASE64_OF_16_RANDOM_BYTES"
+  }],
+  "outbounds": [{"type": "direct", "tag": "direct"}],
+  "route": {"default": "direct"}
+}

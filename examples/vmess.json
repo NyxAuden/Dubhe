@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "inbounds": [{
+    "type": "vmess",
+    "tag": "vmess-in",
+    "listen": "127.0.0.1:10086",
+    "users": [{"name": "user", "uuid": "REPLACE_WITH_A_RANDOM_UUID_BEFORE_USE"}],
+    "xudp": false,
+    "packetaddr": false,
+    "allow_insecure_body": false,
+    "allow_authenticated_length": false
+  }],
+  "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "reject", "tag": "reject"}],
+  "route": {"default": "direct"}
+}

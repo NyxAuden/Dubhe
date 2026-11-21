@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "trojan-xhttp",
+      "tag": "trojan-xhttp-in",
+      "listen": "127.0.0.1:10447",
+      "users": [
+        {
+          "name": "trojan-xhttp-user",
+          "password": "REPLACE_WITH_A_RANDOM_TROJAN_XHTTP_PASSWORD"
+        }
+      ],
+      "allow_insecure_transport": true,
+      "xhttp": {
+        "path": "/GunService/Tun",
+        "mode": "auto"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "reject",
+      "tag": "reject"
+    }
+  ],
+  "route": {
+    "default": "direct",
+    "rules": []
+  }
+}

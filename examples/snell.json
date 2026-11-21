@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "snell",
+      "tag": "snell-in",
+      "listen": "127.0.0.1:10448",
+      "psk": "REPLACE_WITH_A_RANDOM_SNELL_PSK",
+      "version": 5,
+      "users": [
+        { "name": "example-user", "userkey": "REPLACE_WITH_A_RANDOM_SNELL_USERKEY" }
+      ]
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct" }
+}

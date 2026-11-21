@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "inbounds": [
+    { "type": "socks5", "tag": "local", "listen": "127.0.0.1:1080" }
+  ],
+  "outbounds": [
+    {
+      "type": "tuic",
+      "tag": "up",
+      "endpoint": "203.0.113.10:443",
+      "uuid": "REPLACE_WITH_A_RANDOM_TUIC_UUID",
+      "password": "REPLACE_WITH_A_RANDOM_PASSWORD",
+      "tls": {
+        "ca_file": "/absolute/path/to/trusted-ca.pem",
+        "server_name": "tuic.example"
+      },
+      "tuic": {
+        "udp_relay_mode": "native",
+        "congestion_control": "cubic",
+        "zero_rtt_handshake": false
+      }
+    },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "up", "rules": [] }
+}

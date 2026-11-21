@@ -1,0 +1,47 @@
+# 构建产物
+/target/
+/dist/
+
+# 测试凭据与临时私钥。绝不提交：内含本机测试证书、私钥与客户端二进制。
+/.test-artifacts/
+
+# 密钥与证书
+*.key
+*.pem
+*.p12
+*.pfx
+*.der
+*.crt
+*.csr
+id_rsa*
+id_ed25519*
+*.kdbx
+
+# 凭证与本地配置
+.env
+.env.*
+*.secret
+**/secrets/
+config.local.json
+*.token
+
+# 覆盖率与性能分析产物
+*.profraw
+*.profdata
+/lcov.info
+/coverage/
+
+# 编辑器与系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Rust 工具链本地覆盖
+/rust-toolchain.local.toml
+
+# 日志与临时文件
+*.log
+!vendor/**/evidence/*.log
+/tmp/

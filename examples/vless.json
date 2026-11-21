@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "127.0.0.1:8443",
+      "xudp": false,
+      "users": [
+        {
+          "name": "user",
+          "uuid": "REPLACE_WITH_A_RANDOM_UUID_BEFORE_USE"
+        }
+      ],
+      "certificate": "/absolute/path/to/fullchain.pem",
+      "private_key": "/absolute/path/to/private-key.pem"
+    }
+  ],
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "reject", "tag": "reject"}
+  ],
+  "route": {"default": "direct"}
+}

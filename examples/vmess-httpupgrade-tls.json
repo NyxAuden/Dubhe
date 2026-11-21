@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vmess-httpupgrade",
+      "tag": "vmess-httpupgrade-tls-in",
+      "listen": "127.0.0.1:10444",
+      "users": [
+        {
+          "name": "vmess-httpupgrade-user",
+          "uuid": "REPLACE_WITH_A_RANDOM_VMESS_HTTPUPGRADE_UUID_BEFORE_USE"
+        }
+      ],
+      "httpupgrade": {
+        "path": "/proxy"
+      },
+      "certificate": "/absolute/path/to/vmess-httpupgrade/fullchain.pem",
+      "private_key": "/absolute/path/to/vmess-httpupgrade/private-key.pem"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "reject",
+      "tag": "reject"
+    }
+  ],
+  "route": {
+    "default": "direct",
+    "rules": []
+  }
+}

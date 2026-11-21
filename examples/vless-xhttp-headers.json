@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vless-xhttp",
+      "tag": "vless-xhttp-headers-in",
+      "listen": "127.0.0.1:10086",
+      "users": [
+        {
+          "name": "vless-xhttp-user",
+          "uuid": "REPLACE_WITH_A_RANDOM_VLESS_XHTTP_HEADERS_UUID"
+        }
+      ],
+      "xudp": false,
+      "allow_insecure_transport": true,
+      "xhttp": {
+        "path": "/GunService/Tun",
+        "mode": "stream-one",
+        "no_sse_header": true,
+        "headers": {
+          "X-Example": "xhttp-template",
+          "Cache-Control": "no-store"
+        },
+        "sc_max_each_post_bytes": 1000000,
+        "sc_max_buffered_posts": 30,
+        "session_ttl_ms": 30000,
+        "x_padding": { "from": 100, "to": 1000 }
+      }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct" }
+}

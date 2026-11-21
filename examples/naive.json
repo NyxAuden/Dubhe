@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "naive",
+      "tag": "naive-in",
+      "listen": "127.0.0.1:10443",
+      "h3": false,
+      "users": [
+        {
+          "name": "naive-user",
+          "password": "REPLACE_WITH_A_RANDOM_NAIVE_PASSWORD"
+        }
+      ],
+      "certificate": "/absolute/path/to/naive/fullchain.pem",
+      "private_key": "/absolute/path/to/naive/private-key.pem"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "reject",
+      "tag": "reject"
+    }
+  ],
+  "route": {
+    "default": "direct",
+    "rules": []
+  }
+}

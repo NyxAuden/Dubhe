@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "trojan-grpc",
+      "tag": "trojan-grpc-tls-in",
+      "listen": "127.0.0.1:10463",
+      "users": [
+        { "name": "trojan-grpc-tls-user", "password": "REPLACE_WITH_A_RANDOM_TROJAN_GRPC_PASSWORD" }
+      ],
+      "grpc": { "path": "/GunService/Tun" },
+      "certificate": "/absolute/path/to/trojan-grpc-tls/fullchain.pem",
+      "private_key": "/absolute/path/to/trojan-grpc-tls/private-key.pem"
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct", "rules": [] }
+}

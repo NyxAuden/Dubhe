@@ -1,0 +1,54 @@
+rustls 0.23.46 REALITY 加性补丁来源与验证说明
+
+来源与许可
+- 精确官方发布归档：https://static.crates.io/crates/rustls/rustls-0.23.46.crate
+- 原始归档 SHA256：48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf
+- UPSTREAM.json 保存全部 119 个原始文件的 SHA256；发布归档原样保留，包括 Cargo.toml.orig、Cargo.lock、.cargo_vcs_info.json 和三个 LICENSE。
+- 上游许可 Apache-2.0 OR ISC OR MIT。本地新增实现使用同一许可；未复制任何 MPL/GPL REALITY 源码。协议要求来自本项目已批准 design D6/D7，密码实现仍为原 rustls/AWS-LC。
+- Cargo.toml.orig 和 vendor Cargo.lock 是官方发布历史文件，不用于当前生产解析；根 Cargo.toml/Cargo.lock 由主会话独占管理。未在 vendor 新建另一份 lock。
+- 本文不声称已完成全传递许可/公告或精确 Rust1.91 构建；这些由主线依赖门禁统一记录。
+
+加性边界
+1. feature reality 默认关闭；编译它也不会自动启用，ServerConfig.reality 默认 None。
+2. 仅接受 TLS1.3 原始 SH（含握手头，无record头），SID32，null compression，X25519/X25519MLKEM768 和三种标准 TLS1.3 suite；仅 supported_versions/key_share 两扩展，拒绝重复/未知/HRR/truncation。针对真实 CH 的 SID、versions、suite/group/share offer 与 provider 再验证，拒绝 PSK/early_data，不允许 HRR。
+3. 原 provider 独立临时 KX；只替换已验证的等长share范围，扩展顺序/random及其余模板字节保持；同一最终raw编码用于 transcript 和 socket输出。
+4. SH确定后、Certificate编码前调用逐连接 resolver；返回同 SigningKey对象（同Arc底层指针）、Ed25519、严格 SPKI/keys_match、最多8张/65536总字节证书、无OCSP。REALITY 与 Xray 一致固定使用 Ed25519 临时证书，即使客户端未在 signature_algorithms 中声明 Ed25519 也以 Ed25519 完成 CertificateVerify；普通 TLS 仍按客户端列表协商。MLDSA构造由主线完成；接点不静默跳过回调或吞掉其错误。
+5. 固定 D7 RecordPlan：首加密槽总长度>512时一槽聚合，否则四槽分别 EE/Certificate/CV/Finished；CCS6或显式缺失0；可选app槽只空明文。长度含5字节record头，padding为total-5-message-1-16；TLSPlaintext<=16384，TLSInnerPlaintext<=16385，总record<=16406。目标槽位足够时按目标总长填充；本地消息大于目标槽位时使用自然长度而非回退（与 Xray 不要求逐 record 等长一致），仍全部在提交前预检，不截消息。
+6. MessageEncrypter默认拒绝新padding操作，仅原AWS-LC TLS1.3 encrypter支持；拼接inner type及零padding后仍调用原 Seal。record layer保持唯一write_seq和AEAD限额；新路径不用原 encrypt_outgoing的unwrap，失败消耗nonce并关闭，不重试。
+7. 连接创建/Accepted路径开启内部pending闩锁，全部初始flight完成Certificate/CV/Finished编码、布局/能力校验、Seal和可选app槽成功之前，不发布SH/CCS/alert。成功后完整有界flight原子入队；process_new_packets必须返回Ok且wants_write=true，才能交给外层不可逆socket提交。目标socket生命周期由主线管理。
+8. 普通配置不走这些分支；原CertificateVerify、客户端Finished、KeyUpdate与应用解密仍由rustls正常状态机完成。新钩子要求TLS13-only、禁tickets/early-data/half-RTT/secret-extraction/client-auth/certificate-compression；非TCP拒绝。
+9. 客户端加性钩子只允许逐连接替换首份 ClientHello 的32字节 legacy SID：在 CH 载荷构建后、最终编码前调用 BuildsSessionId(random, 当前 key_share, 零SID完整CH握手消息)，设置最终SID后再走原编码。`Config::new` 默认 `allow_hrr=false`，钩子路径拒绝HRR；`Config::new_allow_hrr` 显式开启最小HRR放行（默认关闭，REALITY默认行为不变）。无论是否放行HRR，ECH和early data仍被拒绝。收到HRR构造CH2时不调用builder、不置零，完整保留CH1的 `chp_payload.session_id`/`input.session_id`。另在解析首份 ServerHello 后、证书校验前调用同一 builder 的 `server_hello(encoded)`，只交付含4字节握手头的原始 SH 字节，供调用方按 REALITY ML-DSA-65 扩展校验 `HMAC(authKey, Ed25519Pub || rawCH || rawSH)`；默认实现为空操作，普通调用方不受影响。这些钩子不改变密钥交换结果、证书验证、CertificateVerify/Finished或普通恢复逻辑；调用方负责REALITY wire编码和自己的证书验证器。认证键由调用方KX实现的 `reality_auth_key` 提供，普通KX默认返回None。
+
+公共API
+- rustls::server::reality::RecordPlan::new(sh_total:usize, ccs_total:usize, encrypted:Vec<usize>, empty_app:Option<usize>) -> Result<RecordPlan,Error>
+- rustls::server::reality::Config::new(raw_server_hello:Vec<u8>, record_plan:RecordPlan, certificate_resolver:Arc<dyn ResolvesCertificate>) -> Result<Config,Error>
+- Config::cipher_suite() -> CipherSuite；Config::named_group() -> NamedGroup
+- ResolvesCertificate: Debug+Send+Sync，resolve(&self, final_raw_sh:&[u8]) -> Result<Arc<CertifiedKey>,Error>
+- ServerConfig #[cfg(feature="reality")] pub reality:Option<Arc<Config>>
+- rustls::client::reality::BuildsSessionId::build(random:[u8;32], key_share:&dyn ActiveKeyExchange, zero_hello:&[u8]) -> Result<[u8;32],Error>
+- rustls::client::reality::BuildsSessionId::server_hello(&self, encoded:&[u8])（默认空操作；encoded 含4字节握手头）
+- rustls::client::reality::Config::new(builder:Arc<dyn BuildsSessionId>) -> Config（默认 allow_hrr=false，保持REALITY原行为：拒绝HRR/ECH/early data）
+- rustls::client::reality::Config::new_allow_hrr(builder:Arc<dyn BuildsSessionId>) -> Config（allow_hrr=true，仅额外放行HRR；ECH/early data仍拒绝，CH2保留CH1的SID且不调用builder）；ClientConfig #[cfg(feature="reality")] pub reality:Option<Arc<Config>>
+- ActiveKeyExchange #[cfg(feature="reality")] fn reality_auth_key(&self, server_public:&[u8], random:&[u8;32]) -> Option<[u8;32]>，默认None
+
+测试与复现
+- python3 -I /项目/vendor/rustls/run-tests.py --root /项目
+  runner使用根唯一锁 cargo build --locked --offline -p rustls -p rcgen -p ring，再rustc --test执行vendor内测试，不运行官方程序、不联网/容器、不修改workspace。末尾用同锁构建依赖直接rustc编译feature完全关闭的ring/std/tls12版本。
+- 官方crate排除了src/testdata及集成tests，且rustls不是根workspace成员，故cargo test -p rustls --lib不能运行；没有删除/篡改上游单测。保留新增tests/reality.rs与可复现runner，不能将定向测试称作完整上游测试通过。
+- cargo check --manifest-path /项目/Cargo.toml -p rustls --lib --offline --locked
+- cargo clippy --manifest-path /项目/Cargo.toml -p rustls --lib --offline --locked -- -D warnings
+- rustfmt使用上游匹配风格：--edition 2021 --config skip_children=true,style_edition=2024,chain_width=40；不重格式化其他上游文件。
+- tests/reality.rs使用自持内存peer、rcgen RemoteKeyPair和ring Ed25519；客户端正常验证CertificateVerify/Finished。额外ring HKDF/AEAD/HMAC独立解密真实AWS-LC records、重建rawCH+rawSH+真实消息transcript验证Finished，检查全零padding及空app零明文/下一业务record/KeyUpdate。没有借项目生产auth/parser/certificate作独立测试端。
+- 模拟3309字节扩展只证明MLDSA尺寸可容纳/不足和回调时机；不是实际MLDSA签名互通，真实签名由主线单独验证。
+- stdout、执行元数据及历史见 evidence/，实际passed以对应日志为准，未执行官方/三平台/精确MSRV。evidence/与tests/reality.rs只记录服务端钩子构建/测试；客户端钩子的本机互测记录在根项目 tests/reality_outbound.rs（X25519与X25519MLKEM768 target、三协议WS、VLESS原生UDP），不能把旧vendor日志当作客户端钩子已跑。
+- python3 -I /项目/vendor/rustls/verify-source.py --archive ~/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/rustls-0.23.46.crate --empty-dir /新空目录
+  先核归档/逐文件摘要及常规文件，再应用upstream.patch，核PATCHED.json全部结果。脚本从项目可信路径执行，不从提取目录加载代码；新目录仅作复现，不用于构建。
+- 本批 `Config::new_allow_hrr`/最小HRR放行只做静态检查与本机 verify-source 复现，未在本批运行官方客户端互测或全量 vendor 测试。upstream.patch 的 SHA256 及补丁后逐文件 SHA256 以当前 PATCHED.json 为准。
+
+暂停/失败历史
+- 依赖门禁发现time0.3.45的RUSTSEC-2026-0009后，应主会话指令立即暂停，保存未完成断点；未自行升级/规避。真实用户批准最小修复后恢复；主会话更新time/core/macros/numconv四包并通知稳定锁。
+- 首次check使用-p rustls --features rustls/reality失败：非workspace成员不能这样选feature；改由根依赖既定feature解析，无Cargo改动。
+- 首次编译发现内部模块路径/私有常量/len/闭包mut错误，均修正后check通过。
+- 首批夹具缺少rcgen关闭crypto时必填serial_number，5失败；加serial后剩3失败为测试未循环读尽长flight（非协议修改），修正后6通过。
+- 新增负向测试把suite高字节修改成同值造成1失败，改为真实非法值后12通过；没有降低生产验证。
+- 初次rustfmt默认风格导致上游无关换行差异，调整为style_edition2024/chain_width40匹配上游后仅保留最小相关差异。

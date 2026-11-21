@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "socks5",
+      "tag": "local",
+      "listen": "127.0.0.1:1080"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "socks5",
+      "tag": "upstream",
+      "endpoint": "127.0.0.1:1081"
+    },
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": {
+    "default": "direct",
+    "rules": [{ "outbound": "upstream", "networks": ["tcp"] }]
+  }
+}

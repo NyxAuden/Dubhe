@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vless-httpupgrade",
+      "tag": "vless-httpupgrade-in",
+      "listen": "127.0.0.1:10083",
+      "users": [
+        {
+          "name": "vless-httpupgrade-user",
+          "uuid": "REPLACE_WITH_A_RANDOM_VLESS_HTTPUPGRADE_UUID_BEFORE_USE"
+        }
+      ],
+      "xudp": false,
+      "allow_insecure_transport": true,
+      "httpupgrade": {
+        "path": "/proxy"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "reject",
+      "tag": "reject"
+    }
+  ],
+  "route": {
+    "default": "direct",
+    "rules": []
+  }
+}

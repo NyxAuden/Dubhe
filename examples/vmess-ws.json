@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vmess-ws",
+      "tag": "vmess-ws-in",
+      "listen": "127.0.0.1:10082",
+      "users": [
+        { "name": "vmess-ws-user", "uuid": "REPLACE_WITH_A_RANDOM_VMESS_WS_UUID_BEFORE_USE" }
+      ],
+      "xudp": false,
+      "packetaddr": false,
+      "allow_insecure_body": false,
+      "allow_authenticated_length": false,
+      "websocket": {
+        "path": "/proxy/",
+        "early_data": { "mode": "path", "max_bytes": 2048 }
+      }
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct", "rules": [] }
+}

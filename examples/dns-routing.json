@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "socks5",
+      "tag": "socks",
+      "listen": "127.0.0.1:1080"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "reject",
+      "tag": "blocked"
+    }
+  ],
+  "dns": {
+    "servers": ["1.1.1.1", "1.0.0.1:53"],
+    "hosts": {
+      "internal.test": ["127.0.0.1"]
+    }
+  },
+  "route": {
+    "default": "direct",
+    "rules": [
+      {
+        "outbound": "blocked",
+        "domain_keyword": ["ads", "tracker"]
+      },
+      {
+        "outbound": "blocked",
+        "domain_suffix": [".example.invalid"]
+      }
+    ]
+  }
+}

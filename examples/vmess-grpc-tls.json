@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vmess-grpc",
+      "tag": "vmess-grpc-tls-in",
+      "listen": "127.0.0.1:10453",
+      "users": [
+        { "name": "vmess-grpc-user", "uuid": "REPLACE_WITH_A_RANDOM_VMESS_GRPC_UUID" }
+      ],
+      "xudp": false,
+      "packetaddr": false,
+      "allow_insecure_body": false,
+      "allow_authenticated_length": false,
+      "grpc": { "path": "/GunService/Tun" },
+      "certificate": "/absolute/path/to/vmess-grpc-tls/fullchain.pem",
+      "private_key": "/absolute/path/to/vmess-grpc-tls/private-key.pem"
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct", "rules": [] }
+}

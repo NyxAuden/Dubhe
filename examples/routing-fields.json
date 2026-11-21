@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "inbounds": [
+    {"type": "socks5", "tag": "local", "listen": "127.0.0.1:1080"}
+  ],
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "direct", "tag": "proxy"}
+  ],
+  "route": {
+    "rules": [
+      {"ip_is_private": true, "outbound": "direct"},
+      {"domain_regex": ["^stun\\..+", "\\.local$"], "outbound": "direct"},
+      {"domain_suffix": ["blocked.example"], "outbound": "proxy"},
+      {"domain_suffix": ["internal.example"], "invert": true, "outbound": "proxy"}
+    ],
+    "default": "direct"
+  },
+  "limits": {"idle_timeout_ms": 300000}
+}

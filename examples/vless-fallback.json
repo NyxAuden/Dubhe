@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-fallback",
+      "listen": "127.0.0.1:8443",
+      "xudp": false,
+      "users": [
+        { "name": "user", "uuid": "REPLACE_WITH_A_RANDOM_UUID_BEFORE_USE" }
+      ],
+      "fallbacks": [
+        { "dest": 8080 },
+        { "dest": "127.0.0.1:8081", "path": "/api", "xver": 1 }
+      ],
+      "certificate": "/absolute/path/to/fullchain.pem",
+      "private_key": "/absolute/path/to/private-key.pem"
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct" }
+}

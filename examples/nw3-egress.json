@@ -1,0 +1,1 @@
+{"version":1,"inbounds":[{"type":"socks5","tag":"local-socks","listen":"127.0.0.1:1080"}],"outbounds":[{"type":"direct","tag":"direct"},{"type":"reject","tag":"reject"}],"route":{"default":"direct","rules":[]},"nw3_egress":{"tag":"nw3-exit","endpoint":"portal.example.com:443","key":"0123456789abcdef0123456789abcdef","sni":"portal.example.com","morph":true}}

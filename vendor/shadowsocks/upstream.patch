@@ -1,0 +1,1174 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -38,6 +38,8 @@
+ status = "passively-maintained"
+ 
+ [features]
++# 本内核补丁：禁用认证前可填充的线程局部UDP派生密码缓存。
++aead-2022-no-udp-cipher-cache = ["aead-cipher-2022"]
+ aead-cipher = [
+     "shadowsocks-crypto/v1-aead",
+     "shadowsocks-crypto/aws-lc",
+--- a/Cargo.toml.orig
++++ b/Cargo.toml.orig
+@@ -15,6 +15,8 @@
+ maintenance = { status = "passively-maintained" }
+ 
+ [features]
++# 本内核补丁：禁用认证前可填充的线程局部UDP派生密码缓存。
++aead-2022-no-udp-cipher-cache = ["aead-cipher-2022"]
+ default = ["hickory-dns", "aead-cipher"]
+ 
+ # Uses Hickory-DNS instead of tokio's builtin DNS resolver
+--- a/src/relay/tcprelay/aead.rs
++++ b/src/relay/tcprelay/aead.rs
+@@ -50,6 +50,48 @@
+     crypto::{CipherKind, v1::Cipher},
+ };
+ 
++use super::aead_budget::AeadBudget;
++
++#[cfg(test)]
++mod budget_tests {
++    use super::*;
++
++    const METHOD: CipherKind = CipherKind::AES_128_GCM;
++    const INITIAL_HEADER_LEN: usize = 16 + 2 + 16;
++
++    fn new_writer() -> EncryptedWriter {
++        EncryptedWriter::new(METHOD, &[0x11; 16], &[0x22; 16])
++    }
++
++    fn new_reader() -> DecryptedReader {
++        DecryptedReader::new(METHOD, &[0x11; 16])
++    }
++
++    include!("aead_budget_tests.rs");
++
++    #[test]
++    fn aead_budget_all_2017_methods_obey_direction_limit() {
++        for method in [METHOD, CipherKind::AES_256_GCM, CipherKind::CHACHA20_POLY1305] {
++            let key = vec![0x11; method.key_len()];
++            let salt = vec![0x22; method.salt_len()];
++            let mut writer = EncryptedWriter::new(method, &key, &salt);
++            writer.budget = AeadBudget::with_remaining(2);
++            let mut io = ControlledIo::new(&[], true);
++            assert_eq!(finish_write(&mut writer, &mut io, b"final").unwrap(), 5);
++            assert_eq!(writer.budget.remaining(), 0);
++            assert!(finish_write(&mut writer, &mut io, b"blocked").is_err());
++            let mut reader = DecryptedReader::new(method, &key);
++            reader.budget = AeadBudget::with_remaining(2);
++            let mut input = ControlledIo::new(&io.output, true);
++            let mut output = [0; 5];
++            assert_eq!(finish_read(&mut reader, &mut input, &mut output).unwrap(), 5);
++            assert_eq!(output, *b"final");
++            assert_eq!(reader.budget.remaining(), 0);
++            assert!(finish_read(&mut reader, &mut input, &mut output).is_err());
++        }
++    }
++}
++
+ /// AEAD packet payload must be smaller than 0x3FFF
+ pub const MAX_PACKET_SIZE: usize = 0x3FFF;
+ 
+@@ -98,6 +140,7 @@
+     method: CipherKind,
+     salt: Option<Bytes>,
+     has_handshaked: bool,
++    budget: AeadBudget,
+ }
+ 
+ impl DecryptedReader {
+@@ -112,6 +155,7 @@
+                 method,
+                 salt: None,
+                 has_handshaked: false,
++                budget: AeadBudget::new(),
+             }
+         } else {
+             Self {
+@@ -121,6 +165,7 @@
+                 method,
+                 salt: None,
+                 has_handshaked: false,
++                budget: AeadBudget::new(),
+             }
+         }
+     }
+@@ -131,6 +176,28 @@
+ 
+     /// Attempt to read decrypted data from stream
+     pub fn poll_read_decrypted<S>(
++        &mut self,
++        cx: &mut task::Context<'_>,
++        context: &Context,
++        stream: &mut S,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<ProtocolResult<()>>
++    where
++        S: AsyncRead + Unpin + ?Sized,
++    {
++        if let Err(err) = self.budget.ensure_active() {
++            return Poll::Ready(Err(err.into()));
++        }
++        let result = self.poll_read_decrypted_inner(cx, context, stream, buf);
++        if let Poll::Ready(Err(_)) = &result {
++            self.budget.terminate();
++            self.cipher = None;
++            self.buffer.clear();
++        }
++        result
++    }
++
++    fn poll_read_decrypted_inner<S>(
+         &mut self,
+         cx: &mut task::Context<'_>,
+         context: &Context,
+@@ -216,6 +283,7 @@
+     where
+         S: AsyncRead + Unpin + ?Sized,
+     {
++        self.budget.ensure_available()?;
+         let length_len = 2 + self.method.tag_len();
+ 
+         let n = ready!(self.poll_read_exact(cx, stream, length_len))?;
+@@ -226,6 +294,7 @@
+         let cipher = self.cipher.as_mut().expect("cipher is None");
+ 
+         let m = &mut self.buffer[..length_len];
++        self.budget.consume()?;
+         let length = Self::decrypt_length(cipher, m)?;
+ 
+         Ok(Some(length)).into()
+@@ -241,6 +310,7 @@
+     where
+         S: AsyncRead + Unpin + ?Sized,
+     {
++        self.budget.ensure_available()?;
+         let data_len = size + self.method.tag_len();
+ 
+         let n = ready!(self.poll_read_exact(cx, stream, data_len))?;
+@@ -251,6 +321,7 @@
+         let cipher = self.cipher.as_mut().expect("cipher is None");
+ 
+         let m = &mut self.buffer[..data_len];
++        self.budget.consume()?;
+         if !cipher.decrypt_packet(m) {
+             return Err(ProtocolError::DecryptDataError).into();
+         }
+@@ -335,6 +406,7 @@
+     buffer: BytesMut,
+     state: EncryptWriteState,
+     salt: Bytes,
++    budget: AeadBudget,
+ }
+ 
+ impl EncryptedWriter {
+@@ -349,6 +421,7 @@
+             buffer,
+             state: EncryptWriteState::AssemblePacket,
+             salt: Bytes::copy_from_slice(nonce),
++            budget: AeadBudget::new(),
+         }
+     }
+ 
+@@ -359,6 +432,26 @@
+ 
+     /// Attempt to write encrypted data into the writer
+     pub fn poll_write_encrypted<S>(
++        &mut self,
++        cx: &mut task::Context<'_>,
++        stream: &mut S,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>>
++    where
++        S: AsyncWrite + Unpin + ?Sized,
++    {
++        if let Err(err) = self.budget.ensure_active() {
++            return Poll::Ready(Err(err));
++        }
++        let result = self.poll_write_encrypted_inner(cx, stream, buf);
++        if let Poll::Ready(Err(_)) = &result {
++            self.budget.terminate();
++            self.buffer.clear();
++        }
++        result
++    }
++
++    fn poll_write_encrypted_inner<S>(
+         &mut self,
+         cx: &mut task::Context<'_>,
+         stream: &mut S,
+@@ -382,6 +475,7 @@
+                     let mbuf = unsafe { slice::from_raw_parts_mut(mbuf.as_mut_ptr(), mbuf.len()) };
+ 
+                     self.buffer.put_u16(buf.len() as u16);
++                    self.budget.consume()?;
+                     self.cipher.encrypt_packet(mbuf);
+                     unsafe { self.buffer.advance_mut(self.cipher.tag_len()) };
+ 
+@@ -393,6 +487,7 @@
+                     let mbuf = unsafe { slice::from_raw_parts_mut(mbuf.as_mut_ptr(), mbuf.len()) };
+ 
+                     self.buffer.put_slice(buf);
++                    self.budget.consume()?;
+                     self.cipher.encrypt_packet(mbuf);
+                     unsafe { self.buffer.advance_mut(self.cipher.tag_len()) };
+ 
+--- a/src/relay/tcprelay/aead_2022.rs
++++ b/src/relay/tcprelay/aead_2022.rs
+@@ -70,6 +70,82 @@
+     crypto::{CipherKind, v2::tcp::TcpCipher},
+ };
+ 
++use super::aead_budget::AeadBudget;
++
++#[cfg(test)]
++mod budget_tests {
++    use super::*;
++
++    const METHOD: CipherKind = CipherKind::AEAD2022_BLAKE3_AES_128_GCM;
++    const INITIAL_HEADER_LEN: usize = 16 + 1 + 8 + 2 + 16;
++
++    fn new_writer() -> EncryptedWriter {
++        EncryptedWriter::new(StreamType::Client, METHOD, &[0x11; 16], &[0x22; 16])
++    }
++
++    fn new_reader() -> DecryptedReader {
++        DecryptedReader::new(StreamType::Server, METHOD, &[0x11; 16])
++    }
++
++    include!("aead_budget_tests.rs");
++
++    #[test]
++    fn aead_budget_all_2022_methods_count_request_and_response_headers() {
++        for method in [
++            METHOD,
++            CipherKind::AEAD2022_BLAKE3_AES_256_GCM,
++            CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305,
++        ] {
++            for direction in [StreamType::Client, StreamType::Server] {
++                let key = vec![0x11; method.key_len()];
++                let salt = vec![0x22; method.salt_len()];
++                let mut writer = EncryptedWriter::new(direction, method, &key, &salt);
++                if direction == StreamType::Server {
++                    writer.set_request_salt(Bytes::from(vec![0x33; method.salt_len()]));
++                }
++                writer.budget = AeadBudget::with_remaining(2);
++                let mut io = ControlledIo::new(&[], true);
++                assert_eq!(finish_write(&mut writer, &mut io, b"final").unwrap(), 5);
++                assert_eq!(writer.budget.remaining(), 0);
++                assert!(finish_write(&mut writer, &mut io, b"blocked").is_err());
++                let peer_direction = if direction == StreamType::Client {
++                    StreamType::Server
++                } else {
++                    StreamType::Client
++                };
++                let mut reader = DecryptedReader::new(peer_direction, method, &key);
++                reader.budget = AeadBudget::with_remaining(2);
++                let mut input = ControlledIo::new(&io.output, true);
++                let mut output = [0; 5];
++                assert_eq!(finish_read(&mut reader, &mut input, &mut output).unwrap(), 5);
++                assert_eq!(output, *b"final");
++                assert_eq!(reader.budget.remaining(), 0);
++                assert!(finish_read(&mut reader, &mut input, &mut output).is_err());
++            }
++        }
++    }
++
++    #[test]
++    fn aead_budget_authenticated_user_reset_does_not_revive_a_used_writer() {
++        let mut writer = new_writer();
++        writer.reset_cipher_with_key(&[0x33; 16]);
++        assert!(writer.budget.may_initialize_cipher());
++        let mut output = ControlledIo::new(&[], false);
++        let mut cx = task::Context::from_waker(std::task::Waker::noop());
++        assert!(matches!(
++            writer.poll_write_encrypted(&mut cx, &mut output, b"first"),
++            Poll::Ready(Ok(5))
++        ));
++        let sent = output.output.len();
++        writer.reset_cipher_with_key(&[0x33; 16]);
++        assert!(matches!(
++            writer.poll_write_encrypted(&mut cx, &mut output, b"again"),
++            Poll::Ready(Err(_))
++        ));
++        assert_eq!(output.output.len(), sent);
++    }
++}
++
+ #[inline]
+ fn get_now_timestamp() -> u64 {
+     match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+@@ -138,6 +214,7 @@
+     user_manager: Option<Arc<ServerUserManager>>,
+     user_key: Option<Bytes>,
+     has_handshaked: bool,
++    budget: AeadBudget,
+ }
+ 
+ impl DecryptedReader {
+@@ -166,6 +243,7 @@
+                 user_manager,
+                 user_key: None,
+                 has_handshaked: false,
++                budget: AeadBudget::new(),
+             }
+         } else {
+             Self {
+@@ -182,6 +260,7 @@
+                 user_manager,
+                 user_key: None,
+                 has_handshaked: false,
++                budget: AeadBudget::new(),
+             }
+         }
+     }
+@@ -196,6 +275,28 @@
+ 
+     /// Attempt to read decrypted data from stream
+     pub fn poll_read_decrypted<S>(
++        &mut self,
++        cx: &mut task::Context<'_>,
++        context: &Context,
++        stream: &mut S,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<ProtocolResult<()>>
++    where
++        S: AsyncRead + Unpin + ?Sized,
++    {
++        if let Err(err) = self.budget.ensure_active() {
++            return Poll::Ready(Err(err.into()));
++        }
++        let result = self.poll_read_decrypted_inner(cx, context, stream, buf);
++        if let Poll::Ready(Err(_)) = &result {
++            self.budget.terminate();
++            self.cipher = None;
++            self.buffer.clear();
++        }
++        result
++    }
++
++    fn poll_read_decrypted_inner<S>(
+         &mut self,
+         cx: &mut task::Context<'_>,
+         context: &Context,
+@@ -267,6 +368,7 @@
+     where
+         S: AsyncRead + Unpin + ?Sized,
+     {
++        self.budget.ensure_available()?;
+         let salt_len = self.method.salt_len();
+ 
+         // Header chunk, SALE + AEAD(TYPE + TIMESTAMP [+ REQUEST_SALT] + LENGTH) must be read in one call
+@@ -357,6 +459,7 @@
+         };
+ 
+         // Decrypt the header chunk
++        self.budget.consume()?;
+         if !cipher.decrypt_packet(header_chunk) {
+             return Err(ProtocolError::DecryptHeaderChunkError).into();
+         }
+@@ -415,6 +518,7 @@
+     where
+         S: AsyncRead + Unpin + ?Sized,
+     {
++        self.budget.ensure_available()?;
+         let length_len = 2 + self.method.tag_len();
+ 
+         let n = ready!(self.poll_read_exact(cx, stream, length_len))?;
+@@ -425,6 +529,7 @@
+         let cipher = self.cipher.as_mut().expect("cipher is None");
+ 
+         let m = &mut self.buffer[..length_len];
++        self.budget.consume()?;
+         let length = Self::decrypt_length(cipher, m)?;
+ 
+         Ok(Some(length)).into()
+@@ -434,6 +539,7 @@
+     where
+         S: AsyncRead + Unpin + ?Sized,
+     {
++        self.budget.ensure_available()?;
+         let data_len = size + self.method.tag_len();
+ 
+         let n = ready!(self.poll_read_exact(cx, stream, data_len))?;
+@@ -444,6 +550,7 @@
+         let cipher = self.cipher.as_mut().expect("cipher is None");
+ 
+         let m = &mut self.buffer[..data_len];
++        self.budget.consume()?;
+         if !cipher.decrypt_packet(m) {
+             return Err(ProtocolError::DecryptDataError).into();
+         }
+@@ -533,6 +640,7 @@
+     state: EncryptWriteState,
+     salt: Bytes,
+     request_salt: Option<Bytes>,
++    budget: AeadBudget,
+ }
+ 
+ impl EncryptedWriter {
+@@ -623,6 +731,7 @@
+             state: EncryptWriteState::AssembleHeader,
+             salt: Bytes::copy_from_slice(nonce),
+             request_salt: None,
++            budget: AeadBudget::new(),
+         }
+     }
+ 
+@@ -639,11 +748,36 @@
+ 
+     /// Reset cipher with key
+     pub fn reset_cipher_with_key(&mut self, key: &[u8]) {
+-        self.cipher = TcpCipher::new(self.method, key, &self.salt);
++        if self.budget.may_initialize_cipher() {
++            self.cipher = TcpCipher::new(self.method, key, &self.salt);
++        } else {
++            self.budget.terminate();
++            self.buffer.clear();
++        }
+     }
+ 
+     /// Attempt to write encrypted data into the writer
+     pub fn poll_write_encrypted<S>(
++        &mut self,
++        cx: &mut task::Context<'_>,
++        stream: &mut S,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>>
++    where
++        S: AsyncWrite + Unpin + ?Sized,
++    {
++        if let Err(err) = self.budget.ensure_active() {
++            return Poll::Ready(Err(err));
++        }
++        let result = self.poll_write_encrypted_inner(cx, stream, buf);
++        if let Poll::Ready(Err(_)) = &result {
++            self.budget.terminate();
++            self.buffer.clear();
++        }
++        result
++    }
++
++    fn poll_write_encrypted_inner<S>(
+         &mut self,
+         cx: &mut task::Context<'_>,
+         stream: &mut S,
+@@ -680,6 +814,7 @@
+                         self.buffer.put_slice(salt);
+                     }
+                     self.buffer.put_u16(buf.len() as u16);
++                    self.budget.consume()?;
+                     self.cipher.encrypt_packet(mbuf);
+                     unsafe { self.buffer.advance_mut(self.cipher.tag_len()) };
+ 
+@@ -691,6 +826,7 @@
+                     let mbuf = unsafe { slice::from_raw_parts_mut(mbuf.as_mut_ptr(), mbuf.len()) };
+ 
+                     self.buffer.put_slice(buf);
++                    self.budget.consume()?;
+                     self.cipher.encrypt_packet(mbuf);
+                     unsafe { self.buffer.advance_mut(self.cipher.tag_len()) };
+ 
+@@ -707,6 +843,7 @@
+                     let mbuf = unsafe { slice::from_raw_parts_mut(mbuf.as_mut_ptr(), mbuf.len()) };
+ 
+                     self.buffer.put_u16(buf.len() as u16);
++                    self.budget.consume()?;
+                     self.cipher.encrypt_packet(mbuf);
+                     unsafe { self.buffer.advance_mut(self.cipher.tag_len()) };
+ 
+@@ -718,6 +855,7 @@
+                     let mbuf = unsafe { slice::from_raw_parts_mut(mbuf.as_mut_ptr(), mbuf.len()) };
+ 
+                     self.buffer.put_slice(buf);
++                    self.budget.consume()?;
+                     self.cipher.encrypt_packet(mbuf);
+                     unsafe { self.buffer.advance_mut(self.cipher.tag_len()) };
+ 
+--- a/src/relay/tcprelay/mod.rs
++++ b/src/relay/tcprelay/mod.rs
+@@ -9,6 +9,8 @@
+ mod aead;
+ #[cfg(feature = "aead-cipher-2022")]
+ mod aead_2022;
++#[cfg(any(feature = "aead-cipher", feature = "aead-cipher-2022"))]
++mod aead_budget;
+ pub mod crypto_io;
+ pub mod proxy_listener;
+ pub mod proxy_stream;
+--- a/src/relay/tcprelay/proxy_stream/protocol/v2.rs
++++ b/src/relay/tcprelay/proxy_stream/protocol/v2.rs
+@@ -34,17 +34,12 @@
+         reader.read_exact(&mut padding_size_buffer).await?;
+ 
+         let padding_size = u16::from_be_bytes(padding_size_buffer);
+-        if padding_size > 0 {
+-            let mut take_reader = reader.take(padding_size as u64);
+-            let mut buffer = [0u8; 64];
+-            loop {
+-                match take_reader.read(&mut buffer).await {
+-                    Ok(0) => break,
+-                    Ok(..) => continue,
+-                    Err(err) => return Err(err),
+-                }
+-            }
++        // 本内核补丁：输入也遵守900字节上限，且不能把截断padding当作正常EOF。
++        if usize::from(padding_size) > MAX_PADDING_SIZE {
++            return Err(io::Error::new(io::ErrorKind::InvalidData, "padding exceeds 900 bytes"));
+         }
++        let mut padding = [0u8; MAX_PADDING_SIZE];
++        reader.read_exact(&mut padding[..usize::from(padding_size)]).await?;
+ 
+         Ok(Self { addr, padding_size })
+     }
+--- a/src/relay/tcprelay/proxy_stream/server.rs
++++ b/src/relay/tcprelay/proxy_stream/server.rs
+@@ -125,25 +125,13 @@
+ 
+         #[cfg(feature = "aead-cipher-2022")]
+         if let TcpRequestHeader::Aead2022(ref header) = header {
+-            use log::warn;
+-
+-            // AEAD-2022 SPEC
+-            //
+-            // Padding: If the client is not sending payload along with the header, a random padding MUST be added.
+-            //
+-            // Check here preventing security risk causing by misimplementation clients.
+-            if header.padding_size == 0 {
+-                let (chunk_count, chunk_remaining) = self.stream.current_data_chunk_remaining();
+-                if chunk_count == 1 && chunk_remaining == 0 {
+-                    // Header is the end of the data chunk, so no payload is in the first chunk, and padding == 0.
+-                    // REJECT insecure clients.
+-                    return Err(io::Error::other("no payload in first data chunk, and padding is 0"));
+-                } else if chunk_count > 1 {
+-                    warn!(
+-                        "tcp header is separated in {} chunks, client is not following the AEAD-2022 spec",
+-                        chunk_count,
+-                    );
+-                }
++            let (chunk_count, chunk_remaining) = self.stream.current_data_chunk_remaining();
++            // 本内核补丁：变量头（含padding）必须完整位于首个认证数据块。
++            if chunk_count != 1 {
++                return Err(io::Error::new(io::ErrorKind::InvalidData, "variable header crosses first data chunk"));
++            }
++            if header.padding_size == 0 && chunk_remaining == 0 {
++                return Err(io::Error::other("no payload in first data chunk, and padding is 0"));
+             }
+         }
+         Ok(header.addr())
+--- a/src/relay/udprelay/aead_2022.rs
++++ b/src/relay/udprelay/aead_2022.rs
+@@ -45,15 +45,19 @@
+ //! ```
+ 
+ use std::{
++    io::{self, Cursor, Seek, SeekFrom},
++    rc::Rc,
++    slice,
++    sync::Arc,
++    time::SystemTime,
++};
++#[cfg(any(test, not(feature = "aead-2022-no-udp-cipher-cache")))]
++use std::{
+     cell::RefCell,
+     cmp::Ordering,
+     collections::hash_map::DefaultHasher,
+     hash::{Hash, Hasher},
+-    io::{self, Cursor, Seek, SeekFrom},
+-    rc::Rc,
+-    slice,
+-    sync::Arc,
+-    time::{Duration, SystemTime},
++    time::Duration,
+ };
+ 
+ use aes::{
+@@ -63,6 +67,7 @@
+ use byte_string::ByteStr;
+ use bytes::{Buf, BufMut, Bytes, BytesMut};
+ use log::{error, trace};
++#[cfg(any(test, not(feature = "aead-2022-no-udp-cipher-cache")))]
+ use lru_time_cache::LruCache;
+ 
+ #[cfg(feature = "aead-cipher-2022-extra")]
+@@ -81,6 +86,10 @@
+ };
+ 
+ use super::options::UdpSocketControlData;
++
++#[cfg(all(test, feature = "aead-2022-no-udp-cipher-cache"))]
++#[path = "aead_2022_cache_tests.rs"]
++mod cache_tests;
+ 
+ const CLIENT_SOCKET_TYPE: u8 = 0;
+ const SERVER_SOCKET_TYPE: u8 = 1;
+@@ -108,6 +117,7 @@
+ /// AEAD 2022 protocol result
+ pub type ProtocolResult<T> = Result<T, ProtocolError>;
+ 
++#[cfg(any(test, not(feature = "aead-2022-no-udp-cipher-cache")))]
+ #[derive(PartialEq, Eq, Hash, Clone, Debug)]
+ struct CipherKey {
+     method: CipherKind,
+@@ -115,12 +125,14 @@
+     session_id: u64,
+ }
+ 
++#[cfg(any(test, not(feature = "aead-2022-no-udp-cipher-cache")))]
+ impl PartialOrd for CipherKey {
+     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+         Some(self.cmp(other))
+     }
+ }
+ 
++#[cfg(any(test, not(feature = "aead-2022-no-udp-cipher-cache")))]
+ impl Ord for CipherKey {
+     fn cmp(&self, other: &Self) -> Ordering {
+         let hash1 = {
+@@ -138,9 +150,12 @@
+     }
+ }
+ 
++#[cfg(any(test, not(feature = "aead-2022-no-udp-cipher-cache")))]
+ const CIPHER_CACHE_DURATION: Duration = Duration::from_secs(30);
++#[cfg(any(test, not(feature = "aead-2022-no-udp-cipher-cache")))]
+ const CIPHER_CACHE_LIMIT: usize = 102400;
+ 
++#[cfg(any(test, not(feature = "aead-2022-no-udp-cipher-cache")))]
+ thread_local! {
+     static CIPHER_CACHE: RefCell<LruCache<CipherKey, Rc<UdpCipher>>> =
+         RefCell::new(LruCache::with_expiry_duration_and_capacity(CIPHER_CACHE_DURATION, CIPHER_CACHE_LIMIT));
+@@ -154,7 +169,19 @@
+     }
+ }
+ 
++#[cfg(feature = "aead-2022-no-udp-cipher-cache")]
+ fn get_cipher(method: CipherKind, key: &[u8], session_id: u64) -> Rc<UdpCipher> {
++    // 本内核补丁：派生对象只活到本次调用结束，不按未认证SID保留状态。
++    Rc::new(UdpCipher::new(method, key, session_id))
++}
++
++#[cfg(not(feature = "aead-2022-no-udp-cipher-cache"))]
++fn get_cipher(method: CipherKind, key: &[u8], session_id: u64) -> Rc<UdpCipher> {
++    cached_cipher(method, key, session_id)
++}
++
++#[cfg(any(test, not(feature = "aead-2022-no-udp-cipher-cache")))]
++fn cached_cipher(method: CipherKind, key: &[u8], session_id: u64) -> Rc<UdpCipher> {
+     CIPHER_CACHE.with(|cache| {
+         let mut cache = cache.borrow_mut();
+ 
+--- /dev/null
++++ b/src/relay/tcprelay/aead_budget.rs
+@@ -0,0 +1,92 @@
++//! 本地适配补丁：每方向固定的AEAD操作预算，不修改密码算法或nonce实现。
++
++use std::io;
++
++// 六个选用方法的TCP nonce至少96位；2^63次操作在回绕前保守终止。
++// 不暴露生产构造参数，外部调用者不能调大此上限。
++const OPERATION_LIMIT: u64 = 1 << 63;
++
++pub(super) struct AeadBudget {
++    remaining: u64,
++    failed: bool,
++}
++
++impl AeadBudget {
++    pub(super) fn new() -> Self {
++        Self {
++            remaining: OPERATION_LIMIT,
++            failed: false,
++        }
++    }
++
++    pub(super) fn ensure_active(&self) -> io::Result<()> {
++        if self.failed {
++            Err(io::Error::other("TCP AEAD direction is terminated"))
++        } else {
++            Ok(())
++        }
++    }
++
++    // 可在poll之前检查，但只在紧邻实际密码调用时consume；Pending不扣预算。
++    pub(super) fn ensure_available(&mut self) -> io::Result<()> {
++        self.ensure_active()?;
++        if self.remaining == 0 {
++            self.failed = true;
++            return Err(io::Error::other("TCP AEAD operation budget exhausted"));
++        }
++        Ok(())
++    }
++
++    pub(super) fn consume(&mut self) -> io::Result<()> {
++        self.ensure_available()?;
++        self.remaining -= 1;
++        Ok(())
++    }
++
++    pub(super) fn terminate(&mut self) {
++        self.failed = true;
++    }
++
++    // EIH响应只允许在writer首次加密前切换用户密钥；不能重置nonce来复活旧方向。
++    #[cfg(any(test, feature = "aead-cipher-2022"))]
++    pub(super) fn may_initialize_cipher(&self) -> bool {
++        !self.failed && self.remaining == OPERATION_LIMIT
++    }
++
++    #[cfg(test)]
++    pub(super) fn with_remaining(remaining: u64) -> Self {
++        assert!(remaining <= OPERATION_LIMIT);
++        Self {
++            remaining,
++            failed: false,
++        }
++    }
++
++    #[cfg(test)]
++    pub(super) fn remaining(&self) -> u64 {
++        self.remaining
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn aead_budget_exact_production_boundary_and_terminal_latch() {
++        let mut budget = AeadBudget::new();
++        assert_eq!(budget.remaining(), 1 << 63);
++        assert!(budget.may_initialize_cipher());
++        budget.consume().unwrap();
++        assert_eq!(budget.remaining(), (1 << 63) - 1);
++        assert!(!budget.may_initialize_cipher());
++        budget.remaining = 1;
++        budget.consume().unwrap();
++        assert_eq!(budget.remaining(), 0);
++        assert!(budget.ensure_active().is_ok());
++        assert!(budget.consume().is_err());
++        assert!(budget.ensure_active().is_err());
++        assert!(budget.consume().is_err());
++        assert_eq!(budget.remaining(), 0);
++    }
++}
+--- /dev/null
++++ b/src/relay/tcprelay/aead_budget_tests.rs
+@@ -0,0 +1,325 @@
++// 被两个AEAD模块的私有测试模块include；不修改mod.rs、不暴露生产注入接口。
++use crate::config::{ReplayAttackPolicy, ServerType};
++use std::task::Waker;
++
++struct ControlledIo {
++    input: Vec<u8>,
++    position: usize,
++    output: Vec<u8>,
++    reads: usize,
++    writes: usize,
++    alternate_pending: bool,
++    read_pending: bool,
++    write_pending: bool,
++    fail_write: bool,
++}
++
++impl ControlledIo {
++    fn new(input: &[u8], alternate_pending: bool) -> Self {
++        Self {
++            input: input.to_vec(),
++            position: 0,
++            output: Vec::new(),
++            reads: 0,
++            writes: 0,
++            alternate_pending,
++            read_pending: alternate_pending,
++            write_pending: alternate_pending,
++            fail_write: false,
++        }
++    }
++}
++
++impl AsyncRead for ControlledIo {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        cx: &mut task::Context<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        self.reads += 1;
++        if self.read_pending {
++            self.read_pending = false;
++            cx.waker().wake_by_ref();
++            return Poll::Pending;
++        }
++        self.read_pending = self.alternate_pending;
++        let n = buf.remaining().min(self.input.len() - self.position);
++        buf.put_slice(&self.input[self.position..self.position + n]);
++        self.position += n;
++        Poll::Ready(Ok(()))
++    }
++}
++
++impl AsyncWrite for ControlledIo {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        cx: &mut task::Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        self.writes += 1;
++        if self.fail_write {
++            return Poll::Ready(Err(io::Error::other("injected write failure")));
++        }
++        if self.write_pending {
++            self.write_pending = false;
++            cx.waker().wake_by_ref();
++            return Poll::Pending;
++        }
++        self.write_pending = self.alternate_pending;
++        let n = buf.len().min(3); // 强制部分写，Pending重试不得再次加密/计数。
++        self.output.extend_from_slice(&buf[..n]);
++        Poll::Ready(Ok(n))
++    }
++
++    fn poll_flush(self: Pin<&mut Self>, _: &mut task::Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(Ok(()))
++    }
++
++    fn poll_shutdown(self: Pin<&mut Self>, _: &mut task::Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(Ok(()))
++    }
++}
++
++fn finish_write(
++    writer: &mut EncryptedWriter,
++    io: &mut ControlledIo,
++    data: &[u8],
++) -> io::Result<usize> {
++    let mut cx = task::Context::from_waker(Waker::noop());
++    for _ in 0..4096 {
++        if let Poll::Ready(result) = writer.poll_write_encrypted(&mut cx, io, data) {
++            return result;
++        }
++    }
++    panic!("write poll次数超出有限测试上界");
++}
++
++fn finish_read(
++    reader: &mut DecryptedReader,
++    io: &mut ControlledIo,
++    output: &mut [u8],
++) -> ProtocolResult<usize> {
++    let mut context = Context::new(ServerType::Server);
++    context.set_replay_attack_policy(ReplayAttackPolicy::Ignore);
++    let mut cx = task::Context::from_waker(Waker::noop());
++    let mut buf = ReadBuf::new(output);
++    for _ in 0..4096 {
++        if let Poll::Ready(result) = reader.poll_read_decrypted(&mut cx, &context, io, &mut buf) {
++            return result.map(|()| buf.filled().len());
++        }
++    }
++    panic!("read poll次数超出有限测试上界");
++}
++
++fn encrypted_chunks(chunks: &[&[u8]]) -> Vec<u8> {
++    let mut writer = new_writer();
++    let mut io = ControlledIo::new(&[], false);
++    for chunk in chunks {
++        assert_eq!(
++            finish_write(&mut writer, &mut io, chunk).unwrap(),
++            chunk.len()
++        );
++    }
++    io.output
++}
++
++#[test]
++fn aead_budget_writer_counts_actual_operations_once_across_pending_and_partial_writes() {
++    let mut writer = new_writer();
++    writer.budget = AeadBudget::with_remaining(4);
++    let mut io = ControlledIo::new(&[], true);
++    let mut cx = task::Context::from_waker(Waker::noop());
++    assert!(
++        writer
++            .poll_write_encrypted(&mut cx, &mut io, b"one")
++            .is_pending()
++    );
++    assert_eq!(writer.budget.remaining(), 2); // 固定头/长度与载荷各一次。
++    assert_eq!(finish_write(&mut writer, &mut io, b"one").unwrap(), 3);
++    assert_eq!(writer.budget.remaining(), 2);
++    assert_eq!(finish_write(&mut writer, &mut io, b"two").unwrap(), 3);
++    assert_eq!(writer.budget.remaining(), 0);
++    let sent = io.output.clone();
++    let calls = io.writes;
++    for _ in 0..3 {
++        assert!(finish_write(&mut writer, &mut io, b"blocked").is_err());
++        assert_eq!(io.output, sent);
++        assert_eq!(io.writes, calls);
++        assert_eq!(writer.budget.remaining(), 0);
++    }
++}
++
++#[test]
++fn aead_budget_writer_incomplete_pair_is_terminal_and_emits_nothing() {
++    for remaining in [0, 1] {
++        let mut writer = new_writer();
++        writer.budget = AeadBudget::with_remaining(remaining);
++        let mut io = ControlledIo::new(&[], false);
++        assert!(finish_write(&mut writer, &mut io, b"blocked").is_err());
++        assert_eq!(writer.budget.remaining(), 0);
++        assert_eq!(io.writes, 0);
++        assert!(io.output.is_empty());
++        assert!(writer.buffer.is_empty());
++        for _ in 0..2 {
++            assert!(finish_write(&mut writer, &mut io, b"blocked").is_err());
++            assert_eq!(io.writes, 0);
++        }
++    }
++}
++
++#[test]
++fn aead_budget_writer_io_failure_is_terminal_even_with_unspent_budget() {
++    let mut writer = new_writer();
++    writer.budget = AeadBudget::with_remaining(8);
++    let mut io = ControlledIo::new(&[], false);
++    io.fail_write = true;
++    assert!(finish_write(&mut writer, &mut io, b"blocked").is_err());
++    assert_eq!(writer.budget.remaining(), 6);
++    assert_eq!(io.writes, 1);
++    io.fail_write = false;
++    assert!(finish_write(&mut writer, &mut io, b"blocked").is_err());
++    assert_eq!(writer.budget.remaining(), 6);
++    assert_eq!(io.writes, 1);
++    assert!(io.output.is_empty());
++}
++
++#[test]
++fn aead_budget_writer_error_after_partial_output_never_resumes_output() {
++    let mut writer = new_writer();
++    writer.budget = AeadBudget::with_remaining(8);
++    let mut io = ControlledIo::new(&[], true);
++    let mut cx = task::Context::from_waker(Waker::noop());
++    assert!(
++        writer
++            .poll_write_encrypted(&mut cx, &mut io, b"blocked")
++            .is_pending()
++    );
++    assert!(
++        writer
++            .poll_write_encrypted(&mut cx, &mut io, b"blocked")
++            .is_pending()
++    );
++    assert_eq!(io.output.len(), 3);
++    io.fail_write = true;
++    assert!(finish_write(&mut writer, &mut io, b"blocked").is_err());
++    let sent = io.output.clone();
++    let writes = io.writes;
++    io.fail_write = false;
++    assert!(finish_write(&mut writer, &mut io, b"blocked").is_err());
++    assert_eq!(io.output, sent);
++    assert_eq!(io.writes, writes);
++    assert_eq!(writer.budget.remaining(), 6);
++}
++
++#[test]
++fn aead_budget_reader_later_length_cannot_release_unbudgeted_data() {
++    let wire = encrypted_chunks(&[b"one", b"hidden"]);
++    let mut reader = new_reader();
++    reader.budget = AeadBudget::with_remaining(3);
++    let mut io = ControlledIo::new(&wire, true);
++    let mut first = [0; 3];
++    assert_eq!(finish_read(&mut reader, &mut io, &mut first).unwrap(), 3);
++    assert_eq!(first, *b"one");
++    assert_eq!(reader.budget.remaining(), 1);
++    let mut blocked = [0xaa; 16];
++    assert!(finish_read(&mut reader, &mut io, &mut blocked).is_err());
++    assert_eq!(reader.budget.remaining(), 0);
++    assert_eq!(blocked, [0xaa; 16]);
++    let calls = io.reads;
++    assert!(finish_read(&mut reader, &mut io, &mut blocked).is_err());
++    assert_eq!(io.reads, calls);
++}
++
++#[test]
++fn aead_budget_reader_header_and_data_pending_do_not_spend_or_repeat_operations() {
++    let wire = encrypted_chunks(&[b"one", b"two"]);
++    let mut reader = new_reader();
++    reader.budget = AeadBudget::with_remaining(4);
++    let mut io = ControlledIo::new(&wire, true);
++    let mut context = Context::new(ServerType::Server);
++    context.set_replay_attack_policy(ReplayAttackPolicy::Ignore);
++    let mut cx = task::Context::from_waker(Waker::noop());
++    let mut output = [0; 3];
++    let mut buf = ReadBuf::new(&mut output);
++    assert!(
++        reader
++            .poll_read_decrypted(&mut cx, &context, &mut io, &mut buf)
++            .is_pending()
++    );
++    assert_eq!(reader.budget.remaining(), 4); // 包括2022首固定头：Pending不消费。
++    let mut saw_first_operation = false;
++    for _ in 0..32 {
++        let result = reader.poll_read_decrypted(&mut cx, &context, &mut io, &mut buf);
++        if result.is_pending() && reader.budget.remaining() == 3 {
++            saw_first_operation = true; // 固定头/长度已认证，载荷read仍Pending。
++            break;
++        }
++        assert!(result.is_pending());
++    }
++    assert!(saw_first_operation);
++    assert_eq!(finish_read(&mut reader, &mut io, &mut output).unwrap(), 3);
++    assert_eq!(output, *b"one");
++    assert_eq!(reader.budget.remaining(), 2);
++    // 耗尽后仍可交付最后一次成功认证而已缓冲的明文，不再执行密码操作。
++    let mut byte = [0; 1];
++    assert_eq!(finish_read(&mut reader, &mut io, &mut byte).unwrap(), 1);
++    assert_eq!(byte, *b"t");
++    assert_eq!(reader.budget.remaining(), 0);
++    let mut rest = [0; 2];
++    assert_eq!(finish_read(&mut reader, &mut io, &mut rest).unwrap(), 2);
++    assert_eq!(rest, *b"wo");
++    let calls = io.reads;
++    for _ in 0..3 {
++        assert!(finish_read(&mut reader, &mut io, &mut output).is_err());
++        assert_eq!(io.reads, calls);
++        assert_eq!(reader.budget.remaining(), 0);
++        assert!(reader.cipher.is_none());
++    }
++}
++
++#[test]
++fn aead_budget_reader_one_operation_cannot_authenticate_or_release_payload() {
++    let wire = encrypted_chunks(&[b"hidden"]);
++    for remaining in [0, 1] {
++        let mut reader = new_reader();
++        reader.budget = AeadBudget::with_remaining(remaining);
++        let mut io = ControlledIo::new(&wire, true);
++        let mut output = [0xaa; 16];
++        assert!(finish_read(&mut reader, &mut io, &mut output).is_err());
++        assert_eq!(reader.budget.remaining(), 0);
++        assert_eq!(output, [0xaa; 16]);
++        assert!(reader.cipher.is_none());
++        let calls = io.reads;
++        let position = io.position;
++        assert!(finish_read(&mut reader, &mut io, &mut output).is_err());
++        assert_eq!((io.reads, io.position), (calls, position));
++    }
++}
++
++#[test]
++fn aead_budget_reader_bad_header_or_payload_tag_spends_once_and_is_terminal() {
++    for corrupt_at in [
++        INITIAL_HEADER_LEN - 1,
++        encrypted_chunks(&[b"hidden"]).len() - 1,
++    ] {
++        let mut wire = encrypted_chunks(&[b"hidden"]);
++        wire[corrupt_at] ^= 1;
++        let mut reader = new_reader();
++        reader.budget = AeadBudget::with_remaining(8);
++        let mut io = ControlledIo::new(&wire, true);
++        let mut output = [0xaa; 16];
++        assert!(finish_read(&mut reader, &mut io, &mut output).is_err());
++        let expected = if corrupt_at == INITIAL_HEADER_LEN - 1 {
++            7
++        } else {
++            6
++        };
++        assert_eq!(reader.budget.remaining(), expected);
++        assert_eq!(output, [0xaa; 16]);
++        let calls = io.reads;
++        assert!(finish_read(&mut reader, &mut io, &mut output).is_err());
++        assert_eq!(io.reads, calls);
++        assert_eq!(reader.budget.remaining(), expected);
++        assert!(reader.cipher.is_none());
++    }
++}
+--- /dev/null
++++ b/src/relay/udprelay/aead_2022_cache_tests.rs
+@@ -0,0 +1,86 @@
++//! 本内核缓存禁用补丁的差异与状态测试；不替代端到端互通验收。
++use super::*;
++use crate::config::ServerType;
++
++fn methods() -> [CipherKind; 3] {
++    [
++        CipherKind::AEAD2022_BLAKE3_AES_128_GCM,
++        CipherKind::AEAD2022_BLAKE3_AES_256_GCM,
++        CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305,
++    ]
++}
++
++#[test]
++fn cached_and_uncached_ciphertext_is_identical() {
++    for method in methods() {
++        let key = vec![0x47; method.key_len()];
++        for sid in [0, 1, 0x123456789abcdef0, u64::MAX] {
++            CIPHER_CACHE.with(|cache| cache.borrow_mut().clear());
++            let cached = cached_cipher(method, &key, sid);
++            let uncached = get_cipher(method, &key, sid);
++            let nonce_length = if method == CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305 {
++                24
++            } else {
++                12
++            };
++            let nonce = vec![0x23; nonce_length];
++            let mut expected = vec![0x65; 128 + method.tag_len()];
++            let mut actual = expected.clone();
++            cached.encrypt_packet(&nonce, &mut expected);
++            uncached.encrypt_packet(&nonce, &mut actual);
++            assert_eq!(actual, expected, "{method}, sid={sid}");
++            assert!(uncached.decrypt_packet(&nonce, &mut expected));
++            assert!(cached.decrypt_packet(&nonce, &mut actual));
++            assert_eq!(&actual[..128], &[0x65; 128]);
++            assert_eq!(actual, expected);
++            drop(cached);
++            drop(uncached);
++        }
++    }
++    CIPHER_CACHE.with(|cache| cache.borrow_mut().clear());
++}
++
++#[test]
++fn valid_packets_and_invalid_tags_do_not_fill_cache() {
++    let context = Context::new(ServerType::Server);
++    let address: Address = "127.0.0.1:1234".parse().unwrap();
++    for method in methods() {
++        CIPHER_CACHE.with(|cache| cache.borrow_mut().clear());
++        let key = vec![0x61; method.key_len()];
++        for sid in 1..=2048 {
++            let mut control = UdpSocketControlData::default();
++            control.client_session_id = sid;
++            control.server_session_id = sid + 10_000;
++            control.packet_id = sid * 2;
++            let mut wire = BytesMut::new();
++            encrypt_client_payload_aead_2022(
++                &context,
++                method,
++                &key,
++                &address,
++                &control,
++                &[],
++                b"cache-test",
++                &mut wire,
++            );
++            let mut corrupt = wire.to_vec();
++            *corrupt.last_mut().unwrap() ^= 1;
++            assert!(decrypt_client_payload_aead_2022(&context, method, &key, &mut corrupt, None).is_err());
++            let (n, target, returned) =
++                decrypt_client_payload_aead_2022(&context, method, &key, &mut wire, None).unwrap();
++            assert_eq!(target, address);
++            assert_eq!(&wire[..n], b"cache-test");
++            assert_eq!(returned.client_session_id, sid);
++            assert_eq!(returned.packet_id, control.packet_id);
++            let mut response = BytesMut::new();
++            encrypt_server_payload_aead_2022(&context, method, &key, &address, &control, b"response", &mut response);
++            let (n, target, returned) =
++                decrypt_server_payload_aead_2022(&context, method, &key, &mut response).unwrap();
++            assert_eq!(target, address);
++            assert_eq!(&response[..n], b"response");
++            assert_eq!(returned.client_session_id, sid);
++            assert_eq!(returned.server_session_id, control.server_session_id);
++            CIPHER_CACHE.with(|cache| assert_eq!(cache.borrow().len(), 0));
++        }
++    }
++}

@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "nw3",
+      "tag": "nw3-in",
+      "listen": "127.0.0.1:10451",
+      "key": "0123456789abcdef0123456789abcdef",
+      "morph": true,
+      "out": "direct"
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct" }
+}

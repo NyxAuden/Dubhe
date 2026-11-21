@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "inbounds": [
+    { "type": "socks5", "tag": "local", "listen": "127.0.0.1:1080" }
+  ],
+  "outbounds": [
+    {
+      "type": "naive",
+      "tag": "naive-upstream",
+      "endpoint": "203.0.113.10:443",
+      "username": "REPLACE_WITH_USER",
+      "password": "REPLACE_WITH_RANDOM_PASSWORD",
+      "tls": {
+        "ca_file": "/etc/ssl/private/naive-ca.pem",
+        "server_name": "proxy.example"
+      },
+      "naive": {
+        "http_version": "2",
+        "udp_over_tcp": false,
+        "extra_headers": {}
+      }
+    },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "naive-upstream" }
+}

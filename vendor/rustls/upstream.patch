@@ -1,0 +1,2408 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -81,6 +81,8 @@
+ ]
+ logging = ["log"]
+ prefer-post-quantum = ["aws_lc_rs"]
++# Opt-in, per-connection, bounded REALITY TLS1.3 hooks.
++reality = ["aws_lc_rs", "std"]
+ read_buf = [
+     "rustversion",
+     "std",
+@@ -195,7 +197,7 @@
+ version = "0.4.4"
+ 
+ [dev-dependencies.rcgen]
+-version = "0.14"
++version = "0.13"
+ features = [
+     "pem",
+     "aws_lc_rs",
+--- /dev/null
++++ b/REALITY-SOURCE.txt
+@@ -0,0 +1,54 @@
++rustls 0.23.46 REALITY 加性补丁来源与验证说明
++
++来源与许可
++- 精确官方发布归档：https://static.crates.io/crates/rustls/rustls-0.23.46.crate
++- 原始归档 SHA256：48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf
++- UPSTREAM.json 保存全部 119 个原始文件的 SHA256；发布归档原样保留，包括 Cargo.toml.orig、Cargo.lock、.cargo_vcs_info.json 和三个 LICENSE。
++- 上游许可 Apache-2.0 OR ISC OR MIT。本地新增实现使用同一许可；未复制任何 MPL/GPL REALITY 源码。协议要求来自本项目已批准 design D6/D7，密码实现仍为原 rustls/AWS-LC。
++- Cargo.toml.orig 和 vendor Cargo.lock 是官方发布历史文件，不用于当前生产解析；根 Cargo.toml/Cargo.lock 由主会话独占管理。未在 vendor 新建另一份 lock。
++- 本文不声称已完成全传递许可/公告或精确 Rust1.91 构建；这些由主线依赖门禁统一记录。
++
++加性边界
++1. feature reality 默认关闭；编译它也不会自动启用，ServerConfig.reality 默认 None。
++2. 仅接受 TLS1.3 原始 SH（含握手头，无record头），SID32，null compression，X25519/X25519MLKEM768 和三种标准 TLS1.3 suite；仅 supported_versions/key_share 两扩展，拒绝重复/未知/HRR/truncation。针对真实 CH 的 SID、versions、suite/group/share offer 与 provider 再验证，拒绝 PSK/early_data，不允许 HRR。
++3. 原 provider 独立临时 KX；只替换已验证的等长share范围，扩展顺序/random及其余模板字节保持；同一最终raw编码用于 transcript 和 socket输出。
++4. SH确定后、Certificate编码前调用逐连接 resolver；返回同 SigningKey对象（同Arc底层指针）、Ed25519、严格 SPKI/keys_match、最多8张/65536总字节证书、无OCSP。REALITY 与 Xray 一致固定使用 Ed25519 临时证书，即使客户端未在 signature_algorithms 中声明 Ed25519 也以 Ed25519 完成 CertificateVerify；普通 TLS 仍按客户端列表协商。MLDSA构造由主线完成；接点不静默跳过回调或吞掉其错误。
++5. 固定 D7 RecordPlan：首加密槽总长度>512时一槽聚合，否则四槽分别 EE/Certificate/CV/Finished；CCS6或显式缺失0；可选app槽只空明文。长度含5字节record头，padding为total-5-message-1-16；TLSPlaintext<=16384，TLSInnerPlaintext<=16385，总record<=16406。目标槽位足够时按目标总长填充；本地消息大于目标槽位时使用自然长度而非回退（与 Xray 不要求逐 record 等长一致），仍全部在提交前预检，不截消息。
++6. MessageEncrypter默认拒绝新padding操作，仅原AWS-LC TLS1.3 encrypter支持；拼接inner type及零padding后仍调用原 Seal。record layer保持唯一write_seq和AEAD限额；新路径不用原 encrypt_outgoing的unwrap，失败消耗nonce并关闭，不重试。
++7. 连接创建/Accepted路径开启内部pending闩锁，全部初始flight完成Certificate/CV/Finished编码、布局/能力校验、Seal和可选app槽成功之前，不发布SH/CCS/alert。成功后完整有界flight原子入队；process_new_packets必须返回Ok且wants_write=true，才能交给外层不可逆socket提交。目标socket生命周期由主线管理。
++8. 普通配置不走这些分支；原CertificateVerify、客户端Finished、KeyUpdate与应用解密仍由rustls正常状态机完成。新钩子要求TLS13-only、禁tickets/early-data/half-RTT/secret-extraction/client-auth/certificate-compression；非TCP拒绝。
++9. 客户端加性钩子只允许逐连接替换首份 ClientHello 的32字节 legacy SID：在 CH 载荷构建后、最终编码前调用 BuildsSessionId(random, 当前 key_share, 零SID完整CH握手消息)，设置最终SID后再走原编码。`Config::new` 默认 `allow_hrr=false`，钩子路径拒绝HRR；`Config::new_allow_hrr` 显式开启最小HRR放行（默认关闭，REALITY默认行为不变）。无论是否放行HRR，ECH和early data仍被拒绝。收到HRR构造CH2时不调用builder、不置零，完整保留CH1的 `chp_payload.session_id`/`input.session_id`。另在解析首份 ServerHello 后、证书校验前调用同一 builder 的 `server_hello(encoded)`，只交付含4字节握手头的原始 SH 字节，供调用方按 REALITY ML-DSA-65 扩展校验 `HMAC(authKey, Ed25519Pub || rawCH || rawSH)`；默认实现为空操作，普通调用方不受影响。这些钩子不改变密钥交换结果、证书验证、CertificateVerify/Finished或普通恢复逻辑；调用方负责REALITY wire编码和自己的证书验证器。认证键由调用方KX实现的 `reality_auth_key` 提供，普通KX默认返回None。
++
++公共API
++- rustls::server::reality::RecordPlan::new(sh_total:usize, ccs_total:usize, encrypted:Vec<usize>, empty_app:Option<usize>) -> Result<RecordPlan,Error>
++- rustls::server::reality::Config::new(raw_server_hello:Vec<u8>, record_plan:RecordPlan, certificate_resolver:Arc<dyn ResolvesCertificate>) -> Result<Config,Error>
++- Config::cipher_suite() -> CipherSuite；Config::named_group() -> NamedGroup
++- ResolvesCertificate: Debug+Send+Sync，resolve(&self, final_raw_sh:&[u8]) -> Result<Arc<CertifiedKey>,Error>
++- ServerConfig #[cfg(feature="reality")] pub reality:Option<Arc<Config>>
++- rustls::client::reality::BuildsSessionId::build(random:[u8;32], key_share:&dyn ActiveKeyExchange, zero_hello:&[u8]) -> Result<[u8;32],Error>
++- rustls::client::reality::BuildsSessionId::server_hello(&self, encoded:&[u8])（默认空操作；encoded 含4字节握手头）
++- rustls::client::reality::Config::new(builder:Arc<dyn BuildsSessionId>) -> Config（默认 allow_hrr=false，保持REALITY原行为：拒绝HRR/ECH/early data）
++- rustls::client::reality::Config::new_allow_hrr(builder:Arc<dyn BuildsSessionId>) -> Config（allow_hrr=true，仅额外放行HRR；ECH/early data仍拒绝，CH2保留CH1的SID且不调用builder）；ClientConfig #[cfg(feature="reality")] pub reality:Option<Arc<Config>>
++- ActiveKeyExchange #[cfg(feature="reality")] fn reality_auth_key(&self, server_public:&[u8], random:&[u8;32]) -> Option<[u8;32]>，默认None
++
++测试与复现
++- python3 -I /项目/vendor/rustls/run-tests.py --root /项目
++  runner使用根唯一锁 cargo build --locked --offline -p rustls -p rcgen -p ring，再rustc --test执行vendor内测试，不运行官方程序、不联网/容器、不修改workspace。末尾用同锁构建依赖直接rustc编译feature完全关闭的ring/std/tls12版本。
++- 官方crate排除了src/testdata及集成tests，且rustls不是根workspace成员，故cargo test -p rustls --lib不能运行；没有删除/篡改上游单测。保留新增tests/reality.rs与可复现runner，不能将定向测试称作完整上游测试通过。
++- cargo check --manifest-path /项目/Cargo.toml -p rustls --lib --offline --locked
++- cargo clippy --manifest-path /项目/Cargo.toml -p rustls --lib --offline --locked -- -D warnings
++- rustfmt使用上游匹配风格：--edition 2021 --config skip_children=true,style_edition=2024,chain_width=40；不重格式化其他上游文件。
++- tests/reality.rs使用自持内存peer、rcgen RemoteKeyPair和ring Ed25519；客户端正常验证CertificateVerify/Finished。额外ring HKDF/AEAD/HMAC独立解密真实AWS-LC records、重建rawCH+rawSH+真实消息transcript验证Finished，检查全零padding及空app零明文/下一业务record/KeyUpdate。没有借项目生产auth/parser/certificate作独立测试端。
++- 模拟3309字节扩展只证明MLDSA尺寸可容纳/不足和回调时机；不是实际MLDSA签名互通，真实签名由主线单独验证。
++- stdout、执行元数据及历史见 evidence/，实际passed以对应日志为准，未执行官方/三平台/精确MSRV。evidence/与tests/reality.rs只记录服务端钩子构建/测试；客户端钩子的本机互测记录在根项目 tests/reality_outbound.rs（X25519与X25519MLKEM768 target、三协议WS、VLESS原生UDP），不能把旧vendor日志当作客户端钩子已跑。
++- python3 -I /项目/vendor/rustls/verify-source.py --archive ~/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/rustls-0.23.46.crate --empty-dir /新空目录
++  先核归档/逐文件摘要及常规文件，再应用upstream.patch，核PATCHED.json全部结果。脚本从项目可信路径执行，不从提取目录加载代码；新目录仅作复现，不用于构建。
++- 本批 `Config::new_allow_hrr`/最小HRR放行只做静态检查与本机 verify-source 复现，未在本批运行官方客户端互测或全量 vendor 测试。upstream.patch 的 SHA256 及补丁后逐文件 SHA256 以当前 PATCHED.json 为准。
++
++暂停/失败历史
++- 依赖门禁发现time0.3.45的RUSTSEC-2026-0009后，应主会话指令立即暂停，保存未完成断点；未自行升级/规避。真实用户批准最小修复后恢复；主会话更新time/core/macros/numconv四包并通知稳定锁。
++- 首次check使用-p rustls --features rustls/reality失败：非workspace成员不能这样选feature；改由根依赖既定feature解析，无Cargo改动。
++- 首次编译发现内部模块路径/私有常量/len/闭包mut错误，均修正后check通过。
++- 首批夹具缺少rcgen关闭crypto时必填serial_number，5失败；加serial后剩3失败为测试未循环读尽长flight（非协议修改），修正后6通过。
++- 新增负向测试把suite高字节修改成同值造成1失败，改为真实非法值后12通过；没有降低生产验证。
++- 初次rustfmt默认风格导致上游无关换行差异，调整为style_edition2024/chain_width40匹配上游后仅保留最小相关差异。
+--- /dev/null
++++ b/evidence/check.log
+@@ -0,0 +1,4 @@
++    Blocking waiting for file lock on package cache
++    Blocking waiting for file lock on build directory
++   Compiling rustls v0.23.46 ($PROJECT_ROOT/vendor/rustls)
++    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.95s
+--- /dev/null
++++ b/evidence/clippy.log
+@@ -0,0 +1,2 @@
++   Compiling rustls v0.23.46 ($PROJECT_ROOT/vendor/rustls)
++    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.67s
+--- /dev/null
++++ b/evidence/execution.json
+@@ -0,0 +1,46 @@
++{
++  "tests": {
++    "command": [
++      "python3",
++      "-I",
++      "$PROJECT_ROOT/vendor/rustls/run-tests.py",
++      "--root",
++      "$PROJECT_ROOT"
++    ],
++    "exit_code": 0
++  },
++  "check": {
++    "command": [
++      "cargo",
++      "check",
++      "--manifest-path",
++      "$PROJECT_ROOT/Cargo.toml",
++      "-p",
++      "rustls",
++      "--lib",
++      "--offline",
++      "--locked"
++    ],
++    "exit_code": 0
++  },
++  "clippy": {
++    "command": [
++      "cargo",
++      "clippy",
++      "--manifest-path",
++      "$PROJECT_ROOT/Cargo.toml",
++      "-p",
++      "rustls",
++      "--lib",
++      "--offline",
++      "--locked",
++      "--",
++      "-D",
++      "warnings"
++    ],
++    "exit_code": 0
++  },
++  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
++  "recorded_at": "2026-11-05T07:11:18.150508+00:00",
++  "root_lock_sha256": "a6f70121acafa096472034013e9572754f8ad2d5adbd8a638a1f0507a3a4b2cd"
++}
+--- /dev/null
++++ b/evidence/tests.log
+@@ -0,0 +1,19 @@
++    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s
++
++running 13 tests
++test record_plan_boundaries ... ok
++test ordinary_ring_tls12_no_hook ... ok
++test ordinary_ring_no_hook_real_certificate_and_finished ... ok
++test raw_server_hello_strict_validation_and_truncations ... ok
++test aead_limit_failure_is_fallible_and_atomic ... ok
++test insufficient_certificate_space_has_no_output ... ok
++test separated_layout_and_absent_ccs ... ok
++test invalid_client_finished_never_delivers_application ... ok
++test hybrid_aggregated_large_certificate ... ok
++test template_offers_session_and_provider_rechecked ... ok
++test callback_failure_key_swap_and_spki_mismatch_have_no_output ... ok
++test tls_inner_plaintext_exact_limit ... ok
++test x25519_aggregated_and_empty_app_all_suites ... ok
++
++test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
++
+--- /dev/null
++++ b/run-tests.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python3
++"""使用项目唯一 Cargo.lock 构建和执行 vendor TLS 定向测试，不修改 workspace。"""
++import argparse
++import json
++import pathlib
++import subprocess
++
++parser = argparse.ArgumentParser(description=__doc__)
++parser.add_argument("--root", type=pathlib.Path, required=True)
++args = parser.parse_args()
++root = args.root.resolve()
++command = ["cargo", "build", "--manifest-path", str(root / "Cargo.toml"), "--locked", "--offline", "-p", "rustls", "-p", "rcgen@0.13.2", "-p", "ring", "--message-format=json"]
++result = subprocess.run(command, cwd=root, text=True, stdout=subprocess.PIPE, check=True)
++libs = {}
++all_libs = {}
++for line in result.stdout.splitlines():
++    item = json.loads(line)
++    if item.get("reason") != "compiler-artifact":
++        continue
++    name = item["target"]["name"]
++    for filename in item["filenames"]:
++        if filename.endswith(".rlib"):
++            all_libs[name] = filename
++            if name in {"rustls", "rcgen", "ring"}:
++                libs[name] = filename
++if set(libs) != {"rustls", "rcgen", "ring"}:
++    raise RuntimeError("缺少精确 Cargo 构建工件")
++output = root / "target" / "vendor-rustls-tests"
++output.mkdir(exist_ok=True)
++command = ["rustc", "--edition=2021", "--test", str(root / "vendor/rustls/tests/reality.rs"), "-L", f"dependency={root / 'target/debug/deps'}", "-o", str(output / "reality")]
++for name, filename in libs.items():
++    command += ["--extern", f"{name}={filename}"]
++subprocess.run(command, cwd=root, check=True)
++subprocess.run([str(output / "reality"), "--nocapture"], cwd=root, check=True)
++# 发布 crate 排除了上游 testdata，且不是 workspace member。因此额外用
++# 同一锁解析的依赖直接验证 rustls feature 关闭的 ring/std/tls12 构建。
++command = ["rustc", "--edition=2021", "--crate-name", "rustls", "--crate-type", "rlib", str(root / "vendor/rustls/src/lib.rs"), "-L", f"dependency={root / 'target/debug/deps'}", "-o", str(output / "librustls_no_reality.rlib")]
++for feature in ("ring", "std", "tls12"):
++    command += ["--cfg", f'feature="{feature}"']
++for name in ("once_cell", "ring", "subtle", "zeroize"):
++    command += ["--extern", f"{name}={all_libs[name]}"]
++command += ["--extern", f"pki_types={all_libs['rustls_pki_types']}", "--extern", f"webpki={all_libs['webpki']}"]
++subprocess.run(command, cwd=root, check=True)
+--- a/src/client/builder.rs
++++ b/src/client/builder.rs
+@@ -186,6 +186,8 @@
+             cert_decompressors: compress::default_cert_decompressors().to_vec(),
+             ech_mode: self.state.client_ech_mode,
+             send_ticket_request: None,
++            #[cfg(feature = "reality")]
++            reality: None,
+         }
+     }
+ }
+--- a/src/client/client_conn.rs
++++ b/src/client/client_conn.rs
+@@ -294,6 +294,10 @@
+     ///
+     /// [RFC 9149]: https://datatracker.ietf.org/doc/html/rfc9149
+     pub send_ticket_request: Option<TicketRequest>,
++
++    /// Additive REALITY client session-ID hook. Ordinary TLS leaves this `None`.
++    #[cfg(feature = "reality")]
++    pub reality: Option<alloc::sync::Arc<super::reality::Config>>,
+ }
+ 
+ /// Desired session ticket counts for the RFC 9149 `ticket_request` extension.
+--- a/src/client/hs.rs
++++ b/src/client/hs.rs
+@@ -27,6 +27,7 @@
+ use crate::hash_hs::HandshakeHashBuffer;
+ use crate::log::{debug, trace};
+ use crate::msgs::base::Payload;
++use crate::msgs::codec::Codec;
+ use crate::msgs::enums::{Compression, ExtensionType};
+ use crate::msgs::handshake::{
+     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
+@@ -402,6 +403,36 @@
+         extensions: exts,
+     };
+ 
++    #[cfg(feature = "reality")]
++    if let Some(reality) = &config.reality {
++        if config.ech_mode.is_some() || config.enable_early_data {
++            return Err(Error::General(
++                "REALITY client does not support ECH or early data".into(),
++            ));
++        }
++        if retryreq.is_some() && !reality.allows_hrr() {
++            return Err(Error::General(
++                "REALITY client does not support HRR unless allow_hrr is enabled".into(),
++            ));
++        }
++        // On a retry, `input.session_id` and `chp_payload.session_id` already
++        // carry the session ID sent in the first ClientHello. Never rebuild or
++        // zero it here: HRR requires the same legacy session ID.
++        if retryreq.is_none() {
++            let key_share = key_share
++                .as_deref()
++                .ok_or_else(|| Error::General("REALITY client requires a key share".into()))?;
++            chp_payload.session_id = SessionId::from_bytes([0u8; 32]);
++            let zero_hello =
++                HandshakeMessagePayload(HandshakePayload::ClientHello(chp_payload.clone()))
++                    .get_encoding();
++            let sid = reality.build(input.random.0, key_share, &zero_hello)?;
++            let sid = SessionId::from_bytes(sid);
++            chp_payload.session_id = sid;
++            input.session_id = sid;
++        }
++    }
++
+     let ech_grease_ext = config
+         .ech_mode
+         .as_ref()
+@@ -690,6 +721,12 @@
+     {
+         let server_hello =
+             require_handshake_msg!(m, HandshakeType::ServerHello, HandshakePayload::ServerHello)?;
++        #[cfg(feature = "reality")]
++        if let Some(reality) = &self.input.config.reality {
++            if let MessagePayload::Handshake { encoded, .. } = &m.payload {
++                reality.server_hello(encoded.bytes());
++            }
++        }
+         trace!("We got ServerHello {server_hello:#?}");
+ 
+         use crate::ProtocolVersion::{TLSv1_2, TLSv1_3};
+--- /dev/null
++++ b/src/client/reality.rs
+@@ -0,0 +1,83 @@
++//! Additive REALITY client hook.
++//!
++//! This module only lets the caller replace the ClientHello legacy session ID
++//! after the key share is generated. It does not authenticate REALITY, alter
++//! certificates, relax verification, or change ordinary TLS behavior. The
++//! caller's builder is responsible for the REALITY wire encoding and for
++//! installing a certificate verifier that validates the temporary cert.
++use alloc::{fmt, sync::Arc};
++use core::fmt::Debug;
++
++use crate::crypto::ActiveKeyExchange;
++use crate::Error;
++
++/// Builds the 32-byte REALITY legacy session ID.
++///
++/// `zero_hello` is the complete ClientHello handshake message (including its
++/// four-byte handshake header) encoded with a zero-filled 32-byte session ID.
++/// `key_share` is the exact active key exchange used in that ClientHello.
++pub trait BuildsSessionId: Debug + Send + Sync {
++    fn build(
++        &self,
++        random: [u8; 32],
++        key_share: &dyn ActiveKeyExchange,
++        zero_hello: &[u8],
++    ) -> Result<[u8; 32], Error>;
++
++    /// Receives the raw encoded ServerHello (including its four-byte
++    /// handshake header) before certificate verification.
++    ///
++    /// REALITY's optional ML-DSA-65 extension signs
++    /// `HMAC(auth_key, pubkey || rawCH || rawSH)`, so the caller needs the
++    /// exact wire bytes. The default is a no-op for HMAC-only callers.
++    fn server_hello(&self, _encoded: &[u8]) {}
++}
++
++/// Per-client REALITY session-ID builder.
++pub struct Config {
++    builder: Arc<dyn BuildsSessionId>,
++    allow_hrr: bool,
++}
++
++impl Config {
++    pub fn new(builder: Arc<dyn BuildsSessionId>) -> Self {
++        Self {
++            builder,
++            allow_hrr: false,
++        }
++    }
++
++    /// Allows a HelloRetryRequest when this hook is installed.
++    ///
++    /// The session ID chosen for the first ClientHello is carried into the
++    /// second ClientHello unchanged. ECH and early data remain unsupported.
++    pub fn new_allow_hrr(builder: Arc<dyn BuildsSessionId>) -> Self {
++        Self {
++            builder,
++            allow_hrr: true,
++        }
++    }
++
++    pub(crate) fn allows_hrr(&self) -> bool {
++        self.allow_hrr
++    }
++
++    pub(crate) fn build(
++        &self,
++        random: [u8; 32],
++        key_share: &dyn ActiveKeyExchange,
++        zero_hello: &[u8],
++    ) -> Result<[u8; 32], Error> {
++        self.builder.build(random, key_share, zero_hello)
++    }
++
++    pub(crate) fn server_hello(&self, encoded: &[u8]) {
++        self.builder.server_hello(encoded);
++    }
++}
++
++impl fmt::Debug for Config {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("reality::client::Config([REDACTED])")
++    }
++}
+--- a/src/common_state.rs
++++ b/src/common_state.rs
+@@ -61,6 +61,10 @@
+     pub(crate) refresh_traffic_keys_pending: bool,
+     pub(crate) fips: bool,
+     pub(crate) tls13_tickets_received: u32,
++    // Suppress every partial handshake/alert until the bounded REALITY flight
++    // has been fully prepared. Failed sessions never publish their buffers.
++    #[cfg(feature = "reality")]
++    pub(crate) reality_pending: bool,
+ }
+ 
+ impl CommonState {
+@@ -94,6 +98,8 @@
+             refresh_traffic_keys_pending: false,
+             fips: false,
+             tls13_tickets_received: 0,
++            #[cfg(feature = "reality")]
++            reality_pending: false,
+         }
+     }
+ 
+@@ -517,6 +523,10 @@
+ 
+     /// Send a raw TLS message, fragmenting it if needed.
+     pub(crate) fn send_msg(&mut self, m: Message<'_>, must_encrypt: bool) {
++        #[cfg(feature = "reality")]
++        if self.reality_pending {
++            return;
++        }
+         {
+             if let Protocol::Quic = self.protocol {
+                 if let MessagePayload::Alert(alert) = m.payload {
+@@ -635,6 +645,10 @@
+         desc: AlertDescription,
+         err: impl Into<Error>,
+     ) -> Error {
++        #[cfg(feature = "reality")]
++        if self.reality_pending {
++            return err.into();
++        }
+         debug_assert!(!self.sent_fatal_alert);
+         let m = Message::build_alert(AlertLevel::Fatal, desc);
+         self.send_msg(m, self.record_layer.is_encrypting());
+@@ -1114,6 +1128,11 @@
+             .add(&self.body[start_len..]);
+     }
+ 
++    #[cfg(feature = "reality")]
++    pub(crate) fn reality_body(&self) -> &[u8] {
++        &self.body
++    }
++
+     pub(crate) fn finish(self, common: &mut CommonState) {
+         common.send_msg(
+             Message {
+--- a/src/crypto/aws_lc_rs/tls13.rs
++++ b/src/crypto/aws_lc_rs/tls13.rs
+@@ -254,6 +254,51 @@
+ 
+     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
+         payload_len + 1 + self.enc_key.algorithm().tag_len()
++    }
++
++    #[cfg(feature = "reality")]
++    fn reality_encrypted_payload_len(
++        &self,
++        payload_len: usize,
++        padding: usize,
++    ) -> Result<usize, Error> {
++        let inner = payload_len
++            .checked_add(1)
++            .and_then(|len| len.checked_add(padding))
++            .ok_or(Error::EncryptError)?;
++        if payload_len > 16_384 || inner > crate::server::reality::MAX_INNER_PLAINTEXT {
++            return Err(Error::EncryptError);
++        }
++        inner
++            .checked_add(self.enc_key.algorithm().tag_len())
++            .ok_or(Error::EncryptError)
++    }
++
++    #[cfg(feature = "reality")]
++    fn encrypt_reality(
++        &mut self,
++        msg: OutboundPlainMessage<'_>,
++        seq: u64,
++        padding: usize,
++    ) -> Result<OutboundOpaqueMessage, Error> {
++        let total_len = self.reality_encrypted_payload_len(msg.payload.len(), padding)?;
++        let mut payload = PrefixedPayload::with_capacity(total_len);
++        payload.extend_from_chunks(&msg.payload);
++        payload.extend_from_slice(&msg.typ.to_array());
++        // Bounded by TLSInnerPlaintext's checked limit, never arbitrary allocation.
++        for _ in 0..padding {
++            payload.extend_from_slice(&[0]);
++        }
++        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
++        let aad = aead::Aad::from(make_tls13_aad(total_len));
++        self.enc_key
++            .seal_in_place_append_tag(nonce, aad, &mut payload)
++            .map_err(|_| Error::EncryptError)?;
++        Ok(OutboundOpaqueMessage::new(
++            ContentType::ApplicationData,
++            ProtocolVersion::TLSv1_2,
++            payload,
++        ))
+     }
+ }
+ 
+@@ -314,6 +359,51 @@
+     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
+         payload_len + 1 + self.enc_key.algorithm().tag_len()
+     }
++
++    #[cfg(feature = "reality")]
++    fn reality_encrypted_payload_len(
++        &self,
++        payload_len: usize,
++        padding: usize,
++    ) -> Result<usize, Error> {
++        let inner = payload_len
++            .checked_add(1)
++            .and_then(|len| len.checked_add(padding))
++            .ok_or(Error::EncryptError)?;
++        if payload_len > 16_384 || inner > crate::server::reality::MAX_INNER_PLAINTEXT {
++            return Err(Error::EncryptError);
++        }
++        inner
++            .checked_add(self.enc_key.algorithm().tag_len())
++            .ok_or(Error::EncryptError)
++    }
++
++    #[cfg(feature = "reality")]
++    fn encrypt_reality(
++        &mut self,
++        msg: OutboundPlainMessage<'_>,
++        seq: u64,
++        padding: usize,
++    ) -> Result<OutboundOpaqueMessage, Error> {
++        let total_len = self.reality_encrypted_payload_len(msg.payload.len(), padding)?;
++        let mut payload = PrefixedPayload::with_capacity(total_len);
++        payload.extend_from_chunks(&msg.payload);
++        payload.extend_from_slice(&msg.typ.to_array());
++        // Bounded by TLSInnerPlaintext's checked limit, never arbitrary allocation.
++        for _ in 0..padding {
++            payload.extend_from_slice(&[0]);
++        }
++        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
++        let aad = aead::Aad::from(make_tls13_aad(total_len));
++        self.enc_key
++            .seal_in_place_append_tag(nonce, aad, &mut payload)
++            .map_err(|_| Error::EncryptError)?;
++        Ok(OutboundOpaqueMessage::new(
++            ContentType::ApplicationData,
++            ProtocolVersion::TLSv1_2,
++            payload,
++        ))
++    }
+ }
+ 
+ struct GcmMessageDecrypter {
+--- a/src/crypto/cipher.rs
++++ b/src/crypto/cipher.rs
+@@ -157,6 +157,29 @@
+     /// Return the length of the ciphertext that results from encrypting plaintext of
+     /// length `payload_len`
+     fn encrypted_payload_len(&self, payload_len: usize) -> usize;
++
++    /// Exact bounded TLS1.3 ciphertext size with zero padding, if supported.
++    /// The default deliberately rejects this opt-in operation.
++    #[cfg(feature = "reality")]
++    fn reality_encrypted_payload_len(
++        &self,
++        _payload_len: usize,
++        _padding: usize,
++    ) -> Result<usize, Error> {
++        Err(UnsupportedOperationError.into())
++    }
++
++    /// Encrypt a bounded TLS1.3 inner plaintext with trailing zero padding.
++    /// Implemented only by the reviewed AWS-LC TLS1.3 record encrypters.
++    #[cfg(feature = "reality")]
++    fn encrypt_reality(
++        &mut self,
++        _msg: OutboundPlainMessage<'_>,
++        _seq: u64,
++        _padding: usize,
++    ) -> Result<OutboundOpaqueMessage, Error> {
++        Err(UnsupportedOperationError.into())
++    }
+ }
+ 
+ impl dyn MessageEncrypter {
+--- a/src/crypto/mod.rs
++++ b/src/crypto/mod.rs
+@@ -471,6 +471,19 @@
+     /// from a `&[u8]`.
+     ///
+     /// This consumes and so terminates the [`ActiveKeyExchange`].
++    /// Additive REALITY client hook: derive the authentication key from this
++    /// key exchange and the configured static server public key. Ordinary KX
++    /// implementations inherit `None`; only a REALITY-aware X25519 group
++    /// implements it. This does not change the TLS shared secret.
++    #[cfg(feature = "reality")]
++    fn reality_auth_key(
++        &self,
++        _server_public: &[u8],
++        _random: &[u8; 32],
++    ) -> Option<[u8; 32]> {
++        None
++    }
++
+     fn complete_for_tls_version(
+         self: Box<Self>,
+         peer_pub_key: &[u8],
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -586,6 +586,9 @@
+     mod ech;
+     pub(super) mod handy;
+     mod hs;
++    /// Additive REALITY client ClientHello session-id hook.
++    #[cfg(feature = "reality")]
++    pub mod reality;
+     #[cfg(test)]
+     mod test;
+     #[cfg(feature = "tls12")]
+@@ -629,6 +632,9 @@
+     pub(crate) mod handy;
+     mod hs;
+     mod server_conn;
++    /// Bounded, opt-in REALITY server handshake hooks.
++    #[cfg(feature = "reality")]
++    pub mod reality;
+     #[cfg(test)]
+     mod test;
+     #[cfg(feature = "tls12")]
+--- a/src/msgs/handshake.rs
++++ b/src/msgs/handshake.rs
+@@ -178,6 +178,10 @@
+             data: [0u8; 32],
+             len: 0,
+         }
++    }
++
++    pub(crate) fn from_bytes(data: [u8; 32]) -> Self {
++        Self { data, len: 32 }
+     }
+ 
+     #[cfg(feature = "tls12")]
+--- a/src/record_layer.rs
++++ b/src/record_layer.rs
+@@ -115,6 +115,46 @@
+         self.message_encrypter
+             .encrypt(plain, seq)
+             .unwrap()
++    }
++
++    #[cfg(feature = "reality")]
++    pub(crate) fn check_reality_padding(
++        &self,
++        payload_len: usize,
++        padding: usize,
++    ) -> Result<usize, Error> {
++        self.message_encrypter
++            .reality_encrypted_payload_len(payload_len, padding)
++    }
++
++    // This path never calls encrypt_outgoing's assert/unwrap. It shares exactly
++    // the same counter and respects both the provider AEAD and TLS limits.
++    #[cfg(feature = "reality")]
++    pub(crate) fn encrypt_reality(
++        &mut self,
++        plain: OutboundPlainMessage<'_>,
++        padding: usize,
++    ) -> Result<OutboundOpaqueMessage, Error> {
++        if self.encrypt_state != DirectionState::Active
++            || self.next_pre_encrypt_action() != PreEncryptAction::Nothing
++        {
++            return Err(Error::EncryptError);
++        }
++        let expected = self.check_reality_padding(plain.payload.len(), padding)?;
++        let seq = self.write_seq;
++        // A failed Seal consumes this sequence number too; the connection fails
++        // closed rather than retrying a nonce that a provider may have used.
++        self.write_seq = self
++            .write_seq
++            .checked_add(1)
++            .ok_or(Error::EncryptError)?;
++        let encrypted = self
++            .message_encrypter
++            .encrypt_reality(plain, seq, padding)?;
++        if encrypted.payload.as_ref().len() != expected {
++            return Err(Error::EncryptError);
++        }
++        Ok(encrypted)
+     }
+ 
+     /// Prepare to use the given `MessageEncrypter` for future message encryption.
+--- a/src/server/builder.rs
++++ b/src/server/builder.rs
+@@ -104,6 +104,8 @@
+         let require_ems = self.provider.fips();
+ 
+         ServerConfig {
++            #[cfg(feature = "reality")]
++            reality: None,
+             provider: self.provider,
+             verifier: self.state.verifier,
+             cert_resolver,
+--- a/src/server/hs.rs
++++ b/src/server/hs.rs
+@@ -453,10 +453,27 @@
+                 )
+             })?
+         };
++        #[cfg(feature = "reality")]
++        if self.config.reality.is_some() {
++            certkey.keys_match()?;
++        }
+         let certkey = ActiveCertifiedKey::from_certified_key(&certkey);
+ 
+-        let (suite, skxg) = self
+-            .choose_suite_and_kx_group(
++        #[cfg(feature = "reality")]
++        let reality_selection = self
++            .config
++            .reality
++            .as_ref()
++            .map(|reality| {
++                if self.previous_hello.is_some() {
++                    return Err(super::reality::invalid());
++                }
++                reality.select(&self.config, client_hello, version, cx.common.protocol)
++            })
++            .transpose()?;
++
++        let mut ordinary_selection = || {
++            self.choose_suite_and_kx_group(
+                 version,
+                 certkey.get_key().algorithm(),
+                 cx.common.protocol,
+@@ -469,7 +486,15 @@
+             .map_err(|incompat| {
+                 cx.common
+                     .send_fatal_alert(AlertDescription::HandshakeFailure, incompat)
+-            })?;
++            })
++        };
++        #[cfg(feature = "reality")]
++        let (suite, skxg) = match reality_selection {
++            Some(selected) => selected,
++            None => ordinary_selection()?,
++        };
++        #[cfg(not(feature = "reality"))]
++        let (suite, skxg) = ordinary_selection()?;
+ 
+         // RFC 9846 section 4.2.4: the server must negotiate the same cipher suite it
+         // named in its HelloRetryRequest
+--- /dev/null
++++ b/src/server/reality.rs
+@@ -0,0 +1,543 @@
++//! Bounded opt-in TLS1.3 hooks for an externally authenticated REALITY connection.
++//!
++//! This module does not authenticate REALITY, connect to targets, or relax TLS
++//! certificate/CertificateVerify/Finished checks. Each `Config` belongs to one
++//! connection. All initial output is withheld until its complete flight is ready.
++use alloc::{sync::Arc, vec::Vec};
++use core::{fmt, ops::Range};
++
++use crate::common_state::{CommonState, Protocol};
++use crate::crypto::SupportedKxGroup;
++use crate::msgs::codec::Reader;
++use crate::msgs::handshake::{
++    ClientHelloPayload, HandshakeMessagePayload, HandshakePayload, SessionId,
++};
++use crate::msgs::message::{Message, MessagePayload, OutboundPlainMessage};
++use crate::sign::{CertifiedKey, SigningKey};
++use crate::{
++    CipherSuite, ContentType, Error, NamedGroup, ProtocolVersion, ServerConfig, SignatureScheme,
++    SupportedCipherSuite,
++};
++
++/// Maximum retained initial flight, including all record headers.
++pub const MAX_FLIGHT_SIZE: usize = 131_072;
++/// Maximum TLSInnerPlaintext size, including content type and zero padding.
++pub(crate) const MAX_INNER_PLAINTEXT: usize = 16_385;
++const MAX_RAW_SH: usize = 2048;
++const TAG_LEN: usize = 16;
++const MAX_RECORD: usize = 5 + MAX_INNER_PLAINTEXT + TAG_LEN;
++const MAX_CERT_CHAIN: usize = 65_536;
++
++pub(crate) fn invalid() -> Error {
++    Error::General("incompatible REALITY TLS template or flight".into())
++}
++
++/// A per-connection certificate resolver called after final raw ServerHello
++/// construction and before Certificate encoding (including optional ML-DSA).
++///
++/// The returned key must be the same `Arc<dyn SigningKey>` as the initial
++/// `ServerConfig::cert_resolver` key; its certificate must contain that key's
++/// SPKI. The callback cannot change negotiation or access traffic secrets.
++pub trait ResolvesCertificate: fmt::Debug + Send + Sync {
++    /// Resolve the certificate using the exact outgoing handshake encoding,
++    /// including its four-byte handshake header, but no record header.
++    fn resolve(&self, final_raw_sh: &[u8]) -> Result<Arc<CertifiedKey>, Error>;
++}
++
++/// One of the two fixed D7 initial-flight record layouts.
++#[derive(Clone, Debug)]
++pub struct RecordPlan {
++    sh_total: usize,
++    ccs_total: usize,
++    encrypted: Vec<usize>,
++    empty_app: Option<usize>,
++}
++
++impl RecordPlan {
++    /// Build a plan from total record lengths (including the five-byte header).
++    /// `ccs_total` is 6, or 0 for an explicitly absent CCS. A first encrypted
++    /// length greater than 512 requires one aggregated record; otherwise exactly
++    /// four records contain EE, Certificate, CertificateVerify and Finished.
++    /// The optional last slot carries zero application plaintext, never a ticket.
++    pub fn new(
++        sh_total: usize,
++        ccs_total: usize,
++        encrypted: Vec<usize>,
++        empty_app: Option<usize>,
++    ) -> Result<Self, Error> {
++        if !(5..=MAX_RAW_SH + 5).contains(&sh_total) || !matches!(ccs_total, 0 | 6) {
++            return Err(invalid());
++        }
++        let Some(first) = encrypted.first() else {
++            return Err(invalid());
++        };
++        if encrypted.len() != if *first > 512 { 1 } else { 4 } {
++            return Err(invalid());
++        }
++        let mut total = sh_total
++            .checked_add(ccs_total)
++            .ok_or_else(invalid)?;
++        for len in encrypted.iter().chain(empty_app.iter()) {
++            if !(5 + 1 + TAG_LEN..=MAX_RECORD).contains(len) {
++                return Err(invalid());
++            }
++            total = total
++                .checked_add(*len)
++                .ok_or_else(invalid)?;
++        }
++        if total > MAX_FLIGHT_SIZE {
++            return Err(invalid());
++        }
++        Ok(Self {
++            sh_total,
++            ccs_total,
++            encrypted,
++            empty_app,
++        })
++    }
++
++    fn padding(&self, payload_len: usize, total: usize) -> Result<usize, Error> {
++        // TLSPlaintext.fragment <= 2^14; TLSInnerPlaintext <= 2^14 + 1.
++        if payload_len > 16_384 {
++            return Err(invalid());
++        }
++        // 尽力模仿目标记录总长；目标槽位小于本地消息时使用自然长度而不是
++        // 回退。Xray 的 REALITY 也不要求本地 flight 与目标逐 record 等长。
++        let padding = total
++            .checked_sub(5 + 1 + TAG_LEN)
++            .and_then(|space| space.checked_sub(payload_len))
++            .unwrap_or(0);
++        if payload_len + 1 + padding > MAX_INNER_PLAINTEXT {
++            return Err(invalid());
++        }
++        Ok(padding)
++    }
++
++    fn fragments<'a>(&self, body: &'a [u8]) -> Result<Vec<(&'a [u8], usize)>, Error> {
++        if body.len() > MAX_FLIGHT_SIZE {
++            return Err(invalid());
++        }
++        let mut cursor = Cursor::new(body);
++        let mut messages = Vec::with_capacity(4);
++        for typ in [8, 11, 15, 20] {
++            let start = cursor.pos;
++            if cursor.u8()? != typ {
++                return Err(invalid());
++            }
++            let len = cursor.take(3)?;
++            let len =
++                (usize::from(len[0]) << 16) | (usize::from(len[1]) << 8) | usize::from(len[2]);
++            cursor.take(len)?;
++            messages.push(&body[start..cursor.pos]);
++        }
++        if !cursor.empty() {
++            return Err(invalid());
++        }
++        if self.encrypted.len() == 1 {
++            messages = alloc::vec![body];
++        }
++        messages
++            .into_iter()
++            .zip(self.encrypted.iter().copied())
++            .map(|(message, total)| {
++                self.padding(message.len(), total)
++                    .map(|padding| (message, padding))
++            })
++            .collect()
++    }
++}
++
++/// Validated, immutable template and bounded record policy for one connection.
++/// Ordinary TLS configurations leave `ServerConfig::reality` as `None`.
++pub struct Config {
++    raw_server_hello: Vec<u8>,
++    template: Template,
++    record_plan: RecordPlan,
++    certificate_resolver: Arc<dyn ResolvesCertificate>,
++}
++
++impl fmt::Debug for Config {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("reality::Config")
++            .field("suite", &self.template.suite)
++            .field("group", &self.template.group)
++            .field("record_plan", &self.record_plan)
++            .finish_non_exhaustive()
++    }
++}
++
++impl Config {
++    /// Validate the raw target SH and record plan. Client offers and provider
++    /// support are checked again against the actual ClientHello inside rustls.
++    pub fn new(
++        raw_server_hello: Vec<u8>,
++        record_plan: RecordPlan,
++        certificate_resolver: Arc<dyn ResolvesCertificate>,
++    ) -> Result<Self, Error> {
++        let template = Template::parse(&raw_server_hello)?;
++        if record_plan.sh_total != raw_server_hello.len() + 5 {
++            return Err(invalid());
++        }
++        Ok(Self {
++            raw_server_hello,
++            template,
++            record_plan,
++            certificate_resolver,
++        })
++    }
++
++    /// Target-selected TLS1.3 cipher suite.
++    pub fn cipher_suite(&self) -> CipherSuite {
++        self.template.suite
++    }
++    /// Target-selected X25519 or X25519MLKEM768 group.
++    pub fn named_group(&self) -> NamedGroup {
++        self.template.group
++    }
++
++    pub(crate) fn validate_config(config: &ServerConfig, protocol: Protocol) -> Result<(), Error> {
++        if protocol != Protocol::Tcp
++            || config.max_early_data_size != 0
++            || config.send_half_rtt_data
++            || config.send_tls13_tickets != 0
++            || config.max_tls13_tickets != 0
++            || config.ticketer.enabled()
++            || config.enable_secret_extraction
++            || config.verifier.offer_client_auth()
++            || !config.cert_compressors.is_empty()
++            || config
++                .cert_resolver
++                .only_raw_public_keys()
++            || !config.supports_version(ProtocolVersion::TLSv1_3, protocol)
++            || config.supports_version(ProtocolVersion::TLSv1_2, protocol)
++        {
++            return Err(invalid());
++        }
++        Ok(())
++    }
++
++    pub(crate) fn select(
++        &self,
++        config: &ServerConfig,
++        ch: &ClientHelloPayload,
++        version: ProtocolVersion,
++        protocol: Protocol,
++    ) -> Result<(SupportedCipherSuite, &'static dyn SupportedKxGroup), Error> {
++        Self::validate_config(config, protocol)?;
++        if version != ProtocolVersion::TLSv1_3
++            || ch.session_id.as_ref() != self.template.sid
++            || ch.preshared_key_offer.is_some()
++            || ch.early_data_request.is_some()
++            || !ch
++                .supported_versions
++                .as_ref()
++                .is_some_and(|v| v.tls13)
++            || !ch
++                .cipher_suites
++                .contains(&self.template.suite)
++            || !ch
++                .named_groups
++                .as_ref()
++                .is_some_and(|groups| groups.contains(&self.template.group))
++            || ch.has_keyshare_extension_with_duplicates()
++            || !ch
++                .key_shares
++                .as_ref()
++                .is_some_and(|shares| {
++                    shares.iter().any(|share| {
++                        share.group == self.template.group
++                            && share.payload.0.len()
++                                == match share.group {
++                                    NamedGroup::X25519 => 32,
++                                    NamedGroup::X25519MLKEM768 => 1216,
++                                    _ => 0,
++                                }
++                    })
++                })
++        {
++            return Err(invalid());
++        }
++        let suite = config
++            .provider
++            .cipher_suites
++            .iter()
++            .copied()
++            .find(|suite| suite.suite() == self.template.suite && suite.tls13().is_some())
++            .ok_or_else(invalid)?;
++        let group = config
++            .provider
++            .kx_groups
++            .iter()
++            .copied()
++            .find(|group| group.name() == self.template.group && group.usable_for_version(version))
++            .ok_or_else(invalid)?;
++        Ok((suite, group))
++    }
++
++    pub(crate) fn final_hello(
++        &self,
++        suite: CipherSuite,
++        group: NamedGroup,
++        sid: &SessionId,
++        local_share: &[u8],
++    ) -> Result<Vec<u8>, Error> {
++        if suite != self.template.suite
++            || group != self.template.group
++            || sid.as_ref() != self.template.sid
++            || local_share.len() != self.template.share.len()
++        {
++            return Err(invalid());
++        }
++        let mut raw = self.raw_server_hello.clone();
++        raw[self.template.share.clone()].copy_from_slice(local_share);
++        let checked = Template::parse(&raw)?;
++        if checked.sid != self.template.sid || checked.suite != suite || checked.group != group {
++            return Err(invalid());
++        }
++        Ok(raw)
++    }
++
++    pub(crate) fn resolve(
++        &self,
++        raw: &[u8],
++        original_key: &dyn SigningKey,
++        _schemes: &[SignatureScheme],
++    ) -> Result<Arc<CertifiedKey>, Error> {
++        let key = self.certificate_resolver.resolve(raw)?;
++        let total = key
++            .cert
++            .iter()
++            .try_fold(0usize, |total, cert| total.checked_add(cert.len()))
++            .ok_or_else(invalid)?;
++        if key.cert.is_empty()
++            || key.cert.len() > 8
++            || total > MAX_CERT_CHAIN
++            || key.ocsp.is_some()
++            || !core::ptr::eq::<dyn SigningKey>(&*key.key, original_key)
++            || key.key.public_key() != original_key.public_key()
++            // REALITY 固定使用 Ed25519 临时证书；与 Xray 一致，即使客户端未在
++            // signature_algorithms 中声明 Ed25519，服务端仍以 Ed25519 完成
++            // CertificateVerify。这里不能按普通 TLS 的客户端套件列表拒绝。
++            || key.key.algorithm() != crate::SignatureAlgorithm::ED25519
++        {
++            return Err(invalid());
++        }
++        key.keys_match()?;
++        Ok(key)
++    }
++
++    pub(crate) fn finish_flight(
++        &self,
++        common: &mut CommonState,
++        raw_sh: &[u8],
++        body: &[u8],
++    ) -> Result<Vec<Vec<u8>>, Error> {
++        if raw_sh.len() + 5 != self.record_plan.sh_total {
++            return Err(invalid());
++        }
++        let fragments = self.record_plan.fragments(body)?;
++        // Preflight every length and provider capability before invoking any Seal.
++        for (payload, padding) in &fragments {
++            common
++                .record_layer
++                .check_reality_padding(payload.len(), *padding)?;
++        }
++        if let Some(total) = self.record_plan.empty_app {
++            self.record_plan.padding(0, total)?;
++        }
++        let mut records = Vec::with_capacity(7);
++        records.push(
++            OutboundPlainMessage {
++                typ: ContentType::Handshake,
++                version: ProtocolVersion::TLSv1_2,
++                payload: raw_sh.into(),
++            }
++            .to_unencrypted_opaque()
++            .encode(),
++        );
++        if self.record_plan.ccs_total == 6 {
++            records.push(alloc::vec![20, 3, 3, 0, 1, 1]);
++        }
++        for (payload, padding) in fragments {
++            records.push(
++                common
++                    .record_layer
++                    .encrypt_reality(
++                        OutboundPlainMessage {
++                            typ: ContentType::Handshake,
++                            version: ProtocolVersion::TLSv1_3,
++                            payload: payload.into(),
++                        },
++                        padding,
++                    )?
++                    .encode(),
++            );
++        }
++        Ok(records)
++    }
++
++    pub(crate) fn finish_application_slot(
++        &self,
++        common: &mut CommonState,
++        records: &mut Vec<Vec<u8>>,
++    ) -> Result<(), Error> {
++        if let Some(total) = self.record_plan.empty_app {
++            let padding = self.record_plan.padding(0, total)?;
++            records.push(
++                common
++                    .record_layer
++                    .encrypt_reality(
++                        OutboundPlainMessage {
++                            typ: ContentType::ApplicationData,
++                            version: ProtocolVersion::TLSv1_3,
++                            payload: (&[][..]).into(),
++                        },
++                        padding,
++                    )?
++                    .encode(),
++            );
++        }
++        if records
++            .iter()
++            .map(Vec::len)
++            .sum::<usize>()
++            > MAX_FLIGHT_SIZE
++        {
++            return Err(invalid());
++        }
++        Ok(())
++    }
++}
++
++struct Template {
++    suite: CipherSuite,
++    group: NamedGroup,
++    sid: [u8; 32],
++    share: Range<usize>,
++}
++impl Template {
++    fn parse(raw: &[u8]) -> Result<Self, Error> {
++        if raw.len() > MAX_RAW_SH {
++            return Err(invalid());
++        }
++        let mut cursor = Cursor::new(raw);
++        if cursor.take(4)?
++            != [
++                2,
++                0,
++                ((raw.len().saturating_sub(4) >> 8) & 255) as u8,
++                (raw.len().saturating_sub(4) & 255) as u8,
++            ]
++            || cursor.u16()? != 0x0303
++        {
++            return Err(invalid());
++        }
++        cursor.take(32)?;
++        if cursor.u8()? != 32 {
++            return Err(invalid());
++        }
++        let mut sid = [0; 32];
++        sid.copy_from_slice(cursor.take(32)?);
++        let suite = CipherSuite::from(cursor.u16()?);
++        if !matches!(
++            suite,
++            CipherSuite::TLS13_AES_128_GCM_SHA256
++                | CipherSuite::TLS13_AES_256_GCM_SHA384
++                | CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
++        ) || cursor.u8()? != 0
++        {
++            return Err(invalid());
++        }
++        let ext_len = usize::from(cursor.u16()?);
++        if raw.len().checked_sub(cursor.pos) != Some(ext_len) {
++            return Err(invalid());
++        }
++        let mut version = false;
++        let mut kx = None;
++        while !cursor.empty() {
++            let typ = cursor.u16()?;
++            let len = usize::from(cursor.u16()?);
++            let start = cursor.pos;
++            let value = cursor.take(len)?;
++            match typ {
++                43 if !version && value == [3, 4] => version = true,
++                51 if kx.is_none() => {
++                    let mut share = Cursor::new(value);
++                    let group = NamedGroup::from(share.u16()?);
++                    let len = usize::from(share.u16()?);
++                    if len
++                        != match group {
++                            NamedGroup::X25519 => 32,
++                            NamedGroup::X25519MLKEM768 => 1120,
++                            _ => return Err(invalid()),
++                        }
++                    {
++                        return Err(invalid());
++                    }
++                    share.take(len)?;
++                    if !share.empty() {
++                        return Err(invalid());
++                    }
++                    kx = Some((group, start + 4..start + 4 + len));
++                }
++                _ => return Err(invalid()),
++            }
++        }
++        if !version {
++            return Err(invalid());
++        }
++        let (group, share) = kx.ok_or_else(invalid)?;
++        // Also require the mature rustls parser to accept exactly this SH.
++        let mut reader = Reader::init(raw);
++        let parsed = HandshakeMessagePayload::read_version(&mut reader, ProtocolVersion::TLSv1_3)?;
++        reader.expect_empty("REALITY ServerHello")?;
++        if !matches!(parsed.0, HandshakePayload::ServerHello(_)) {
++            return Err(invalid());
++        }
++        Ok(Self {
++            suite,
++            group,
++            sid,
++            share,
++        })
++    }
++}
++
++struct Cursor<'a> {
++    bytes: &'a [u8],
++    pos: usize,
++}
++impl<'a> Cursor<'a> {
++    fn new(bytes: &'a [u8]) -> Self {
++        Self { bytes, pos: 0 }
++    }
++    fn take(&mut self, len: usize) -> Result<&'a [u8], Error> {
++        let end = self
++            .pos
++            .checked_add(len)
++            .ok_or_else(invalid)?;
++        let result = self
++            .bytes
++            .get(self.pos..end)
++            .ok_or_else(invalid)?;
++        self.pos = end;
++        Ok(result)
++    }
++    fn u8(&mut self) -> Result<u8, Error> {
++        Ok(self.take(1)?[0])
++    }
++    fn u16(&mut self) -> Result<u16, Error> {
++        let b = self.take(2)?;
++        Ok(u16::from_be_bytes([b[0], b[1]]))
++    }
++    fn empty(&self) -> bool {
++        self.pos == self.bytes.len()
++    }
++}
++
++pub(crate) fn hello_message(raw: &[u8]) -> Result<Message<'_>, Error> {
++    Ok(Message {
++        version: ProtocolVersion::TLSv1_2,
++        payload: MessagePayload::new(ContentType::Handshake, ProtocolVersion::TLSv1_3, raw)?,
++    })
++}
+--- a/src/server/server_conn.rs
++++ b/src/server/server_conn.rs
+@@ -295,6 +295,11 @@
+ /// [`ServerSessionMemoryCache`]: crate::server::handy::ServerSessionMemoryCache
+ #[derive(Clone, Debug)]
+ pub struct ServerConfig {
++    /// Optional per-connection REALITY template, certificate and record policy.
++    /// Compiling the feature alone does not enable these hooks.
++    #[cfg(feature = "reality")]
++    pub reality: Option<Arc<super::reality::Config>>,
++
+     /// Source of randomness and other crypto.
+     pub(super) provider: Arc<CryptoProvider>,
+ 
+@@ -1071,6 +1076,15 @@
+         }
+ 
+         self.connection.enable_secret_extraction = config.enable_secret_extraction;
++        #[cfg(feature = "reality")]
++        if config.reality.is_some() {
++            if let Err(err) =
++                super::reality::Config::validate_config(&config, self.connection.protocol)
++            {
++                return Err((err, AcceptedAlert::empty()));
++            }
++            self.connection.reality_pending = true;
++        }
+ 
+         let state = hs::ExpectClientHello::new(config, ServerExtensionsInput::default());
+         let mut cx = hs::ServerContext::from(&mut self.connection);
+@@ -1227,6 +1241,11 @@
+         common.set_max_fragment_size(config.max_fragment_size)?;
+         common.enable_secret_extraction = config.enable_secret_extraction;
+         common.fips = config.fips();
++        #[cfg(feature = "reality")]
++        if config.reality.is_some() {
++            super::reality::Config::validate_config(&config, common.protocol)?;
++            common.reality_pending = true;
++        }
+         Ok(Self::new(
+             Box::new(hs::ExpectClientHello::new(config, extra_exts)),
+             ServerConnectionData::default(),
+--- a/src/server/tls13.rs
++++ b/src/server/tls13.rs
+@@ -377,6 +377,8 @@
+ 
+             let full_handshake = resumedata.is_none();
+             self.transcript.add_message(chm);
++            #[cfg(feature = "reality")]
++            let mut final_raw_sh = None;
+             let key_schedule = emit_server_hello(
+                 &mut self.transcript,
+                 &self.randoms,
+@@ -389,7 +391,22 @@
+                     .as_ref()
+                     .map(|x| &x.master_secret.0[..]),
+                 &self.config,
++                #[cfg(feature = "reality")]
++                &mut final_raw_sh,
+             )?;
++            #[cfg(feature = "reality")]
++            let reality_certificate = match (&self.config.reality, &final_raw_sh) {
++                (Some(reality), Some(raw)) => {
++                    Some(reality.resolve(raw, server_key.get_key(), &sigschemes_ext)?)
++                }
++                (None, None) => None,
++                _ => return Err(crate::server::reality::invalid()),
++            };
++            #[cfg(feature = "reality")]
++            let server_key = match &reality_certificate {
++                Some(key) => ActiveCertifiedKey::from_certified_key(key),
++                None => server_key,
++            };
+             if !self.previous_hello.is_some() {
+                 emit_fake_ccs(cx.common);
+             }
+@@ -430,11 +447,16 @@
+                 } else {
+                     emit_certificate_tls13(&mut flight, server_key.get_cert(), ocsp_response);
+                 }
++                #[cfg(feature = "reality")]
++                let force_ed25519 = self.config.reality.is_some();
++                #[cfg(not(feature = "reality"))]
++                let force_ed25519 = false;
+                 emit_certificate_verify_tls13(
+                     &mut flight,
+                     cx.common,
+                     server_key.get_key(),
+                     &sigschemes_ext,
++                    force_ed25519,
+                 )?;
+                 client_auth
+             } else {
+@@ -466,8 +488,15 @@
+             }
+ 
+             cx.common.check_aligned_handshake()?;
+-            let key_schedule_traffic =
+-                emit_finished_tls13(flight, &self.randoms, cx, key_schedule, &self.config);
++            let key_schedule_traffic = emit_finished_tls13(
++                flight,
++                &self.randoms,
++                cx,
++                key_schedule,
++                &self.config,
++                #[cfg(feature = "reality")]
++                final_raw_sh.as_deref(),
++            )?;
+ 
+             if !doing_client_auth && self.config.send_half_rtt_data {
+                 // Application data can be sent immediately after Finished, in one
+@@ -533,6 +562,7 @@
+         chosen_psk_idx: Option<usize>,
+         resuming_psk: Option<&[u8]>,
+         config: &ServerConfig,
++        #[cfg(feature = "reality")] final_raw_sh: &mut Option<Vec<u8>>,
+     ) -> Result<KeyScheduleHandshake, Error> {
+         // Prepare key exchange; the caller already found the matching SupportedKxGroup
+         let (share, kxgroup) = share_and_kxgroup;
+@@ -545,6 +575,18 @@
+             })?;
+         cx.common.kx_state.complete();
+ 
++        #[cfg(feature = "reality")]
++        if let Some(reality) = &config.reality {
++            if chosen_psk_idx.is_some() || resuming_psk.is_some() {
++                return Err(crate::server::reality::invalid());
++            }
++            *final_raw_sh = Some(reality.final_hello(
++                suite.common.suite,
++                ckx.group,
++                session_id,
++                &ckx.pub_key,
++            )?);
++        }
+         let extensions = Box::new(ServerExtensions {
+             key_share: Some(KeyShareEntry::new(ckx.group, ckx.pub_key)),
+             selected_version: Some(ProtocolVersion::TLSv1_3),
+@@ -570,6 +612,11 @@
+ 
+         let client_hello_hash = transcript.hash_given(&[]);
+ 
++        #[cfg(feature = "reality")]
++        let sh = match final_raw_sh.as_deref() {
++            Some(raw) => crate::server::reality::hello_message(raw)?,
++            None => sh,
++        };
+         trace!("sending server hello {sh:?}");
+         transcript.add_message(&sh);
+         cx.common.send_msg(sh, false);
+@@ -829,17 +876,25 @@
+         common: &mut CommonState,
+         signing_key: &dyn sign::SigningKey,
+         schemes: &[SignatureScheme],
++        force_ed25519: bool,
+     ) -> Result<(), Error> {
+         let message = construct_server_verify_message(&flight.transcript.current_hash());
+ 
+-        let signer = signing_key
+-            .choose_scheme(schemes)
+-            .ok_or_else(|| {
+-                common.send_fatal_alert(
+-                    AlertDescription::HandshakeFailure,
+-                    PeerIncompatible::NoSignatureSchemesInCommon,
+-                )
+-            })?;
++        // REALITY 的临时证书固定为 Ed25519；上游 Xray 不要求客户端在
++        // signature_algorithms 中声明 Ed25519。该分支只由 REALITY 配置开启。
++        let signer = if force_ed25519
++            && signing_key.algorithm() == crate::SignatureAlgorithm::ED25519
++        {
++            signing_key.choose_scheme(&[SignatureScheme::ED25519])
++        } else {
++            signing_key.choose_scheme(schemes)
++        }
++        .ok_or_else(|| {
++            common.send_fatal_alert(
++                AlertDescription::HandshakeFailure,
++                PeerIncompatible::NoSignatureSchemesInCommon,
++            )
++        })?;
+ 
+         let scheme = signer.scheme();
+         let sig = signer.sign(message.as_ref())?;
+@@ -859,7 +914,8 @@
+         cx: &mut ServerContext<'_>,
+         key_schedule: KeyScheduleHandshake,
+         config: &ServerConfig,
+-    ) -> KeyScheduleTrafficWithClientFinishedPending {
++        #[cfg(feature = "reality")] final_raw_sh: Option<&[u8]>,
++    ) -> Result<KeyScheduleTrafficWithClientFinishedPending, Error> {
+         let handshake_hash = flight.transcript.current_hash();
+         let verify_data = key_schedule.sign_server_finish(&handshake_hash);
+         let verify_data_payload = Payload::new(verify_data.as_ref());
+@@ -869,16 +925,38 @@
+         trace!("sending finished {fin:?}");
+         flight.add(fin);
+         let hash_at_server_fin = flight.transcript.current_hash();
++        #[cfg(feature = "reality")]
++        let reality_records = match (&config.reality, final_raw_sh) {
++            (Some(reality), Some(raw)) => {
++                Some(reality.finish_flight(cx.common, raw, flight.reality_body())?)
++            }
++            (None, None) => None,
++            _ => return Err(crate::server::reality::invalid()),
++        };
+         flight.finish(cx.common);
+ 
+         // Now move to application data keys.  Read key change is deferred until
+         // the Finish message is received & validated.
+-        key_schedule.into_traffic_with_client_finished_pending(
++        let traffic = key_schedule.into_traffic_with_client_finished_pending(
+             hash_at_server_fin,
+             &*config.key_log,
+             &randoms.client,
+             cx.common,
+-        )
++        );
++        #[cfg(feature = "reality")]
++        if let (Some(reality), Some(mut records)) = (&config.reality, reality_records) {
++            reality.finish_application_slot(cx.common, &mut records)?;
++            if !cx.common.reality_pending || !cx.common.sendable_tls.is_empty() {
++                return Err(crate::server::reality::invalid());
++            }
++            // All encodings, signatures, layout checks and Seals have succeeded.
++            // Publication cannot expose a half-constructed initial flight.
++            cx.common.reality_pending = false;
++            for record in records {
++                cx.common.sendable_tls.append(record);
++            }
++        }
++        Ok(traffic)
+     }
+ }
+ 
+--- /dev/null
++++ b/tests/reality.rs
+@@ -0,0 +1,826 @@
++//! 自持内存 TLS peer：不调用项目 REALITY parser/auth/certificate。
++use ring::signature::KeyPair as _;
++use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
++use rustls::crypto::{CryptoProvider, aws_lc_rs, ring as ring_provider};
++use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
++use rustls::server::reality::{Config, RecordPlan, ResolvesCertificate};
++use rustls::sign::{CertifiedKey, SingleCertAndKey};
++use rustls::{
++    ClientConfig, ClientConnection, DigitallySignedStruct, Error, RootCertStore, ServerConfig,
++    ServerConnection, SignatureScheme,
++};
++use std::{
++    io::{Cursor, Read, Write},
++    sync::{Arc, Mutex},
++};
++
++struct Remote(Arc<ring::signature::Ed25519KeyPair>);
++impl rcgen::RemoteKeyPair for Remote {
++    fn public_key(&self) -> &[u8] {
++        self.0.public_key().as_ref()
++    }
++    fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
++        Ok(self.0.sign(msg).as_ref().to_vec())
++    }
++    fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
++        &rcgen::PKCS_ED25519
++    }
++}
++fn certificate(extension_len: usize) -> Arc<CertifiedKey> {
++    let rng = ring::rand::SystemRandom::new();
++    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
++    let remote = Remote(Arc::new(
++        ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap(),
++    ));
++    let pair = rcgen::KeyPair::from_remote(Box::new(remote)).unwrap();
++    let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
++    params.serial_number = Some(rcgen::SerialNumber::from(1u64));
++    if extension_len != 0 {
++        params
++            .custom_extensions
++            .push(rcgen::CustomExtension::from_oid_content(
++                &[0, 0],
++                vec![1; extension_len],
++            ));
++    }
++    let cert = params.self_signed(&pair).unwrap();
++    Arc::new(
++        CertifiedKey::from_der(
++            vec![cert.der().clone()],
++            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.as_ref().to_vec())),
++            &aws_lc_rs::default_provider(),
++        )
++        .unwrap(),
++    )
++}
++fn provider(group: rustls::NamedGroup, suite: rustls::CipherSuite) -> Arc<CryptoProvider> {
++    let mut provider = aws_lc_rs::default_provider();
++    provider
++        .kx_groups
++        .retain(|item| item.name() == group);
++    provider
++        .cipher_suites
++        .retain(|item| item.suite() == suite);
++    Arc::new(provider)
++}
++fn server_config(key: Arc<CertifiedKey>, provider: Arc<CryptoProvider>) -> ServerConfig {
++    let mut config = ServerConfig::builder_with_provider(provider)
++        .with_protocol_versions(&[&rustls::version::TLS13])
++        .unwrap()
++        .with_no_client_auth()
++        .with_cert_resolver(Arc::new(SingleCertAndKey::from(key)));
++    config.send_tls13_tickets = 0;
++    config.max_tls13_tickets = 0;
++    config.cert_compressors.clear();
++    config
++}
++#[derive(Debug)]
++struct Verify(Arc<CryptoProvider>);
++impl ServerCertVerifier for Verify {
++    fn verify_server_cert(
++        &self,
++        _: &CertificateDer<'_>,
++        _: &[CertificateDer<'_>],
++        _: &ServerName<'_>,
++        _: &[u8],
++        _: UnixTime,
++    ) -> Result<ServerCertVerified, Error> {
++        Ok(ServerCertVerified::assertion())
++    }
++    fn verify_tls12_signature(
++        &self,
++        m: &[u8],
++        c: &CertificateDer<'_>,
++        d: &DigitallySignedStruct,
++    ) -> Result<HandshakeSignatureValid, Error> {
++        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
++    }
++    fn verify_tls13_signature(
++        &self,
++        m: &[u8],
++        c: &CertificateDer<'_>,
++        d: &DigitallySignedStruct,
++    ) -> Result<HandshakeSignatureValid, Error> {
++        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
++    }
++    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
++        self.0
++            .signature_verification_algorithms
++            .supported_schemes()
++    }
++}
++fn client(provider: Arc<CryptoProvider>) -> ClientConnection {
++    let config = ClientConfig::builder_with_provider(provider.clone())
++        .with_protocol_versions(&[&rustls::version::TLS13])
++        .unwrap()
++        .dangerous()
++        .with_custom_certificate_verifier(Arc::new(Verify(provider)))
++        .with_no_client_auth();
++    ClientConnection::new(Arc::new(config), ServerName::try_from("localhost").unwrap()).unwrap()
++}
++fn drain_client(client: &mut ClientConnection) -> Vec<u8> {
++    let mut out = Vec::new();
++    while client.wants_write() {
++        client.write_tls(&mut out).unwrap();
++    }
++    out
++}
++fn drain_server(server: &mut ServerConnection) -> Vec<u8> {
++    let mut out = Vec::new();
++    while server.wants_write() {
++        server.write_tls(&mut out).unwrap();
++    }
++    out
++}
++fn records(bytes: &[u8]) -> Vec<&[u8]> {
++    let mut out = Vec::new();
++    let mut pos = 0;
++    while pos != bytes.len() {
++        let len = usize::from(u16::from_be_bytes([bytes[pos + 3], bytes[pos + 4]])) + 5;
++        out.push(&bytes[pos..pos + len]);
++        pos += len;
++    }
++    out
++}
++#[derive(Debug)]
++struct Resolver {
++    key: Arc<CertifiedKey>,
++    observed: Arc<Mutex<Vec<Vec<u8>>>>,
++    fail: bool,
++}
++impl ResolvesCertificate for Resolver {
++    fn resolve(&self, raw: &[u8]) -> Result<Arc<CertifiedKey>, Error> {
++        self.observed
++            .lock()
++            .unwrap()
++            .push(raw.to_vec());
++        if self.fail {
++            return Err(Error::General("intentional callback failure".into()));
++        }
++        Ok(self.key.clone())
++    }
++}
++fn setup(
++    group: rustls::NamedGroup,
++    suite: rustls::CipherSuite,
++    encrypted: Vec<usize>,
++    empty_app: Option<usize>,
++    cert_size: usize,
++    ccs: usize,
++) -> (
++    ClientConnection,
++    ServerConnection,
++    Vec<u8>,
++    Vec<u8>,
++    Arc<Mutex<Vec<Vec<u8>>>>,
++    Arc<Secrets>,
++) {
++    let provider = provider(group, suite);
++    let key = certificate(cert_size);
++    let mut client = client(provider.clone());
++    let ch = drain_client(&mut client);
++    let mut target =
++        ServerConnection::new(Arc::new(server_config(key.clone(), provider.clone()))).unwrap();
++    target
++        .read_tls(&mut Cursor::new(&ch))
++        .unwrap();
++    target.process_new_packets().unwrap();
++    let flight = drain_server(&mut target);
++    let raw = records(&flight)[0][5..].to_vec();
++    let seen = Arc::new(Mutex::new(Vec::new()));
++    let plan = RecordPlan::new(raw.len() + 5, ccs, encrypted, empty_app).unwrap();
++    let hook = Config::new(
++        raw.clone(),
++        plan,
++        Arc::new(Resolver {
++            key: key.clone(),
++            observed: seen.clone(),
++            fail: false,
++        }),
++    )
++    .unwrap();
++    let mut config = server_config(key, provider);
++    config.reality = Some(Arc::new(hook));
++    let secrets = Arc::new(Secrets::default());
++    config.key_log = secrets.clone();
++    (
++        client,
++        ServerConnection::new(Arc::new(config)).unwrap(),
++        ch,
++        raw,
++        seen,
++        secrets,
++    )
++}
++#[derive(Debug, Default)]
++struct Secrets(Mutex<Vec<(String, Vec<u8>)>>);
++impl rustls::KeyLog for Secrets {
++    fn log(&self, label: &str, _: &[u8], secret: &[u8]) {
++        self.0
++            .lock()
++            .unwrap()
++            .push((label.into(), secret.to_vec()));
++    }
++}
++fn expand_label(secret: &[u8], label: &[u8], len: usize, alg: ring::hkdf::Algorithm) -> Vec<u8> {
++    struct Len(usize);
++    impl ring::hkdf::KeyType for Len {
++        fn len(&self) -> usize {
++            self.0
++        }
++    }
++    let mut info = (len as u16).to_be_bytes().to_vec();
++    info.push((6 + label.len()) as u8);
++    info.extend_from_slice(b"tls13 ");
++    info.extend_from_slice(label);
++    info.push(0);
++    let mut out = vec![0; len];
++    ring::hkdf::Prk::new_less_safe(alg, secret)
++        .expand(&[&info], Len(len))
++        .unwrap()
++        .fill(&mut out)
++        .unwrap();
++    out
++}
++fn independent_decrypt(
++    record: &[u8],
++    secret: &[u8],
++    suite: rustls::CipherSuite,
++    seq: u64,
++) -> Vec<u8> {
++    let (aead, hkdf, key_len) = match suite {
++        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256 => {
++            (&ring::aead::AES_128_GCM, ring::hkdf::HKDF_SHA256, 16)
++        }
++        rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => {
++            (&ring::aead::AES_256_GCM, ring::hkdf::HKDF_SHA384, 32)
++        }
++        _ => (&ring::aead::CHACHA20_POLY1305, ring::hkdf::HKDF_SHA256, 32),
++    };
++    let key = expand_label(secret, b"key", key_len, hkdf);
++    let mut iv = expand_label(secret, b"iv", 12, hkdf);
++    for (a, b) in iv[4..]
++        .iter_mut()
++        .zip(seq.to_be_bytes())
++    {
++        *a ^= b;
++    }
++    let nonce = ring::aead::Nonce::try_assume_unique_for_key(&iv).unwrap();
++    let mut payload = record[5..].to_vec();
++    ring::aead::LessSafeKey::new(ring::aead::UnboundKey::new(aead, &key).unwrap())
++        .open_in_place(nonce, ring::aead::Aad::from(&record[..5]), &mut payload)
++        .unwrap()
++        .to_vec()
++}
++fn independent_flight(
++    ch: &[u8],
++    flight: &[u8],
++    suite: rustls::CipherSuite,
++    secrets: &Secrets,
++    separated: bool,
++    empty_app: bool,
++) {
++    let log = secrets.0.lock().unwrap();
++    let handshake_secret = &log
++        .iter()
++        .find(|(label, _)| label == "SERVER_HANDSHAKE_TRAFFIC_SECRET")
++        .unwrap()
++        .1;
++    let app_secret = &log
++        .iter()
++        .find(|(label, _)| label == "SERVER_TRAFFIC_SECRET_0")
++        .unwrap()
++        .1;
++    let all_records = records(flight);
++    let mut transcript = records(ch)[0][5..].to_vec();
++    transcript.extend_from_slice(&all_records[0][5..]);
++    let encrypted = all_records
++        .iter()
++        .filter(|record| record[0] == 23)
++        .copied()
++        .collect::<Vec<_>>();
++    let count = if separated { 4 } else { 1 };
++    let mut body = Vec::new();
++    for (seq, record) in encrypted[..count].iter().enumerate() {
++        let plain = independent_decrypt(record, handshake_secret, suite, seq as u64);
++        let type_pos = plain
++            .iter()
++            .rposition(|byte| *byte != 0)
++            .unwrap();
++        assert_eq!(plain[type_pos], 22);
++        assert!(
++            plain[type_pos + 1..]
++                .iter()
++                .all(|byte| *byte == 0)
++        );
++        assert!(type_pos + 1 < plain.len());
++        body.extend_from_slice(&plain[..type_pos]);
++    }
++    let (digest, hkdf, hmac) = if suite == rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 {
++        (
++            &ring::digest::SHA384,
++            ring::hkdf::HKDF_SHA384,
++            ring::hmac::HMAC_SHA384,
++        )
++    } else {
++        (
++            &ring::digest::SHA256,
++            ring::hkdf::HKDF_SHA256,
++            ring::hmac::HMAC_SHA256,
++        )
++    };
++    let mut pos = 0;
++    let mut kinds = Vec::new();
++    while pos < body.len() {
++        let len = ((body[pos + 1] as usize) << 16)
++            | ((body[pos + 2] as usize) << 8)
++            | body[pos + 3] as usize;
++        let end = pos + 4 + len;
++        kinds.push(body[pos]);
++        if body[pos] == 20 {
++            let hash = ring::digest::digest(digest, &transcript);
++            let finished_key =
++                expand_label(handshake_secret, b"finished", digest.output_len(), hkdf);
++            ring::hmac::verify(
++                &ring::hmac::Key::new(hmac, &finished_key),
++                hash.as_ref(),
++                &body[pos + 4..end],
++            )
++            .unwrap();
++        }
++        transcript.extend_from_slice(&body[pos..end]);
++        pos = end;
++    }
++    assert_eq!(kinds, vec![8, 11, 15, 20]);
++    if empty_app {
++        let plain = independent_decrypt(encrypted[count], app_secret, suite, 0);
++        assert_eq!(plain[0], 23);
++        assert!(plain[1..].iter().all(|byte| *byte == 0));
++    }
++}
++fn exercise(
++    group: rustls::NamedGroup,
++    suite: rustls::CipherSuite,
++    encrypted: Vec<usize>,
++    empty_app: Option<usize>,
++    cert_size: usize,
++    ccs: usize,
++) {
++    let (mut client, mut server, ch, target_sh, seen, secrets) =
++        setup(group, suite, encrypted.clone(), empty_app, cert_size, ccs);
++    server
++        .read_tls(&mut Cursor::new(&ch))
++        .unwrap();
++    server.process_new_packets().unwrap();
++    assert!(server.is_handshaking());
++    let flight = drain_server(&mut server);
++    let actual = records(&flight);
++    let mut expected = vec![target_sh.len() + 5];
++    if ccs != 0 {
++        expected.push(ccs);
++    }
++    expected.extend(encrypted);
++    expected.extend(empty_app);
++    assert_eq!(
++        actual
++            .iter()
++            .map(|r| r.len())
++            .collect::<Vec<_>>(),
++        expected
++    );
++    let final_sh = seen.lock().unwrap()[0].clone();
++    assert_eq!(&actual[0][5..], &final_sh);
++    assert_ne!(final_sh, target_sh); // independent, fresh local KX share
++    assert_eq!(&final_sh[..38], &target_sh[..38]); // random and encoding retained
++    independent_flight(
++        &ch,
++        &flight,
++        suite,
++        &secrets,
++        expected.len() - usize::from(ccs != 0) - 1 - usize::from(empty_app.is_some()) == 4,
++        empty_app.is_some(),
++    );
++    let mut input = Cursor::new(flight);
++    while input.position() < input.get_ref().len() as u64 {
++        client.read_tls(&mut input).unwrap();
++        client.process_new_packets().unwrap();
++    }
++    let finished = drain_client(&mut client);
++    assert!(!finished.is_empty());
++    server
++        .read_tls(&mut Cursor::new(finished))
++        .unwrap();
++    server.process_new_packets().unwrap();
++    assert!(!client.is_handshaking());
++    assert!(!server.is_handshaking());
++    // Optional empty application record consumed sequence 0, not application
++    // plaintext: the next genuine record must still decrypt correctly.
++    server
++        .writer()
++        .write_all(b"genuine application")
++        .unwrap();
++    client
++        .read_tls(&mut Cursor::new(drain_server(&mut server)))
++        .unwrap();
++    client.process_new_packets().unwrap();
++    let mut body = Vec::new();
++    client
++        .reader()
++        .read_to_end(&mut body)
++        .unwrap_err();
++    assert_eq!(body, b"genuine application");
++    server.refresh_traffic_keys().unwrap();
++    server
++        .writer()
++        .write_all(b"after key update")
++        .unwrap();
++    let mut input = Cursor::new(drain_server(&mut server));
++    while input.position() < input.get_ref().len() as u64 {
++        client.read_tls(&mut input).unwrap();
++        client.process_new_packets().unwrap();
++    }
++    let mut body = Vec::new();
++    client
++        .reader()
++        .read_to_end(&mut body)
++        .unwrap_err();
++    assert_eq!(body, b"after key update");
++}
++#[test]
++fn x25519_aggregated_and_empty_app_all_suites() {
++    for suite in [
++        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
++        rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
++        rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
++    ] {
++        exercise(
++            rustls::NamedGroup::X25519,
++            suite,
++            vec![4096],
++            Some(128),
++            0,
++            6,
++        );
++    }
++}
++#[test]
++fn hybrid_aggregated_large_certificate() {
++    exercise(
++        rustls::NamedGroup::X25519MLKEM768,
++        rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
++        vec![8192],
++        Some(64),
++        3309,
++        6,
++    );
++}
++#[test]
++fn separated_layout_and_absent_ccs() {
++    exercise(
++        rustls::NamedGroup::X25519,
++        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
++        vec![128, 4096, 256, 128],
++        None,
++        3309,
++        0,
++    );
++}
++#[test]
++fn insufficient_target_slot_uses_natural_record_lengths() {
++    // 目标 flight 的记录槽位小于本地证书时，仍应完成握手并使用自然长度；
++    // 记录条数与布局形态保持不变。这与 Xray REALITY 不要求逐 record 等长一致。
++    let (_, mut server, ch, _, _, _) = setup(
++        rustls::NamedGroup::X25519,
++        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
++        vec![128, 128, 128, 128],
++        None,
++        3309,
++        6,
++    );
++    server
++        .read_tls(&mut Cursor::new(ch))
++        .unwrap();
++    server.process_new_packets().unwrap();
++    assert!(server.wants_write());
++    assert!(!drain_server(&mut server).is_empty());
++}
++#[test]
++fn record_plan_boundaries() {
++    assert!(RecordPlan::new(100, 6, vec![16_406], None).is_ok());
++    assert!(RecordPlan::new(100, 6, vec![16_407], None).is_err());
++    assert!(RecordPlan::new(100, 6, vec![512], None).is_err());
++    assert!(RecordPlan::new(100, 6, vec![513, 100, 100, 100], None).is_err());
++    assert!(RecordPlan::new(100, 6, vec![], None).is_err());
++    assert!(RecordPlan::new(100, 7, vec![1024], None).is_err());
++    assert!(RecordPlan::new(usize::MAX, 6, vec![1024], None).is_err());
++    assert!(RecordPlan::new(100, 6, vec![1024], Some(21)).is_err());
++}
++fn raw_template() -> (Vec<u8>, Vec<u8>, Arc<CertifiedKey>) {
++    let key = certificate(0);
++    let p = provider(
++        rustls::NamedGroup::X25519,
++        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
++    );
++    let mut client = client(p.clone());
++    let ch = drain_client(&mut client);
++    let mut target = ServerConnection::new(Arc::new(server_config(key.clone(), p))).unwrap();
++    target
++        .read_tls(&mut Cursor::new(&ch))
++        .unwrap();
++    target.process_new_packets().unwrap();
++    (
++        records(&drain_server(&mut target))[0][5..].to_vec(),
++        ch,
++        key,
++    )
++}
++fn hook(raw: Vec<u8>, key: Arc<CertifiedKey>, fail: bool) -> Config {
++    let plan = RecordPlan::new(raw.len() + 5, 6, vec![4096], None).unwrap();
++    Config::new(
++        raw,
++        plan,
++        Arc::new(Resolver {
++            key,
++            observed: Arc::new(Mutex::new(vec![])),
++            fail,
++        }),
++    )
++    .unwrap()
++}
++fn rejects_flight(mut config: ServerConfig, hook: Config, ch: &[u8]) {
++    config.reality = Some(Arc::new(hook));
++    let mut server = ServerConnection::new(Arc::new(config)).unwrap();
++    server
++        .read_tls(&mut Cursor::new(ch))
++        .unwrap();
++    assert!(server.process_new_packets().is_err());
++    assert!(drain_server(&mut server).is_empty());
++    // Errors are latched: no second attempt, no partial output on retry.
++    assert!(server.process_new_packets().is_err());
++    assert!(drain_server(&mut server).is_empty());
++}
++#[test]
++fn raw_server_hello_strict_validation_and_truncations() {
++    let (raw, _, key) = raw_template();
++    let valid = |raw: Vec<u8>| {
++        let plan = RecordPlan::new(raw.len() + 5, 6, vec![4096], None).unwrap();
++        Config::new(
++            raw,
++            plan,
++            Arc::new(Resolver {
++                key: key.clone(),
++                observed: Arc::new(Mutex::new(vec![])),
++                fail: false,
++            }),
++        )
++        .is_ok()
++    };
++    assert!(valid(raw.clone()));
++    for len in 0..raw.len() {
++        assert!(!valid(raw[..len].to_vec()), "truncated at {len}");
++    }
++    for (offset, value) in [
++        (0, 1),
++        (1, 1),
++        (2, 1),
++        (4, 2),
++        (38, 31),
++        (71, 0x12),
++        (72, 4),
++        (73, 1),
++        (77, 44),
++    ] {
++        let mut bad = raw.clone();
++        bad[offset] = value;
++        assert!(!valid(bad), "invalid at {offset}");
++    }
++    let mut hrr = raw.clone();
++    hrr[6..38].copy_from_slice(&[
++        0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
++        0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8,
++        0x33, 0x9c,
++    ]);
++    assert!(!valid(hrr));
++    let mut duplicate = raw.clone();
++    duplicate.extend_from_slice(&[0, 43, 0, 2, 3, 4]);
++    let len = duplicate.len() - 4;
++    duplicate[1..4].copy_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
++    let ext = duplicate.len() - 76;
++    duplicate[74..76].copy_from_slice(&(ext as u16).to_be_bytes());
++    assert!(!valid(duplicate));
++    let plan = RecordPlan::new(raw.len() + 6, 6, vec![4096], None).unwrap();
++    assert!(
++        Config::new(
++            raw,
++            plan,
++            Arc::new(Resolver {
++                key,
++                observed: Arc::new(Mutex::new(vec![])),
++                fail: false
++            })
++        )
++        .is_err()
++    );
++}
++#[test]
++fn template_offers_session_and_provider_rechecked() {
++    let (raw, ch, key) = raw_template();
++    let p = || {
++        provider(
++            rustls::NamedGroup::X25519,
++            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
++        )
++    };
++    let mut bad = raw.clone();
++    bad[39] ^= 1;
++    rejects_flight(
++        server_config(key.clone(), p()),
++        hook(bad, key.clone(), false),
++        &ch,
++    );
++    let mut bad = raw.clone();
++    bad[72] = 2; // allowed suite, but not CH offered
++    rejects_flight(
++        server_config(key.clone(), p()),
++        hook(bad, key.clone(), false),
++        &ch,
++    );
++    let hybrid_p = provider(
++        rustls::NamedGroup::X25519MLKEM768,
++        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
++    );
++    rejects_flight(
++        server_config(key.clone(), hybrid_p),
++        hook(raw.clone(), key.clone(), false),
++        &ch,
++    );
++    // ring has the same advertised suite/group but cannot perform opt-in padding.
++    rejects_flight(
++        server_config(key.clone(), Arc::new(ring_provider::default_provider())),
++        hook(raw, key, false),
++        &ch,
++    );
++}
++#[test]
++fn callback_failure_key_swap_and_spki_mismatch_have_no_output() {
++    let (raw, ch, key) = raw_template();
++    let p = || {
++        provider(
++            rustls::NamedGroup::X25519,
++            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
++        )
++    };
++    rejects_flight(
++        server_config(key.clone(), p()),
++        hook(raw.clone(), key.clone(), true),
++        &ch,
++    );
++    let other = certificate(0);
++    rejects_flight(
++        server_config(key.clone(), p()),
++        hook(raw.clone(), other.clone(), false),
++        &ch,
++    );
++    let mismatched = Arc::new(CertifiedKey::new(other.cert.clone(), key.key.clone()));
++    rejects_flight(
++        server_config(key.clone(), p()),
++        hook(raw.clone(), mismatched, false),
++        &ch,
++    );
++    let oversized = Arc::new(CertifiedKey::new(
++        vec![CertificateDer::from(vec![0; 65537])],
++        key.key.clone(),
++    ));
++    rejects_flight(
++        server_config(key.clone(), p()),
++        hook(raw, oversized, false),
++        &ch,
++    );
++}
++#[test]
++fn invalid_client_finished_never_delivers_application() {
++    let (mut client, mut server, ch, _, _, _) = setup(
++        rustls::NamedGroup::X25519,
++        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
++        vec![4096],
++        None,
++        0,
++        6,
++    );
++    server
++        .read_tls(&mut Cursor::new(ch))
++        .unwrap();
++    server.process_new_packets().unwrap();
++    let mut input = Cursor::new(drain_server(&mut server));
++    while input.position() < input.get_ref().len() as u64 {
++        client.read_tls(&mut input).unwrap();
++        client.process_new_packets().unwrap();
++    }
++    let mut finished = drain_client(&mut client);
++    let end = finished.len() - 1;
++    finished[end] ^= 1;
++    server
++        .read_tls(&mut Cursor::new(finished))
++        .unwrap();
++    assert!(server.process_new_packets().is_err());
++    assert!(server.is_handshaking());
++    let mut byte = [0];
++    assert!(server.reader().read(&mut byte).is_err());
++}
++#[test]
++fn aead_limit_failure_is_fallible_and_atomic() {
++    let (raw, ch, key) = raw_template();
++    let mut p = (*provider(
++        rustls::NamedGroup::X25519,
++        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
++    ))
++    .clone();
++    let original = p.cipher_suites[0].tls13().unwrap();
++    let limited = Box::leak(Box::new(rustls::Tls13CipherSuite {
++        common: rustls::CipherSuiteCommon {
++            suite: original.common.suite,
++            hash_provider: original.common.hash_provider,
++            confidentiality_limit: 1,
++        },
++        hkdf_provider: original.hkdf_provider,
++        aead_alg: original.aead_alg,
++        quic: None,
++    }));
++    p.cipher_suites = vec![rustls::SupportedCipherSuite::Tls13(limited)];
++    let plan = RecordPlan::new(raw.len() + 5, 6, vec![128, 1024, 256, 128], None).unwrap();
++    let hook = Config::new(
++        raw,
++        plan,
++        Arc::new(Resolver {
++            key: key.clone(),
++            observed: Arc::new(Mutex::new(vec![])),
++            fail: false,
++        }),
++    )
++    .unwrap();
++    rejects_flight(server_config(key, Arc::new(p)), hook, &ch);
++}
++#[test]
++fn tls_inner_plaintext_exact_limit() {
++    exercise(
++        rustls::NamedGroup::X25519,
++        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
++        vec![16406],
++        Some(16406),
++        0,
++        6,
++    );
++}
++#[test]
++fn ordinary_ring_no_hook_real_certificate_and_finished() {
++    ordinary_ring(&rustls::version::TLS13);
++}
++#[test]
++fn ordinary_ring_tls12_no_hook() {
++    ordinary_ring(&rustls::version::TLS12);
++}
++fn ordinary_ring(version: &'static rustls::SupportedProtocolVersion) {
++    let key = certificate(0);
++    let mut config = server_config(key.clone(), Arc::new(ring_provider::default_provider()));
++    assert!(config.reality.is_none());
++    if version.version == rustls::ProtocolVersion::TLSv1_2 {
++        config = ServerConfig::builder_with_provider(Arc::new(ring_provider::default_provider()))
++            .with_protocol_versions(&[version])
++            .unwrap()
++            .with_no_client_auth()
++            .with_cert_resolver(Arc::new(SingleCertAndKey::from(key.clone())));
++    }
++    config.send_tls13_tickets = 2;
++    let mut roots = RootCertStore::empty();
++    roots.add(key.cert[0].clone()).unwrap();
++    let client_config =
++        ClientConfig::builder_with_provider(Arc::new(ring_provider::default_provider()))
++            .with_protocol_versions(&[version])
++            .unwrap()
++            .with_root_certificates(roots)
++            .with_no_client_auth();
++    let mut client = ClientConnection::new(
++        Arc::new(client_config),
++        ServerName::try_from("localhost").unwrap(),
++    )
++    .unwrap();
++    let mut server = ServerConnection::new(Arc::new(config)).unwrap();
++    for _ in 0..5 {
++        let bytes = drain_client(&mut client);
++        if !bytes.is_empty() {
++            server
++                .read_tls(&mut Cursor::new(bytes))
++                .unwrap();
++            server.process_new_packets().unwrap();
++        }
++        let bytes = drain_server(&mut server);
++        if !bytes.is_empty() {
++            client
++                .read_tls(&mut Cursor::new(bytes))
++                .unwrap();
++            client.process_new_packets().unwrap();
++        }
++    }
++    assert!(!client.is_handshaking());
++    assert!(!server.is_handshaking());
++}
+--- /dev/null
++++ b/verify-source.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""复核精确官方归档、原始文件摘要和全部补丁；仅在指定新空目录展开。"""
++import argparse
++import hashlib
++import json
++import pathlib
++import subprocess
++import tarfile
++
++parser = argparse.ArgumentParser(description=__doc__)
++parser.add_argument("--archive", type=pathlib.Path, required=True)
++parser.add_argument("--empty-dir", type=pathlib.Path, required=True)
++args = parser.parse_args()
++vendor = pathlib.Path(__file__).resolve().parent
++metadata = json.loads((vendor / "UPSTREAM.json").read_text())
++archive = args.archive.resolve()
++if hashlib.sha256(archive.read_bytes()).hexdigest() != metadata["archive_sha256"]:
++    raise RuntimeError("原始归档 SHA256 不匹配")
++destination = args.empty_dir.resolve()
++if destination.exists():
++    if not destination.is_dir() or any(destination.iterdir()):
++        raise RuntimeError("复现目录必须是全新空目录")
++else:
++    destination.mkdir(parents=True)
++seen = set()
++with tarfile.open(archive) as source:
++    for member in source.getmembers():
++        parts = pathlib.PurePosixPath(member.name).parts
++        if not (member.isfile() or member.isdir()) or not parts or parts[0] != "rustls-0.23.46" or ".." in parts:
++            raise RuntimeError("归档存在非常规文件或越界路径")
++        relative = pathlib.Path(*parts[1:])
++        path = destination / relative
++        if member.isdir():
++            path.mkdir(parents=True, exist_ok=True)
++            continue
++        content = source.extractfile(member).read()
++        name = relative.as_posix()
++        if hashlib.sha256(content).hexdigest() != metadata["original_files_sha256"].get(name):
++            raise RuntimeError("原始文件摘要不匹配")
++        if name in seen:
++            raise RuntimeError("归档文件重复")
++        seen.add(name)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_bytes(content)
++if seen != set(metadata["original_files_sha256"]):
++    raise RuntimeError("归档文件列表不匹配")
++manifest = json.loads((vendor / "PATCHED.json").read_text())
++if hashlib.sha256((vendor / "upstream.patch").read_bytes()).hexdigest() != manifest["patch_sha256"]:
++    raise RuntimeError("补丁 SHA256 不匹配")
++subprocess.run(["patch", "--batch", "-p1", "-d", str(destination), "-i", str(vendor / "upstream.patch")], cwd=vendor.parent, check=True)
++for name, expected in manifest["patched_files_sha256"].items():
++    for root in (destination, vendor):
++        path = root / name
++        if not path.is_file() or path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
++            raise RuntimeError(f"受补丁文件摘要不匹配: {name}")
++actual = {path.relative_to(destination).as_posix() for path in destination.rglob("*") if path.is_file()}
++if actual != set(manifest["patched_files_sha256"]):
++    raise RuntimeError("复现结果文件集合不匹配")
++print(f"来源与补丁复现通过：{len(actual)} 个文件；归档 SHA256 {metadata['archive_sha256']}")

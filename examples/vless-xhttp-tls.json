@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "vless-xhttp",
+      "tag": "vless-xhttp-tls-in",
+      "listen": "127.0.0.1:10445",
+      "users": [
+        {
+          "name": "vless-xhttp-user",
+          "uuid": "REPLACE_WITH_A_RANDOM_VLESS_XHTTP_TLS_UUID_BEFORE_USE"
+        }
+      ],
+      "xudp": false,
+      "xhttp": {
+        "path": "/GunService/Tun",
+        "host": "localhost",
+        "mode": "stream-up"
+      },
+      "certificate": "/absolute/path/to/fullchain.pem",
+      "private_key": "/absolute/path/to/private-key.pem"
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct" }
+}

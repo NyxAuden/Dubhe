@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "trojan-xhttp",
+      "tag": "trojan-xhttp-tls-in",
+      "listen": "127.0.0.1:10446",
+      "users": [
+        { "name": "example-user", "password": "REPLACE_WITH_A_RANDOM_TROJAN_XHTTP_PASSWORD" }
+      ],
+      "xhttp": {
+        "path": "/GunService/Tun",
+        "mode": "packet-up",
+        "no_sse_header": false
+      },
+      "certificate": "/absolute/path/to/fullchain.pem",
+      "private_key": "/absolute/path/to/private-key.pem"
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct" }
+}

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "inbounds": [{
+    "type": "shadowsocks",
+    "tag": "ss-2017",
+    "listen": "127.0.0.1:8388",
+    "method": "chacha20-ietf-poly1305",
+    "password": "REPLACE_WITH_A_RANDOM_SECRET"
+  }],
+  "outbounds": [{"type": "direct", "tag": "direct"}],
+  "route": {"default": "direct"}
+}

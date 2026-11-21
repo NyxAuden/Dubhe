@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "inbounds": [
+    {
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "127.0.0.1:10450",
+      "users": [
+        {
+          "name": "example-user",
+          "uuid": "REPLACE_WITH_A_RANDOM_TUIC_UUID",
+          "password": "REPLACE_WITH_A_RANDOM_TUIC_PASSWORD"
+        }
+      ],
+      "certificate": "/absolute/path/to/fullchain.pem",
+      "private_key": "/absolute/path/to/private-key.pem",
+      "alpn": ["h3"]
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "reject", "tag": "reject" }
+  ],
+  "route": { "default": "direct" }
+}

@@ -1,0 +1,98 @@
+{
+  "modified": true,
+  "purpose": "禁用2022 UDP派生密码缓存、严格2022 TCP变量头校验及每方向固定AEAD操作预算；补丁见upstream.patch",
+  "packages": [
+    {
+      "name": "shadowsocks",
+      "version": "1.25.0",
+      "sha256": "e2065b026dbe4f47048eca384adf07f693bf901050d80abd3adb7b2422709b2d",
+      "archive_url": "https://static.crates.io/crates/shadowsocks/shadowsocks-1.25.0.crate",
+      "index_url": "https://index.crates.io/sh/ad/shadowsocks",
+      "vcs": {
+        "git": {
+          "sha1": "ab388c7466d21f979430e33cc9ef10e22fb05955"
+        },
+        "path_in_vcs": "crates/shadowsocks"
+      }
+    },
+    {
+      "name": "shadowsocks-crypto",
+      "version": "0.8.0",
+      "sha256": "b404a62ebea5003f44b9a2748dee7555c5f9ae39896508e466a2a91ee6fa5df5",
+      "archive_url": "https://static.crates.io/crates/shadowsocks-crypto/shadowsocks-crypto-0.8.0.crate",
+      "index_url": "https://index.crates.io/sh/ad/shadowsocks-crypto",
+      "vcs": {
+        "git": {
+          "sha1": "2ac3f4f6194476ff7b7be2a43c3a83e33510663b"
+        },
+        "path_in_vcs": ""
+      }
+    }
+  ],
+  "original_files": {
+    ".cargo_vcs_info.json": "f71c63e0774bf6eda15c4c90a655c0f48b22cc7a2302a8077f38efa0aa84a947",
+    "Cargo.lock": "e4809488797ba340a7f15ed96753a57dec85d8582f7c2ca9102f3887b9c77da7",
+    "Cargo.toml": "d1275bed8b4dec35514b02dd4e76339b500273a14004b95caae8dd4ee698c953",
+    "Cargo.toml.orig": "d681fb94e07bfa62076787af3feb5dcd067e8138d70d2500d067ad18c2d751ec",
+    "LICENSE": "b453481258ecf6dbe1ec0fb2efa621de6035fcddbee0868cb71b8ffc4c0c4782",
+    "README.md": "4ba6c06f75242d37c844498dbe1e7b1fcdd011a05324d9c19ebceba1a48b6dd0",
+    "src/config.rs": "350b33851b02e4245da73e2e3b9ba0fe4b69f8e6c1055c48ce1d0a81bdbfbd39",
+    "src/context.rs": "0d316cf17f98d8d061db41f3a11e02644c41ca954de28f0b90f0733040dea621",
+    "src/dns_resolver/hickory_dns_resolver.rs": "5f9f00582b8c76f8d2e6ab9ed4a63c964204316b1fbb4cb6fb6973ed66848e54",
+    "src/dns_resolver/mod.rs": "5c463a5adfdca7910f409549b393e614c3c78e808c428a4f5e71614d0c9ebdf2",
+    "src/dns_resolver/resolver.rs": "ab036662b953e3e437ebc22a526eb8fb88986fbdb086d2a945856c40357ce6f2",
+    "src/lib.rs": "0c02fe660dfccd9db37d30f6b64d0d1d629276fea53008d08e41ee3f6288081c",
+    "src/manager/client.rs": "641a6eb5f97306f1ee75551dae8d1bead5ac72ff36cc7206785d976ca40db5cb",
+    "src/manager/datagram.rs": "93bdbf245a5b6309314b5decf21806ff29815ce0855ea9d35e0ec2b77e91aedc",
+    "src/manager/error.rs": "41937a9bd9c0ec8ffc1c5a835eced4675f627662271cfe8d2714972c0ab86c81",
+    "src/manager/listener.rs": "c831a9fcfe830fea3a5d950c7dc6a7f955aa84adc0e81f363fe6ce8891890380",
+    "src/manager/mod.rs": "f65eb3a230d0580f7ae16132145e7ff6b102442e2414144029b30ad6db5df011",
+    "src/manager/protocol.rs": "b28df02f74d2d71eb5ca6a5015b32dba057decfc036cea72460e3c7ffa46403e",
+    "src/net/mod.rs": "ee6ad0e215356dc3d6810b5c4010623caa8892fed3d0fdca07388a8de053750e",
+    "src/net/option.rs": "2da96110dc5ade45d95fbdee629820d5fcd53bf4ac4ec675e9c3d785a3fddcb2",
+    "src/net/sys/mod.rs": "2a798306ac827322d65808c3cbc61e8f434414226dfe5e3e85a2657ade32d5f9",
+    "src/net/sys/unix/bsd/freebsd.rs": "463d8011900e1fe9d99f20baef47ac6cc49b00e9557002664d86c7819713a34d",
+    "src/net/sys/unix/bsd/macos.rs": "811d282e54a36d01623ee8191e71707d71ab1e7ef701f0a816d4cca001f4d549",
+    "src/net/sys/unix/bsd/mod.rs": "5d6795e2abdd8faffaab2ee410eabfa50ba2b17867c42195616bf84b55074d87",
+    "src/net/sys/unix/bsd/others.rs": "688efce928e9fb940c15fd334de00f10ae58e45ecdabe0354b7826a25f78d104",
+    "src/net/sys/unix/linux/mod.rs": "6a029de60ad599afefa61a613598af48e626f3d62f64c02c430bf6d89d8f3ca4",
+    "src/net/sys/unix/mod.rs": "69ff1cc4e839c902f52255a313eb92e05ff9ca2b12bf584c2d47941e87ef9323",
+    "src/net/sys/unix/others.rs": "ba85ca4e91929d1cca270806b8f44712bb5c33f5fcc84cf8f5ce6c81d0aa1f37",
+    "src/net/sys/unix/uds.rs": "c159adf4d088eb68d7a8cfb33d0f12ba4ff75321bd9b8a83cd976d5c1a3851b4",
+    "src/net/sys/windows/mod.rs": "832791d9e03dbe733790254d4e40440f253af2cc73ced9a93439cb9ac40d2f27",
+    "src/net/tcp.rs": "0e3ab72c96a4e4fe9b3d15924e241bee82414ce1b53b8d84eaa6149948edfb87",
+    "src/net/udp.rs": "9bf912b0698af89bbc005638133291c4f0a3906d4cef852aa76de633d9918a08",
+    "src/plugin/mod.rs": "95f2f27f063500e411cafc174d0808d8c89c495ff84701ab0a2ba2052a5dd4eb",
+    "src/plugin/obfs_proxy.rs": "dd96ab11b96d6b23779d4ede868124d56f058399a0e014f50f1911dc3787cfe4",
+    "src/plugin/ss_plugin.rs": "a257e68000e59d1a84d0145938405b1e418c2d669efc73e98a82ecf9f8739481",
+    "src/relay/mod.rs": "ae9e64966fe09e481ae5569fc184b736f918a29172dfe3e720756a20515571c9",
+    "src/relay/socks5.rs": "ab160e6dee96b06eb5eefc269fb8ec418b56a277ad5c35a3ca0be5fc06f1a60b",
+    "src/relay/tcprelay/aead.rs": "6cce7e0f2bb70a8eaddb67cea976f8344e7d4ab2f92ec1b164965322b5337231",
+    "src/relay/tcprelay/aead_2022.rs": "56b44af13238bbef88594bfc87b19b78afaa59b6bf36b6f70c80619e1c4d8728",
+    "src/relay/tcprelay/crypto_io.rs": "1bd37861800712beaf87951e6235e7bc382c7e002fb20efcada84f220a7b1249",
+    "src/relay/tcprelay/mod.rs": "fabbf0537742c5d6e1390290ca118f729fca75d26e5bfe5639cbed8131897acd",
+    "src/relay/tcprelay/proxy_listener.rs": "27be294f4b8a84b949275d9bea59b5f140c0e0646472bc3556639ac4051096c9",
+    "src/relay/tcprelay/proxy_stream/client.rs": "a5c9c7a4b3b03e84862fb5922103a926549373976b5f028582e24a50bbfeac74",
+    "src/relay/tcprelay/proxy_stream/mod.rs": "862d829aab36b6dbbadb132b5ab8c9b1c3b9558e96bea8aca2a1d928f597b496",
+    "src/relay/tcprelay/proxy_stream/protocol/mod.rs": "0327515106b59387425625b80fd6009f23ddffb4222df86b9f568969bbc642fd",
+    "src/relay/tcprelay/proxy_stream/protocol/v1.rs": "b0b4411e927a7fe0ea822d084b4208b32b0d2b4b6cc159d5bfb34f2f98487f71",
+    "src/relay/tcprelay/proxy_stream/protocol/v2.rs": "c7b642e4c00eaba978c9ba1157c2d139b5ed223889aba76d14e13963addfafeb",
+    "src/relay/tcprelay/proxy_stream/server.rs": "1d55d3fa4e5a78ff2d712d0159112a85ba1fd43f81253b81617392a03635b1c1",
+    "src/relay/tcprelay/stream.rs": "18d8cfbd0190610157f9b4184406d58e8ca9b84491eeca8aa1f292d06904dd67",
+    "src/relay/tcprelay/utils.rs": "6dd679b2c9baca129b8b265299d2318cdacd69b09d9903ebf25f7d61c25bf62b",
+    "src/relay/udprelay/aead.rs": "d95039ad83395d9abe729a27c56e6a72884fc27a8b27fbbe51ce41a938febfba",
+    "src/relay/udprelay/aead_2022.rs": "e646bec20b6d1dc592595804b0f3bb9b6c8f7ab2bb2de6b1df6d284934d981a7",
+    "src/relay/udprelay/compat.rs": "698f9da4f43fcecd10c228f6f62bae7c5bba799b6eb8711a383969682cb0458e",
+    "src/relay/udprelay/crypto_io.rs": "28c536cf6ee42ec44889e5911814af27f4b0cc7567a9759bfb54faeda0c85a6e",
+    "src/relay/udprelay/mod.rs": "a3cd95f9ace3c31b2e772b4f03f993f7cc069caccfab89b8935dac6b0355bc3c",
+    "src/relay/udprelay/options.rs": "7350d56e4d0041f8710ced4bd05d75b849f5392930daf46f2bb91daf08c1a5d5",
+    "src/relay/udprelay/proxy_socket.rs": "5e16e7ef5f086c934af8fc741449d570060cccb71cefd2350155e87f7f4fbea4",
+    "src/relay/udprelay/stream.rs": "fe8cb0b671708b5a947d6265053c4e678547a3acda0a5cf9e221582a31325e89",
+    "src/security/mod.rs": "352a830684a0f222688d4b65ccfc218cf91328a753ede52c8f55432ed4d461be",
+    "src/security/replay/mod.rs": "2e5f2f685ff68670e89b4a609b331e9f36c03d208e621ec8e28ddf5025fbcf99",
+    "src/security/replay/ppbloom.rs": "a92506bbe7b1119431fe5de9b037624049d05e1e5d80d5dd92fc1eab63cec841",
+    "tests/tcp.rs": "0d4446e8305b0e4b2997f0a715ccee5e57543a949ca37eb293dc4ff862f550b7",
+    "tests/tcp_tfo.rs": "160dd2008a5bd3f13db53d28694416f10381e63b54a8e299306e339bec2d6339",
+    "tests/udp.rs": "2e95a119305ed564493342621b2cd91b1f968005b8b0cd915416c348828d16b4"
+  }
+}

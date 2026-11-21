@@ -1,0 +1,57 @@
+[Unit]
+Description=Dubhe
+Documentation=file:///usr/local/share/doc/dubhe/operations.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=dubhe
+Group=dubhe
+WorkingDirectory=/etc/dubhe
+ExecStart=/usr/local/bin/dubhe run -c /etc/dubhe/config.json
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+Restart=on-failure
+RestartSec=2s
+
+# Keep the service unprivileged. If a privileged port is unavoidable, grant
+# only CAP_NET_BIND_SERVICE and keep the rest of the bounding set empty.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# Filesystem and process hardening. Config and private keys are read-only.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+
+LimitNOFILE=65536
+# Journald handles rotation. Do not write credentials or payloads to logs.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

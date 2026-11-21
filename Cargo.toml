@@ -1,0 +1,112 @@
+[package]
+name = "dubhe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+license = "GPL-3.0-only"
+description = "独立的模块化服务端代理内核"
+
+[features]
+# 仅用于独立 fuzz 包暴露公开解析入口；生产构建不启用。
+fuzzing = []
+
+[dependencies]
+aes = { version = "=0.9.4", default-features = false }
+aes-gcm = { version = "=0.11.1", default-features = false, features = ["aes", "alloc"] }
+anyhow = "1"
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc"] }
+aws-lc-rs = { version = "=1.19.0", default-features = false, features = ["alloc", "non-fips"] }
+base64 = "0.22"
+blake2 = { version = "=0.10.6", default-features = false, features = ["std"] }
+blake3 = "1.8"
+bytes = "1"
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["alloc"] }
+clap = { version = "4", features = ["derive"] }
+crc32fast = "=1.5.4"
+cryptoxide = { version = "=0.5.1", default-features = false, features = ["hmac", "sha2"] }
+ctr = { version = "=0.10.1", default-features = false }
+md-5 = { version = "=0.11.0", default-features = false }
+prost = { version = "=0.14.4", default-features = false, features = ["derive", "std"] }
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+# 与 quinn 0.11.11 已解析的 quinn-proto 版本相同；仅直接命名
+# `RttEstimator` 与委托 `Cubic`，不引入新包或新版本。
+quinn-proto = { version = "=0.11.19", default-features = false }
+shake = { version = "=0.1.0", default-features = false }
+hickory-resolver = { version = "=0.26.2", default-features = true }
+http = { version = "=1.5.0", default-features = false, features = ["std"] }
+ml-kem = { version = "=0.3.4", default-features = false, features = ["alloc", "getrandom"] }
+nowhere = { path = "vendor/nowhere" }
+httparse = { version = "=1.10.1", default-features = false, features = ["std"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"] }
+h2 = { version = "=0.4.20", default-features = false }
+h3 = { version = "=0.0.8", default-features = false }
+h3-quinn = { version = "=0.0.10", default-features = false, features = ["datagram"] }
+ipnet = { version = "2", features = ["serde"] }
+rcgen = { version = "=0.13.2", default-features = false }
+# 已在 env_filter 的依赖树内；直接命名用于路由 domain_regex。
+regex = { version = "=1.13.1", default-features = false, features = ["std", "perf"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "aws_lc_rs", "std", "tls12", "reality"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+boringtun = { version = "=0.7.1", default-features = false }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
+shadowsocks = { version = "=1.25.0", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "aead-2022-no-udp-cipher-cache"] }
+subtle = "2"
+socket2 = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time", "test-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+url = "2"
+x509-parser = { version = "=0.18.1", default-features = false }
+
+[dev-dependencies]
+aes = "0.9"
+rcgen = "0.13"
+tempfile = "3"
+yasna = "=0.5.2"
+
+[patch.crates-io]
+# 上游 blake3 的 derive-key 上下文只接受 &str；VLESS Encryption 需要任意字节上下文，
+# 因此本地补丁新增 `hash_derive_key_context_bytes`（见 vendor/blake3/PATCH.md）。
+blake3 = { path = "vendor/blake3" }
+rustls = { path = "vendor/rustls" }
+shadowsocks = { path = "vendor/shadowsocks" }
+h3 = { path = "vendor/h3" }
+h3-quinn = { path = "vendor/h3-quinn" }
+
+[workspace]
+members = ["vendor/shadowsocks"]
+default-members = ["."]
+# 固定版本的上游 HTTP/3 源码只作为依赖编译，不进入 workspace 成员与测试面。
+exclude = ["fuzz", "vendor/blake3", "vendor/h3", "vendor/h3-quinn", "vendor/h3-datagram", "vendor/nowhere"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# 发布二进制去掉调试段；符号表保留，backtrace 仍有函数名（无行号）。
+strip = "debuginfo"
+
+# target/debug 体积的主因是依赖的 debug 符号（曾达 39G 的 .o 文件）。
+# 依赖一律不带 debug 信息，自身代码只保留行号（backtrace 仍有行号，
+# 但无法在依赖内部单步查看变量）。改动会使构建指纹失效，需全量重编一次。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# 测试目标不保留 incremental：全量测试曾产生约 16 GiB 的
+# target/debug/incremental，而每次集中验收后这些缓存都会被删除。
+# 需要快速迭代单个测试时可用 CARGO_INCREMENTAL=1 临时覆盖。
+[profile.test]
+incremental = false
+# 76 个集成测试二进制各带一份自身代码的调试信息，是 target 体积主因。
+# 测试失败仍显示用例名与断言消息；需要行号时用 CARGO_PROFILE_TEST_DEBUG=line-tables-only。
+debug = false
