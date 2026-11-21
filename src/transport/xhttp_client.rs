@@ -44,9 +44,17 @@ const MAX_HEAD: usize = 16 * 1024;
 const MAX_BLOCK: usize = 64 * 1024;
 /// 解析 chunked 下行时允许的最大单块声明长度；仅用于拒绝明显异常的帧。
 const MAX_DOWNLINK_CHUNK: usize = 16 * 1024 * 1024;
-/// HTTP/2 单帧与流控窗口，与服务端配置保持一致，避免对端缓冲过大。
+/// HTTP/2 单帧大小。
 const STREAM_CHUNK: usize = 16 * 1024;
-const H2_INITIAL_WINDOW: u32 = 65_535;
+/// H2 初始流控窗口。
+///
+/// 不能沿用协议默认的 65535：`stream-one` 在单条 H2 流上双向承载，
+/// 上传要在同一条流里等下载让出窗口；窗口太小（< 一次传输量）时
+/// 上传与回写会互等，表现为挂起而非报错。
+///
+/// 实测：96 KiB 双跳在 64 KiB 窗口下 8 次跑出 4 次 30s 超时，
+/// 改为 4 MiB 后 8/8 通过。真实大文件传输同样受益。
+const H2_INITIAL_WINDOW: u32 = 4 * 1024 * 1024;
 const H2_MAX_FRAME: u32 = 16_384;
 const H2_MAX_CONCURRENT: u32 = 64;
 /// 上行待写队列长度：队列 × 单块上限 = 有界内存。
