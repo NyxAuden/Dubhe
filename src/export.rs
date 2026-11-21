@@ -93,6 +93,11 @@ pub enum Credential {
     Password {
         password: String,
     },
+    /// Naive 的代理认证是 `用户名:密码`，空用户名会被服务端 407 拒绝。
+    Naive {
+        username: String,
+        password: String,
+    },
     Shadowsocks {
         method: String,
         password: String,
@@ -622,6 +627,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
             users,
             websocket,
             reality,
+            certificate,
             ..
         } => {
             let Some(user) = users.first() else {
@@ -629,7 +635,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
             };
             base(
                 Protocol::Trojan,
-                tls_or_reality(reality, &Some(std::path::PathBuf::new()))?,
+                tls_or_reality(reality, certificate)?,
                 Transport::Ws {
                     path: websocket.path.clone(),
                     host: websocket.host.clone(),
@@ -781,14 +787,18 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 },
             )
         }
-        Inbound::TrojanHttp { users, http, .. } => {
+        Inbound::TrojanHttp {
+            users,
+            http,
+            certificate,
+            ..
+        } => {
             let Some(user) = users.first() else {
                 return Ok(None);
             };
             base(
                 Protocol::Trojan,
-                // Trojan 的证书必填，因此一定是 TLS。
-                Security::Tls { server_name: None },
+                tls_or_reality(&None, certificate)?,
                 Transport::Http {
                     path: http.path.clone(),
                     host: http.host.first().cloned(),
@@ -864,7 +874,8 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 Protocol::Naive,
                 Security::Tls { server_name: None },
                 Transport::Tcp,
-                Credential::Password {
+                Credential::Naive {
+                    username: user.name.clone(),
                     password: user.password.clone(),
                 },
             )
@@ -1098,7 +1109,13 @@ fn xray_outbound(node: &Node) -> std::result::Result<Value, String> {
     let mut stream = Map::new();
     match node.transport {
         Transport::Tcp => {
-            stream.insert("network".into(), json!("tcp"));
+            // Xray 把 Hysteria2 的承载协商放在 network 上，不是普通 TCP。
+            let network = if node.protocol == Protocol::Hysteria2 {
+                "hysteria"
+            } else {
+                "tcp"
+            };
+            stream.insert("network".into(), json!(network));
         }
         Transport::Ws { ref path, ref host } => {
             stream.insert("network".into(), json!("ws"));
@@ -1240,6 +1257,53 @@ fn xray_outbound(node: &Node) -> std::result::Result<Value, String> {
                 }),
             );
         }
+        (
+            Protocol::Hysteria2,
+            Credential::Hysteria2 {
+                password,
+                obfs,
+                up_mbps,
+                down_mbps,
+            },
+        ) => {
+            out.insert("protocol".into(), json!("hysteria"));
+            out.insert(
+                "settings".into(),
+                json!({
+                    "version": 2,
+                    "address": node.host,
+                    "port": node.port,
+                }),
+            );
+            // streamSettings 已提前写入；Xray 的 Hysteria2 认证/混淆都在其中。
+            let stream = out
+                .get_mut("streamSettings")
+                .and_then(Value::as_object_mut)
+                .expect("streamSettings 已写入");
+            let mut hysteria = json!({"version": 2, "auth": password});
+            if let Some(mbps) = up_mbps {
+                hysteria["up_mbps"] = json!(mbps);
+            }
+            if let Some(mbps) = down_mbps {
+                hysteria["down_mbps"] = json!(mbps);
+            }
+            stream.insert("hysteriaSettings".into(), hysteria);
+            // Xray 用 FinalMask 的 UDP 层表达 obfs；不写就无法与带混淆的服务端握手。
+            if let Some(obfs) = obfs {
+                let mut settings = json!({"password": obfs.password});
+                if obfs.kind == "gecko" {
+                    settings["packetSize"] = json!(format!(
+                        "{}-{}",
+                        obfs.min_packet_size.unwrap_or(512),
+                        obfs.max_packet_size.unwrap_or(1200)
+                    ));
+                }
+                stream.insert(
+                    "finalmask".into(),
+                    json!({"udp": [{"type": "salamander", "settings": settings}]}),
+                );
+            }
+        }
         _ => {
             return Err(format!("{:?} 不是 Xray 支持的出站协议", node.protocol));
         }
@@ -1297,6 +1361,35 @@ fn sing_box_outbound(node: &Node) -> std::result::Result<Value, String> {
             out.insert("password".into(), json!(password));
         }
         (
+            Protocol::Snell,
+            Credential::Snell {
+                psk,
+                version,
+                userkey,
+                mode,
+                obfs_mode,
+            },
+        ) => {
+            // sing-box 没有 v5 客户端；官方文档称 v5 线格式与 v4 相同，按 4 发送。
+            let wire = if (4..=5).contains(version) { 4 } else { 6 };
+            if wire == 4 && obfs_mode.as_deref() == Some("tls") {
+                return Err("sing-box 的 Snell obfs 只有 none/http，没有 tls".to_owned());
+            }
+            out.insert("type".into(), json!("snell"));
+            out.insert("version".into(), json!(wire));
+            out.insert("psk".into(), json!(psk));
+            if let Some(userkey) = userkey {
+                out.insert("userkey".into(), json!(userkey));
+            }
+            if wire == 4 {
+                if let Some(obfs) = obfs_mode {
+                    out.insert("obfs_mode".into(), json!(obfs));
+                }
+            } else if let Some(mode) = mode {
+                out.insert("mode".into(), json!(mode));
+            }
+        }
+        (
             Protocol::Hysteria2,
             Credential::Hysteria2 {
                 password,
@@ -1340,9 +1433,9 @@ fn sing_box_outbound(node: &Node) -> std::result::Result<Value, String> {
             out.insert("type".into(), json!("anytls"));
             out.insert("password".into(), json!(password));
         }
-        (Protocol::Naive, Credential::Password { password }) => {
+        (Protocol::Naive, Credential::Naive { username, password }) => {
             out.insert("type".into(), json!("naive"));
-            out.insert("username".into(), json!(""));
+            out.insert("username".into(), json!(username));
             out.insert("password".into(), json!(password));
         }
         _ => {
@@ -1479,6 +1572,11 @@ fn mihomo_proxy(node: &Node) -> std::result::Result<Value, String> {
             out.insert("cipher".into(), json!("auto"));
         }
         (Protocol::Trojan, Credential::Password { password }) => {
+            // Mihomo 的 trojan 实现无条件 TLS（TrojanOption 没有 tls 开关），
+            // 明文 trojan 只会得到 "first record does not look like a TLS handshake"。
+            if node.security == Security::None {
+                return Err("Mihomo 的 trojan 强制 TLS，无法连接明文 trojan".to_owned());
+            }
             out.insert("type".into(), json!("trojan"));
             out.insert("password".into(), json!(password));
         }
@@ -1745,7 +1843,8 @@ fn anywhere_proxy(node: &Node, index: usize) -> std::result::Result<Value, Strin
         }
     }
 
-    // 传输层只对 VLESS 生效（AJSON 规范如此）。
+    // AJSON 的 transport 只属于 VLESS；其它协议的承载字段不会被读取。
+    // 不在这里拒绝，客户端会按 RAW TCP 连接一个 WS/gRPC 端口，静默不通。
     if node.protocol == Protocol::Vless {
         let transport = match &node.transport {
             Transport::Tcp => None,
@@ -1788,6 +1887,8 @@ fn anywhere_proxy(node: &Node, index: usize) -> std::result::Result<Value, Strin
         if let Some(transport) = transport {
             out.insert("transport".into(), transport);
         }
+    } else if !matches!(node.transport, Transport::Tcp) {
+        return Err("Anywhere 的 AJSON 只为 VLESS 读取 transport，其它协议只能 RAW TCP".to_owned());
     }
 
     // nowhere 固定 TLS 1.3，AJSON 里不接受 security 字段。
@@ -2657,6 +2758,8 @@ mod coverage_gap_tests {
         let (sing, _) = get(Target::SingBox, &node);
         assert_eq!(sing["outbounds"][1]["type"], "naive");
         assert_eq!(sing["outbounds"][1]["password"], "pw");
+        // 服务端按 `用户名:密码` 校验；空用户名会被自己的 407 拒绝。
+        assert_eq!(sing["outbounds"][1]["username"], "a");
         // Mihomo v1.19.33 没有 naive 代理类型，必须报告而不是生成。
         let (mihomo, report) = get(Target::Mihomo, &node);
         assert_eq!(mihomo["proxies"].as_array().unwrap().len(), 0);
@@ -2718,6 +2821,48 @@ mod coverage_gap_tests {
                 report.notes
             );
         }
+    }
+
+    #[test]
+    fn snell_v5_exports_as_wire_v4_to_sing_box() {
+        let node = one(json!({
+            "type": "snell", "tag": "sn", "listen": "0.0.0.0:6160",
+            "psk": "snell-psk-v5", "version": 5,
+            "users": [{"name": "a", "userkey": "userkey-1"}]
+        }));
+        let (sing, _) = get(Target::SingBox, &node);
+        // sing-box 没有 v5 客户端；官方文档称 v5 线格式与 v4 相同。
+        assert_eq!(sing["outbounds"][1]["type"], "snell");
+        assert_eq!(sing["outbounds"][1]["version"], 4);
+        assert_eq!(sing["outbounds"][1]["userkey"], "userkey-1");
+    }
+
+    #[test]
+    fn hysteria2_exports_to_xray_with_finalmask_obfs() {
+        let node = one(json!({
+            "type": "hysteria2", "tag": "hy", "listen": "0.0.0.0:443",
+            "users": [{"name": "a", "password": "pw"}],
+            "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem",
+            "up_mbps": 50, "down_mbps": 200,
+            "obfs": {"type": "salamander", "password": "obfs-pw"}
+        }));
+        let (xray, _) = get(Target::Xray, &node);
+        let outbound = &xray["outbounds"][1];
+        assert_eq!(outbound["protocol"], "hysteria");
+        assert_eq!(outbound["streamSettings"]["network"], "hysteria");
+        assert_eq!(outbound["streamSettings"]["hysteriaSettings"]["auth"], "pw");
+        assert_eq!(
+            outbound["streamSettings"]["hysteriaSettings"]["up_mbps"],
+            50
+        );
+        assert_eq!(
+            outbound["streamSettings"]["finalmask"]["udp"][0]["type"],
+            "salamander"
+        );
+        assert_eq!(
+            outbound["streamSettings"]["finalmask"]["udp"][0]["settings"]["password"],
+            "obfs-pw"
+        );
     }
 
     #[test]
