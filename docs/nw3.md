@@ -69,7 +69,18 @@ Egress 是 Nowhere 的另一类独立服务：**没有本地监听**，主动连
 
 URL 映射为 `egress://KEY@ENDPOINT?morph=..&sni=..&pin=..&dial..&rate=..&etar=..`；端点语法与选项最终由 Nowhere 的 `Egress::new` 与客户端配置解析器校验。`Server::check` 会实际构造一次 `Egress`，因此端点/密钥/证书选项错误在检查阶段即可发现。
 
-Egress 与 Portal 一样是独立子系统：**不经过本内核 route/outbounds，也不计入本内核统计与限额**（这与 Nowhere 自身的 Egress 角色一致）；日志同样走 `nowhere::Logger`。本地 IPC 遥测按 Nowhere 的 `InstanceRole::Egress` 注册。
+Egress 与 Portal 一样是独立子系统：**不经过本内核 route/outbounds，也不计入本内核统计与限额**
+> **认证失败的可观测性**：NW3 的共享密钥认证在 `vendor/nowhere` 内部完成，
+> 不做逐次 `ctx.stats.reject()` 打点，因此 `/metrics` 的
+> `dubhe_rejected_total` **不包含 NW3 的认证失败**。
+>
+> 这不是缺陷：NW3 Portal 是独立子系统（自行绑定、自行出站），本内核
+> 只负责把它跑起来。认证失败由 Nowhere 自身的 `SilentRejections`
+> 聚合后经 `nowhere::Logger` 输出日志，可用日志检索，不在指标里。
+>
+> 要接入主 Stats 需要修改 `vendor/nowhere` 的 `Portal::run` 接口，
+> 会破坏与官方 Nowhere 的同步基础，因此不做。
+（这与 Nowhere 自身的 Egress 角色一致）；日志同样走 `nowhere::Logger`。本地 IPC 遥测按 Nowhere 的 `InstanceRole::Egress` 注册。
 
 ## Portal 的出口选择（`out`）
 

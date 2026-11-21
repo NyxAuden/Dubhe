@@ -480,3 +480,43 @@ fn wireguard_inbound_config_is_validated() {
     ]);
     assert!(Config::from_json(&overlapping.to_string()).is_err());
 }
+
+/// WireGuard 的认证失败必须能出现在 `/metrics` 的 `dubhe_rejected_total` 上。
+///
+/// 回归背景：`WireguardServer` 有独立的 `WireguardServerStats`
+/// （区分 `invalid_packets` 与 `unknown_peers`，比全局 `rejected` 更细），
+/// 但此前完全不进 `/metrics`——运维看不到未知公钥 / MAC1 错误 / 报文
+/// 校验失败。由于该类型在 bind 阶段就构造完毕（那时全局 Stats 还没创建），
+/// `runtime` 用周期采样把两个计数的增量并入全局 rejected。
+#[tokio::test]
+async fn invalid_handshakes_are_merged_into_global_rejected() {
+    let mut value = config();
+    // 采样周期缩到最小，测试才不必等 30 秒。
+    value["limits"]["stats_interval_ms"] = json!(1);
+    let running = Running::start(value).await;
+
+    let before = running.stats.snapshot().rejected;
+    // 发一个不可能通过 MAC1 校验的握手初始化：随机字节。
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut garbage = [0u8; 148];
+    for (index, byte) in garbage.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    socket.send_to(&garbage, running.address).await.unwrap();
+
+    let merged = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if running.stats.snapshot().rejected > before {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    running.shutdown().await;
+    assert!(
+        merged.unwrap_or(false),
+        "WireGuard 无效握手没有并入全局 rejected（修复前恒为 0）"
+    );
+}

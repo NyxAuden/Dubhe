@@ -270,6 +270,12 @@ impl Stats {
     pub fn reject(&self) {
         self.rejected.fetch_add(1, Ordering::Relaxed);
     }
+    /// 批量计入 rejected；供周期性采样合并外部计数器（如 WireGuard）使用。
+    pub fn reject_many(&self, count: u64) {
+        if count > 0 {
+            self.rejected.fetch_add(count, Ordering::Relaxed);
+        }
+    }
 }
 impl Drop for Guard {
     fn drop(&mut self) {

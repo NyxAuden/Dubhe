@@ -500,6 +500,15 @@ struct HandshakeWindow {
 /// let task = server.spawn();       // 或 async move { server.run().await }
 /// server.shutdown();
 /// ```
+/// WireGuard 的认证/协议层拒绝类型；两者都计入全局 rejected。
+#[derive(Clone, Copy)]
+enum RejectKind {
+    /// 无效握手 / MAC1 失败 / 解密失败 / 报文校验失败。
+    Invalid,
+    /// 未知静态公钥。
+    UnknownPeer,
+}
+
 pub struct WireguardServer {
     socket: Arc<UdpSocket>,
     config: Arc<WireguardServerConfig>,
@@ -717,6 +726,18 @@ impl WireguardServer {
         self.notify.notify_one();
     }
 
+    /// 记录一次认证/协议层拒绝的本地细分计数。
+    ///
+    /// 全局 `rejected` 由 `runtime` 周期采样 `invalid_packets` +
+    /// `unknown_peers` 的增量合并（见 WireGuard 的 sampler 任务），
+    /// 因为本类型在 bind 阶段就构造完毕，那时全局 Stats 还不存在。
+    fn reject(&self, kind: RejectKind) {
+        match kind {
+            RejectKind::Invalid => self.stats.invalid.fetch_add(1, Ordering::Relaxed),
+            RejectKind::UnknownPeer => self.stats.unknown_peers.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
     pub fn stats(&self) -> WireguardServerStats {
         let (tcp, udp, queued) = {
             let inner = self.inner.lock().unwrap_or_else(poisoned);
@@ -796,7 +817,7 @@ impl WireguardServer {
             }
             Err(error) => {
                 tracing::debug!(?error, "WireGuard 服务端丢弃无法解析的报文");
-                self.stats.invalid.fetch_add(1, Ordering::Relaxed);
+                self.reject(RejectKind::Invalid);
             }
         }
     }
@@ -817,12 +838,12 @@ impl WireguardServer {
             Ok(half) => half,
             Err(error) => {
                 tracing::debug!(?error, "WireGuard 服务端拒绝无效握手初始化");
-                self.stats.invalid.fetch_add(1, Ordering::Relaxed);
+                self.reject(RejectKind::Invalid);
                 return;
             }
         };
         let Some(index) = self.peer_slots.get(&half.peer_static_public).copied() else {
-            self.stats.unknown_peers.fetch_add(1, Ordering::Relaxed);
+            self.reject(RejectKind::UnknownPeer);
             return;
         };
 
@@ -869,7 +890,7 @@ impl WireguardServer {
                 }
             }
             if failed {
-                self.stats.invalid.fetch_add(1, Ordering::Relaxed);
+                self.reject(RejectKind::Invalid);
             } else if accepted {
                 // 只有完整通过 MAC1、静态密钥、TAI64N 校验后才学习漫游地址。
                 let peer = &mut inner.peers[index];
@@ -952,7 +973,7 @@ impl WireguardServer {
                 }
             }
             if failed {
-                self.stats.invalid.fetch_add(1, Ordering::Relaxed);
+                self.reject(RejectKind::Invalid);
             } else if accepted {
                 let peer = &mut inner.peers[index];
                 peer.endpoint = Some(sender);
@@ -993,11 +1014,11 @@ impl WireguardServer {
         mut packet: Vec<u8>,
     ) -> Option<FlowKey> {
         if !valid_packet_checksums(&packet) {
-            self.stats.invalid.fetch_add(1, Ordering::Relaxed);
+            self.reject(RejectKind::Invalid);
             return None;
         }
         let Some(info) = inspect_packet(&packet) else {
-            self.stats.invalid.fetch_add(1, Ordering::Relaxed);
+            self.reject(RejectKind::Invalid);
             return None;
         };
         if info.destination.ip().is_unspecified()
@@ -1123,7 +1144,7 @@ impl WireguardServer {
 
         // 将目的地址 DNAT 到本机隧道地址 + 临时端口，便于 smoltcp 终止。
         if !rewrite_destination(&mut packet, local_ip, local_port) {
-            self.stats.invalid.fetch_add(1, Ordering::Relaxed);
+            self.reject(RejectKind::Invalid);
             return None;
         }
         if inner.device.rx.len() >= self.config.max_queued_datagrams {
@@ -1196,7 +1217,7 @@ impl WireguardServer {
         }
         let target = key.destination;
         if !rewrite_source(&mut packet, target.ip(), target.port()) {
-            self.stats.invalid.fetch_add(1, Ordering::Relaxed);
+            self.reject(RejectKind::Invalid);
             return;
         }
         let peer = &mut inner.peers[key.peer];

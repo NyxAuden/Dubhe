@@ -1081,6 +1081,30 @@ impl Server {
                     );
                     let stop = stop.clone();
                     let force = force.clone();
+                    // WireGuard 的认证失败要能出现在 /metrics 上。
+                    // 它在 bind 阶段就构造完毕，那时全局 Stats 还没创建，
+                    // 所以在这里周期采样两个认证计数的增量并入全局 rejected。
+                    // 细分（invalid_packets / unknown_peers）仍保留在
+                    // WireguardServerStats 里。
+                    let sampler = server.clone();
+                    let global = self.context.stats.clone();
+                    let interval = Duration::from_millis(self.context.limits.stats_interval_ms);
+                    let sampler_stop = stop.clone();
+                    tasks.spawn(async move {
+                        let mut last = sampler.stats();
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = sampler_stop.cancelled() => return Ok(()),
+                                _ = tokio::time::sleep(interval) => {}
+                            }
+                            let now = sampler.stats();
+                            let auth = (now.invalid_packets + now.unknown_peers)
+                                .saturating_sub(last.invalid_packets + last.unknown_peers);
+                            global.reject_many(auth);
+                            last = now;
+                        }
+                    });
                     tasks.spawn(async move {
                         let driver = server.clone().run();
                         tokio::pin!(driver);
