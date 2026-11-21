@@ -70,7 +70,7 @@ x509-parser = { version = "=0.18.1", default-features = false }
 aes = "0.9"
 rcgen = "0.13"
 tempfile = "3"
-yasna = "=0.5.2"
+yasna = "=0.6.0"
 
 [patch.crates-io]
 # 上游 blake3 的 derive-key 上下文只接受 &str；VLESS Encryption 需要任意字节上下文，
