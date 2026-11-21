@@ -35,6 +35,39 @@ du -sh target/* target/debug/*
 
 CI 每次都是全新容器，不需要额外处理；本地连续跑多轮全量测试时才需要上面的清理。
 
+## 实测数据（2026-11-21）
+
+在 macOS ARM64、Rust 1.91.0 上实测 `cargo test --locked --all-targets --no-run`：
+
+| 产物 | 占用 | 占比 |
+|---|---|---|
+| 78 个测试二进制 | **6.1 GiB** | 82% |
+| `.rmeta`（`cargo check`/`clippy` 产物） | 361 MiB | 5% |
+| `build/`（C/汇编中间物，aws-lc-sys 与 ring 为主） | 124 MiB | 2% |
+| `.d` 依赖描述 | 6.7 MiB | <1% |
+| **合计** | **7.4 GiB** | |
+
+单个 lib 测试二进制的段构成（样本 102 MiB）：
+
+| 段 | 大小 | 说明 |
+|---|---|---|
+| `__text` | 47 MiB | 实际代码 |
+| `__eh_frame` | 11 MiB | 栈展开信息 |
+| `__gcc_except_tab` | 3.1 MiB | 异常表 |
+| `__unwind_info` | 2.2 MiB | 同上 |
+| `__const` | 2.2 MiB | 常量 |
+
+### 已验证无效或不可接受的优化
+
+| 方案 | 实测/预期 | 结论 |
+|---|---|---|
+| `debug-assertions = false` + `overflow-checks = false` | 102 → 98 MiB（-4%） | 收益太小，且关闭溢出检查会掩盖真实 bug |
+| `panic = "abort"` 消除 `__eh_frame` | 理论 -14% | **不可接受**：libtest 无法捕获 panic，一个用例失败会终止整个进程并丢失其余结果 |
+| 单独删 `.rmeta` | 312 → 161 MiB | 可行但下次 `check`/`clippy` 会重建，只是临时回收 |
+
+`tools/ci.sh` 现在默认在跑完后 `cargo clean -p dubhe`，
+用 `DUHBE_CI_KEEP_TARGET=1` 可保留产物调试。
+
 ## 还能再省的地方
 
 把 76 个测试二进制合并成 6–8 个分组（每个 test crate 只能有一个 crate root），

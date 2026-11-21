@@ -13,4 +13,13 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo build --locked --release --bin dubhe
 
+# `clippy --all-targets` 与 `test --all-targets` 各自产生一套产物，叠加约
+# 6–8 GiB：76 个集成测试二进制各 85–101 MiB，每个都静态链接整份代码。
+# 这是 Rust 集成测试的结构性成本，无法通过配置消除，只能跑完回收。
+# 设 DUHBE_CI_KEEP_TARGET=1 可保留产物用于调试。
+if [ "${DUHBE_CI_KEEP_TARGET:-0}" != "1" ]; then
+    cargo clean -p dubhe 2>/dev/null || true
+    printf '%s\n' "ci: 已回收本项目构建产物（DUHBE_CI_KEEP_TARGET=1 可保留）"
+fi
+
 printf '%s\n' "ci: all checks passed"
