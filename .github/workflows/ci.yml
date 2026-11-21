@@ -53,7 +53,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install cargo-deny
-        run: cargo +stable install cargo-deny --locked
+        # 必须固定版本：cargo-deny 0.22 要求 rustc 1.95，而本项目固定 1.91.0，
+        # 不固定会直接装不上导致 supply-chain job 失败。
+        run: cargo +stable install cargo-deny --version 0.20.2 --locked
       - name: Deny advisories, licenses, sources
         run: cargo deny check
 
