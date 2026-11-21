@@ -10,7 +10,15 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# 每条 ignore 都必须写明为何本仓库不受影响，不接受「先放行再说」。
+ignore = [
+    # humantime 2.4.0 的实际依赖为空（`cargo tree -i humantime` 只显示
+    # nowhere -> dubhe），公告正文「humantime wraps chrono」的前提对本版本
+    # 不成立。chrono 已从依赖树移除；humantime 仅用于解析 NOW_* 环境变量的
+    # 时长（5m / 1h30m / 2 days / 1min 30sec），无替代品且无自写解析器的
+    # 风险收益比。上游 nowhere 引入，见 docs/upstream-facts.md。
+    "RUSTSEC-2026-0542",
+]
 
 [licenses]
 version = 2

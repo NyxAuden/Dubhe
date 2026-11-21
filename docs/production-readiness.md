@@ -78,7 +78,27 @@
 - PEM 加载从 `rustls-pemfile` 迁移到 `rustls-pki-types` 的 `PemObject`，不再依赖
   已归档 crate。
 - 修复后重新执行 `cargo deny check`：**advisories、bans、licenses、sources 全部通过**。
-  `deny.toml` 仍保持无 ignore；新增依赖或公告会重新阻断。
+
+2026-11-21 再次执行时发现两条新公告：
+
+- `chrono 0.4.45`：RUSTSEC-2026-0543（unmaintained）。
+- `humantime 2.4.0`：RUSTSEC-2026-0542（unmaintained，公告称因 chrono 不再维护）。
+
+处理：
+
+- `chrono` 已**从依赖树移除**。它在 `vendor/nowhere` 里只有一处用途
+  （`common/logger.rs` 的 UTC 时间戳格式化），改用 std 手写
+  `utc_timestamp()`（Howard Hinnant 的 `civil_from_days`），输出格式与原
+  chrono 格式 `%Y-%m-%dT%H:%M:%S%.3fZ` 逐字符一致，并已用 1970/2000/
+  闰年 2000-02-29 等参照点与 Python `datetime` 交叉验证。
+- `humantime` **保留**，并在 `deny.toml` 中带完整理由 ignore：
+  该 crate 2.4.0 的实际依赖为空（`cargo tree -i humantime` 只显示
+  `nowhere -> dubhe`），公告正文「humantime wraps chrono」的前提对本版本
+  不成立。它只用于解析 9 个 `NOW_*` 环境变量的时长（`5m`、`1h30m`、
+  `2 days`、`1min 30sec`），上游 nowhere 引入；自写解析器的边界风险与
+  收益比不划算。
+
+`deny.toml` 现在**有一条** ignore，其余仍为空，新增依赖或公告会重新阻断。
 
 这不等于完整安全审计，也不等于所有 DNS 行为已被生产验证；只是当前锁文件的已知公告
 已清零。后续必须在 CI 中持续运行 `tools/supply-chain.sh`，并保留公告复核记录。
