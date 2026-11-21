@@ -26,6 +26,16 @@ impl std::fmt::Display for RouteRejected {
 }
 impl std::error::Error for RouteRejected {}
 
+/// 是否为协议层认证失败。
+///
+/// VLESS / VMess / Trojan 的认证失败统一用 `PermissionDenied`
+/// （见 `src/protocol/vless.rs:123`、`vmess/header.rs:97`、`trojan.rs:49`）。
+/// 用于在多路复用入口（gRPC、V2Ray HTTP H2、V2Ray QUIC）里补计数，
+/// 这些路径此前用 `let _` 吞掉 dispatch 错误，认证失败完全不可见。
+pub(crate) fn is_authentication_failure(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
+}
+
 pub(crate) fn is_route_rejection(error: &io::Error) -> bool {
     error
         .get_ref()

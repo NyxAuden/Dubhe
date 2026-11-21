@@ -53,32 +53,54 @@ where
                 ),
                 None => Box::new(stream),
             };
-            let accepted = timeout_at(
+            let accepted = match timeout_at(
                 deadline,
                 vless::handshake_with_xudp(&mut stream, &users, xudp),
             )
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "V2Ray 传输/VLESS 认证超时"))??;
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "V2Ray 传输/VLESS 认证超时"))
+            .and_then(|result| result)
+            {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    // 认证阶段的失败计入 rejected：H2 与 QUIC 此前用 `let _`
+                    // 吞掉错误，同一入口 H1 能看见爆破、H2 看不见。
+                    ctx.stats.reject();
+                    return Err(error);
+                }
+            };
             drop(handshake);
             crate::runtime::serve_plain_vless(stream, accepted, &tag, ctx, duration, xudp).await
         }
         Inbound::VmessHttp { tag, .. } | Inbound::VmessQuic { tag, .. } => {
             let prepared = vmess.ok_or_else(|| io::Error::other("VMess 未准备"))?;
-            let accepted = timeout_at(deadline, prepared.handshake(&mut stream, tls_enabled))
+            let accepted = match timeout_at(deadline, prepared.handshake(&mut stream, tls_enabled))
                 .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "V2Ray 传输/VMess 认证超时")
-                })??;
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "V2Ray 传输/VMess 认证超时"))
+                .and_then(|result| result)
+            {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    ctx.stats.reject();
+                    return Err(error);
+                }
+            };
             let allow_udp = prepared.allow_udp();
             drop(handshake);
             crate::runtime::serve_vmess(stream, accepted, &tag, ctx, duration, allow_udp).await
         }
         Inbound::TrojanHttp { tag, users, .. } | Inbound::TrojanQuic { tag, users, .. } => {
-            let request = timeout_at(deadline, trojan::read_request(&mut stream, &users))
+            let request = match timeout_at(deadline, trojan::read_request(&mut stream, &users))
                 .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "V2Ray 传输/Trojan 认证超时")
-                })??;
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "V2Ray 传输/Trojan 认证超时"))
+                .and_then(|result| result)
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    ctx.stats.reject();
+                    return Err(error);
+                }
+            };
             drop(handshake);
             match request.command {
                 Command::Connect => {

@@ -1034,6 +1034,10 @@ where
                 let user = match http::authenticate_header(auth, users) {
                     Ok(user) => user,
                     Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                        // 与 H1 的 accept.rs 兜底保持一致：认证失败计入 rejected。
+                        // 此前 H2 只回 407 就 continue，同一入口 H1 能看见爆破、
+                        // H2 看不见；而 TLS 下 ALPN 优先 h2。
+                        ctx.stats.reject();
                         let _ = respond.send_response(
                             Response::builder().status(StatusCode::PROXY_AUTHENTICATION_REQUIRED).body(()).unwrap(),
                             true,

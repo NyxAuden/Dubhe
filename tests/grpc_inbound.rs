@@ -1577,3 +1577,57 @@ fn grpc_transport_rejects_misplaced_or_invalid_tuning_fields() {
         assert!(!grpc_outbound_config(transport.clone()), "{transport}");
     }
 }
+
+/// gRPC 入口的协议层认证失败必须计入 `stats.rejected`。
+///
+/// 回归背景：`src/transport/grpc.rs` 的 `run_rpc` 此前拿到 `dispatch` 错误后
+/// 只 `scope.abort_and_join()` 就返回，没有任何统计——`accept_rpc` 只对 RPC
+/// 准入（路径/content-type/名额）计数。结果是 gRPC 入口的 UUID/密码猜测在
+/// `dubhe_rejected_total` 上完全不可见，只有并发超限能看到。
+///
+/// 同类缺陷已在 Hysteria2、TUIC、Naive 各出现过一次，这是第四处。
+#[tokio::test]
+async fn trojan_grpc_rejected_counts_protocol_authentication_failure() {
+    let cert = Certificate::new();
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let server = Running::start(with_inbound(grpc_inbound("trojan-grpc", Some(&cert)))).await;
+    let before = server.stats.snapshot().rejected;
+
+    let tls = tls_h2(&cert, server.address).await;
+    let (mut send_request, connection) = h2::client::handshake(tls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let (response, mut stream) = send_request
+        .send_request(request("/GunService/Tun"), false)
+        .unwrap();
+    let response = timeout(WAIT, response).await.unwrap().unwrap();
+    assert_eq!(response.status(), 200);
+    // 故意使用错误密码：Trojan 认证必须失败。
+    stream
+        .send_data(
+            frame(&trojan_hello(
+                "deliberately-wrong-grpc-password",
+                echo.address,
+                b"wrong",
+            )),
+            false,
+        )
+        .unwrap();
+    // 等待服务端处理并计数；认证失败会 abort 局部任务并关闭 RPC。
+    let counted = timeout(WAIT, async {
+        loop {
+            if server.stats.snapshot().rejected > before {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    drop(stream);
+    driver.abort();
+    server.shutdown().await;
+
+    assert!(
+        counted.unwrap_or(false),
+        "gRPC 协议层认证失败没有计入 stats.rejected（修复前为 0）"
+    );
+}

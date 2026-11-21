@@ -996,7 +996,16 @@ async fn run_rpc(
         let _ = pump_out(bridge_read, send, multi).await;
     });
     let result = dispatch(app, &inbound, vmess, ctx.clone(), deadline, lease).await;
-    if result.is_err() {
+    if let Err(error) = &result {
+        // 认证失败必须计入 rejected：此前只 abort_and_join 就返回，导致
+        // gRPC 入口的 UUID/密码猜测在 dubhe_rejected_total 上完全不可见
+        // （只有 RPC 准入超限才计数）。判据见下一行注释。
+        //
+        // 无法在此区分认证阶段与业务阶段：`dispatch` 内部 `drop(handshake)`
+        // 的 permit 已被移走。因此按错误类型保守判定，只对认证类错误计数。
+        if crate::forward::is_authentication_failure(error) {
+            ctx.stats.reject();
+        }
         // 认证或业务失败：终止并join局部任务，让对端看到显式失败而非成功trailers。
         scope.abort_and_join().await;
         return;
