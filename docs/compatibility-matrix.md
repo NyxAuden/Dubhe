@@ -10,10 +10,10 @@
 >   Trojan、VLESS（含 XUDP）、Shadowsocks、VMess、Hysteria2、TUIC、
 >   Snell v4、**AnyTLS**。客户端不支持时（Xray 无 hysteria2/tuic/snell/
 >   anytls，Mihomo 无 naive）用例**显式报告跳过**，不计为通过。
-> - **Naive**：sing-box 用例已写好，但被**测试证书限制**阻塞——
->   NaiveProxy 走 Chromium 网络栈，`rcgen::generate_simple_self_signed`
->   的默认有效期（1975–4096）被拒为 `cert validity too long`，
->   缩短有效期后仍被拒。属测试基建问题，不计为通过。
+> - **Naive**：sing-box 用例已跑通（valid / wrong-password /
+>   untrusted-certificate）。曾因 Chromium 网络栈的证书有效期限制阻塞，
+>   已改测试证书为显式一年期；另因上游硬编码 `RemoteIsDomain: true`
+>   导致连 `[::1]`，测试侧改用双栈监听。
 > - **其余协议**（ShadowTLS、WireGuard、Vision、REALITY、
 >   VLESS Encryption、WS/WSS、gRPC、XHTTP、HTTPUpgrade、mKCP、
 >   NW3 的官方二进制方向）**只有本机回环测试**。
