@@ -35,6 +35,14 @@
 >   该 hybrid share（缺了直接回落）；Mihomo 默认也移除，需非默认开关
 >   `support-x25519mlkem768: true`。所以「三家 REALITY 矩阵」在协议层
 >   不成立，不能写成三家都通过。
+> - **REALITY 出站**（2026-11-22）：本内核出站 → 官方 Xray v26.10.31
+>   REALITY 服务端，TCP 双向回显通过（`tests/reality_official_outbound.rs`）。
+>   此前出站只有内核连内核的闭环，双方实现错误会互相抵消。
+>   **排查中确认的一个上游行为**：Xray 的 `freedom` 出站对 vless 入站
+>   默认应用 `defaultBlockPrivateRule`，即屏蔽 127.0.0.0/8 等私有地址。
+>   本机回环测试必须给 freedom 配 `finalRules: [{action: allow, ip:
+>   ["127.0.0.0/8"]}]`，否则会出现「REALITY 认证成功、服务端日志
+>   accepted，但数据为零」的假象——这与内核实现无关，曾误判为内核缺陷。
 > - **其余协议**（WireGuard、NW3 的官方二进制
 >   方向）**只有本机回环测试**。正文中的「与官方客户端互通」均为历史人工
 >   记录，当前工作区无可复现测试，亦无脚本可重跑。
