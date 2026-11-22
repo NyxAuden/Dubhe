@@ -107,10 +107,21 @@ async fn wait_listening(address: SocketAddr) -> Result<()> {
     .context("服务端未在期限内监听")
 }
 
+/// 取一个端口交给 Xray 子进程监听。
+///
+/// 不使用 `bind(0)` 的返回值：Linux 临时端口范围（32768–60999）会被
+/// 并发测试的 TCP 连接当作源端口占用，造成「释放后再绑定」的 `AddrInUse`。
+/// 这里在范围之外顺序探测，并由调用方保证进程内不重复。
 fn pick_port() -> SocketAddr {
-    // 绑定 0 拿端口后立即释放；测试串行执行，争抢窗口可接受。
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(20000);
+    for _ in 20000u16..30000 {
+        let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            drop(listener);
+            return SocketAddr::from(([127, 0, 0, 1], port));
+        }
+    }
+    panic!("没有可用测试端口");
 }
 
 fn reality_server(target: SocketAddr, port: u16) -> Value {

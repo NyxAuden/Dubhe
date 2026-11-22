@@ -104,17 +104,32 @@ impl CliProcess {
 ///
 /// 并行测试各自“绑定 :0 → 释放 → 子进程绑定”时，内核可能把刚释放的端口
 /// 再发给另一个测试；全局记录已发出的端口，避免两次分配落到同一端口。
+/// 预留一个测试专用端口。
+///
+/// 不能直接用 `bind("127.0.0.1:0")` 的返回值：Linux 的临时端口范围是
+/// 32768–60999，`bind(0)` 恰好从这个范围里取，而同一时刻其它测试建立的
+/// TCP 连接会把这些端口当作**源端口**占用。于是「释放 → 稍后再 bind」
+/// 会间歇性拿到 `AddrInUse`（2026-11-22 在 CI x86_64 上实测复现）。
+///
+/// 这里改为在临时端口范围之外顺序探测，并保证进程内不重复发放。
 fn reserve_port() -> std::net::SocketAddr {
     static ISSUED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
         std::sync::OnceLock::new();
     let issued = ISSUED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    loop {
-        let listener = StdListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        if issued.lock().unwrap().insert(address.port()) {
-            return address;
+    // 20000–29999 低于临时端口下界 32768，避开内核自动分配的源端口。
+    for port in 20000u16..30000 {
+        if issued.lock().unwrap().contains(&port) {
+            continue;
+        }
+        let Ok(listener) = StdListener::bind(("127.0.0.1", port)) else {
+            continue;
+        };
+        drop(listener);
+        if issued.lock().unwrap().insert(port) {
+            return std::net::SocketAddr::from(([127, 0, 0, 1], port));
         }
     }
+    panic!("没有可用测试端口");
 }
 
 impl Drop for CliProcess {

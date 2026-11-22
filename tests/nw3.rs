@@ -19,9 +19,28 @@ use tokio::{
 
 const KEY: &str = "0123456789abcdef0123456789abcdef";
 
+/// 取一个测试专用端口。
+///
+/// 不用 `bind("127.0.0.1:0")`：Linux 的临时端口范围是 32768–60999，
+/// 这个范围会被并发测试的 TCP 连接当作源端口占用，导致「释放后再绑定」
+/// 间歇性 `AddrInUse`。这里在范围之外顺序探测。
 fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    // 并发测试必须各自拿到不同端口，否则会互相抢占导致「未就绪」超时。
+    static ISSUED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+        std::sync::OnceLock::new();
+    let issued = ISSUED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    for port in 20000u16..30000 {
+        if issued.lock().unwrap().contains(&port) {
+            continue;
+        }
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            drop(listener);
+            if issued.lock().unwrap().insert(port) {
+                return port;
+            }
+        }
+    }
+    panic!("没有可用测试端口");
 }
 
 fn pin(cert: &Certificate) -> String {
