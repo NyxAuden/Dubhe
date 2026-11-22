@@ -28,7 +28,14 @@
 >   服务端 `decryption` 可确定性推导客户端 `encryption`（X25519 标量乘、
 >   ML-KEM-768 种子展开），已用 `xray vlessenc` + `xray x25519 -i` 官方输出
 >   逐字节核对。sing-box/Mihomo 的 VLESS 出站无该字段，用例显式跳过。
-> - **其余协议**（WireGuard、REALITY、NW3 的官方二进制
+> - **REALITY**（2026-11-22）：Xray v26.10.31 客户端 valid / wrong-uuid
+>   通过（TCP）。**只对 Xray 生成用例，这不是偷懒而是协议事实**：
+>   sing-box 的 `common/tls/reality_client.go` 主动把 X25519MLKEM768 从
+>   `SupportedCurves`/`KeyShare` 里过滤掉，而本内核与 Xray 服务端都硬要求
+>   该 hybrid share（缺了直接回落）；Mihomo 默认也移除，需非默认开关
+>   `support-x25519mlkem768: true`。所以「三家 REALITY 矩阵」在协议层
+>   不成立，不能写成三家都通过。
+> - **其余协议**（WireGuard、NW3 的官方二进制
 >   方向）**只有本机回环测试**。正文中的「与官方客户端互通」均为历史人工
 >   记录，当前工作区无可复现测试，亦无脚本可重跑。
 >

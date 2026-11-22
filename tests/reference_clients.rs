@@ -39,6 +39,11 @@ const WRONG_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30812";
 /// `encryption`（公钥）。公钥由私钥确定性推导，见
 /// `xray x25519 -i "<private>"`（2026-11-22 逐字节核对）。
 const VLESS_ENCRYPTION_PRIVATE: &str = "-DqEf18Ai3PxV9ZMJToAvlwY2XMlcMYlJItT-8oQBWg";
+/// REALITY 固定密钥对，由 `xray x25519` 生成。
+/// `xray x25519 -i "<私钥>"` 可确定性复现同一公钥。
+const REALITY_PRIVATE: &str = "aAz6xlX1zFLJbdvh_eO-eL5Ap2ez06m5iPh1ZamRGVM";
+const REALITY_PUBLIC: &str = "WgEqf-ahV6J6uGy6Uy8fMPH3uMhmQ8JFw9vkwpKypEQ";
+const REALITY_SHORT_ID: &str = "8172635445362718";
 /// 服务端 `decryption`：启用 600s 票据，因此客户端用 `0rtt`。
 const VLESS_ENCRYPTION_CLIENT: &str =
     "mlkem768x25519plus.native.0rtt.MvcuFHxUUqUmO0_v_XgyVRuQDNZtWvoroqUfEaBZCy0";
@@ -72,6 +77,8 @@ enum Protocol {
     VlessQuic,
     /// VLESS Encryption（`mlkem768x25519plus`）。
     VlessEncryption,
+    /// VLESS over REALITY（`security: "reality"` + RAW 传输）。
+    VlessReality,
     Vmess,
     Hysteria2,
     Tuic,
@@ -95,7 +102,8 @@ impl Protocol {
             | Self::VlessHttp
             | Self::VlessKcp
             | Self::VlessQuic
-            | Self::VlessEncryption => "vless",
+            | Self::VlessEncryption
+            | Self::VlessReality => "vless",
             Self::Vmess => "vmess",
             Self::Hysteria2 => "hysteria2",
             Self::Tuic => "tuic",
@@ -118,6 +126,7 @@ impl Protocol {
             Self::VlessKcp => "vless-kcp",
             Self::VlessQuic => "vless-quic",
             Self::VlessEncryption => "vless-encryption",
+            Self::VlessReality => "vless-reality",
             _ => self.name(),
         }
     }
@@ -156,6 +165,7 @@ impl Protocol {
                 | Self::VlessKcp
                 | Self::VlessQuic
                 | Self::VlessEncryption
+                | Self::VlessReality
                 | Self::Vmess,
                 Scenario::WrongCredential,
             ) => WRONG_UUID,
@@ -171,6 +181,7 @@ impl Protocol {
                 | Self::VlessKcp
                 | Self::VlessQuic
                 | Self::VlessEncryption
+                | Self::VlessReality
                 | Self::Vmess,
                 _,
             ) => UUID,
@@ -187,6 +198,9 @@ impl Protocol {
             // 服务端 connections 始终为 0（对比 ws 承载同一测试会正常回包）。
             // 这是客户端侧行为，不是内核缺陷，因此该组合只验收 TCP。
             (Self::VlessHttp, "mihomo") => false,
+            // REALITY 的 UDP 在官方 Xray 客户端下实测不通（TCP 正常）。
+            // 这是该承载的客户端行为，只验收 TCP。
+            (Self::VlessReality, _) => false,
 
             // sing-box 实机报 "UDP is not supported by outbound: kernel"；
             // naive 出站只能 TCP CONNECT。
@@ -202,7 +216,9 @@ impl Protocol {
     /// Snell 是纯对称加密握手，没有 TLS，所以 `untrusted-certificate`
     /// 场景对它不适用——那边测的是证书校验，不是协议本身。
     fn uses_tls(self) -> bool {
-        !matches!(self, Self::Snell)
+        // Snell 无 TLS；REALITY 的证书不是常规 TLS 校验，而由临时证书
+        // HMAC + 目标证书链决定，因此 `untrusted-certificate` 场景不适用。
+        !matches!(self, Self::Snell | Self::VlessReality)
     }
 
     /// 该参考客户端是否实现了此协议。
@@ -249,6 +265,14 @@ impl Protocol {
             Self::VlessEncryption if client != "xray" => {
                 Some("只有 Xray 的 VLESS 出站支持 encryption 字段")
             }
+            // REALITY 的客户端矩阵在协议层不成立：
+            // - sing-box 主动移除 X25519MLKEM768（common/tls/reality_client.go），
+            //   而本内核与 Xray 服务端都硬要求该 hybrid share；
+            // - Mihomo 默认也移除，需非默认开关 support-x25519mlkem768。
+            // 因此只对 Xray 生成用例，不假装三家都支持。
+            Self::VlessReality if client != "xray" => Some(
+                "REALITY 需 X25519MLKEM768；该客户端默认不发（sing-box 直接移除，Mihomo 需非默认开关）",
+            ),
             // Xray v26.10.31 的 mKCP 出站实测不工作：日志显示 connection
             // 创建后立刻 Close（state 1 at 0），向独立 UDP 探针零发包。
             // 内核 mKCP 由 tests/kcp.rs 的 10 项本机回环覆盖。
@@ -259,7 +283,7 @@ impl Protocol {
         }
     }
 
-    fn inbound(self, certificate: &Certificate) -> Value {
+    fn inbound(self, certificate: &Certificate, target: Option<SocketAddr>) -> Value {
         let mut inbound = certificate.inbound();
         match self {
             Self::Vless
@@ -273,6 +297,7 @@ impl Protocol {
             | Self::VlessKcp
             | Self::VlessQuic
             | Self::VlessEncryption
+            | Self::VlessReality
             | Self::Vmess => {
                 // 承载变体需要把 type 换成对应入口名。
                 inbound["type"] = json!(match self {
@@ -284,6 +309,7 @@ impl Protocol {
                     Self::VlessKcp => "vless-kcp",
                     Self::VlessQuic => "vless-quic",
                     Self::VlessEncryption => "vless",
+                    Self::VlessReality => "vless-reality",
                     _ => self.name(),
                 });
                 inbound["tag"] = json!(self.mode());
@@ -293,6 +319,21 @@ impl Protocol {
                     inbound["decryption"] = json!(format!(
                         "mlkem768x25519plus.native.600s.{VLESS_ENCRYPTION_PRIVATE}"
                     ));
+                }
+                if matches!(self, Self::VlessReality) {
+                    let target = target.expect("REALITY 缺少 target");
+                    // REALITY 不用常规证书：临时证书由私钥 + 客户端公钥派生，
+                    // 证书链来自 target 的真实 TLS 握手。
+                    if let Some(map) = inbound.as_object_mut() {
+                        map.remove("certificate");
+                        map.remove("private_key");
+                    }
+                    inbound["reality"] = json!({
+                        "target": {"host": target.ip().to_string(), "port": target.port()},
+                        "private_key": REALITY_PRIVATE,
+                        "server_names": ["localhost"],
+                        "short_ids": [REALITY_SHORT_ID]
+                    });
                 }
                 if matches!(self, Self::VlessXudp) {
                     inbound["xudp"] = json!(true);
@@ -410,7 +451,7 @@ impl Protocol {
                 handshake.expect("ShadowTLS 缺少本地 TLS 握手目标"),
                 PASSWORD,
             ),
-            _ => json!([self.inbound(certificate)]),
+            _ => json!([self.inbound(certificate, handshake)]),
         }
     }
 
@@ -632,6 +673,7 @@ impl Scenario {
                 | Protocol::VlessKcp
                 | Protocol::VlessQuic
                 | Protocol::VlessEncryption
+                | Protocol::VlessReality
                 | Protocol::Vmess,
             ) => "wrong-uuid",
             (Self::UntrustedCertificate, _) => "untrusted-certificate",
@@ -691,7 +733,8 @@ fn client_config(
                 | Protocol::VlessHttp
                 | Protocol::VlessKcp
                 | Protocol::VlessQuic
-                | Protocol::VlessEncryption => {
+                | Protocol::VlessEncryption
+                | Protocol::VlessReality => {
                     // VlessOption 使用 servername，而 TrojanOption 使用 sni。
                     // 同一固定源码的 adapter/parser.go 按 smux.enabled 控制复用包装。
                     proxy["uuid"] = json!(credential);
@@ -708,6 +751,12 @@ fn client_config(
                     }
                     if matches!(protocol, Protocol::VlessEncryption) {
                         proxy["encryption"] = json!(VLESS_ENCRYPTION_CLIENT);
+                    }
+                    if matches!(protocol, Protocol::VlessReality) {
+                        proxy["reality-opts"] = json!({
+                            "public-key": REALITY_PUBLIC,
+                            "short-id": REALITY_SHORT_ID
+                        });
                     }
                     // Mihomo 用 network + *-opts 表达承载。
                     match protocol {
@@ -819,7 +868,8 @@ fn client_config(
                 | Protocol::VlessHttp
                 | Protocol::VlessKcp
                 | Protocol::VlessQuic
-                | Protocol::VlessEncryption => {
+                | Protocol::VlessEncryption
+                | Protocol::VlessReality => {
                     // *string: 省略/null 会默认 XUDP；必须显式空字符串才走原生 UDP。
                     // https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/option/vless.go
                     // https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/protocol/vless/outbound.go
@@ -835,6 +885,13 @@ fn client_config(
                     outbound["multiplex"] = json!({"enabled": false});
                     if matches!(protocol, Protocol::VlessEncryption) {
                         outbound["encryption"] = json!(VLESS_ENCRYPTION_CLIENT);
+                    }
+                    if matches!(protocol, Protocol::VlessReality) {
+                        outbound["tls"]["reality"] = json!({
+                            "enabled": true,
+                            "public_key": REALITY_PUBLIC,
+                            "short_id": REALITY_SHORT_ID
+                        });
                     }
                     // sing-box 用 transport 段表达承载。
                     match protocol {
@@ -929,7 +986,8 @@ fn client_config(
                 | Protocol::VlessHttp
                 | Protocol::VlessKcp
                 | Protocol::VlessQuic
-                | Protocol::VlessEncryption => {
+                | Protocol::VlessEncryption
+                | Protocol::VlessReality => {
                     json!({"address": "127.0.0.1", "port": server.port(),
                     "id": credential,
                     "encryption": match protocol {
@@ -978,7 +1036,8 @@ fn client_config(
                 | Protocol::VlessHttp
                 | Protocol::VlessKcp
                 | Protocol::VlessQuic
-                | Protocol::VlessEncryption => json!({"enabled": false,
+                | Protocol::VlessEncryption
+                | Protocol::VlessReality => json!({"enabled": false,
                     "concurrency": -1, "xudpConcurrency": -1}),
             };
             // Xray 用 streamSettings.network + *Settings 表达承载。
@@ -991,6 +1050,17 @@ fn client_config(
                         "oneTimeLoading": true}]
                 }
             });
+            if matches!(protocol, Protocol::VlessReality) {
+                // REALITY 覆盖默认的 tls 段。
+                stream["security"] = json!("reality");
+                stream["realitySettings"] = json!({
+                    "serverName": "localhost",
+                    "fingerprint": "chrome",
+                    "publicKey": REALITY_PUBLIC,
+                    "shortId": REALITY_SHORT_ID
+                });
+                stream.as_object_mut().map(|map| map.remove("tlsSettings"));
+            }
             match protocol {
                 Protocol::VlessWs => {
                     stream["network"] = json!("ws");
@@ -1304,6 +1374,7 @@ async fn positive_udp(proxy: SocketAddr, protocol: Protocol) -> Result<Value> {
         | Protocol::VlessKcp
         | Protocol::VlessQuic
         | Protocol::VlessEncryption
+        | Protocol::VlessReality
         | Protocol::Vmess
         | Protocol::Hysteria2
         | Protocol::Tuic
@@ -1629,7 +1700,7 @@ async fn run_scenarios(
     let certificate = Certificate::new();
     let unrelated = Certificate::new();
     // ShadowTLS 的握手伪装目标：真实 TLS 1.3 服务端，独立于协议入站证书。
-    let handshake = if matches!(protocol, Protocol::ShadowTls) {
+    let handshake = if matches!(protocol, Protocol::ShadowTls | Protocol::VlessReality) {
         Some(TlsHandshakeTarget::start(&certificate).await?)
     } else {
         None
@@ -1667,9 +1738,13 @@ async fn run_scenarios(
                 protocol.inbounds(&certificate, handshake.as_ref().map(|h| h.address));
             config
         } else {
-            let mut inbound = protocol.inbound(&certificate);
-            // Snell 没有 TLS；KCP 用明文（allow_insecure_transport 显式豁免）。
-            if !matches!(protocol, Protocol::Snell | Protocol::VlessKcp) {
+            let mut inbound = protocol.inbound(&certificate, handshake.as_ref().map(|h| h.address));
+            // Snell 没有 TLS；KCP 用明文；REALITY 不用常规证书（临时证书由
+            // 私钥 + 客户端公钥派生，证书链来自 target 的真实握手）。
+            if !matches!(
+                protocol,
+                Protocol::Snell | Protocol::VlessKcp | Protocol::VlessReality
+            ) {
                 inbound["certificate"] = json!(cert_path);
                 inbound["private_key"] = json!(key_path);
             }
@@ -1949,7 +2024,7 @@ fn configuration_generation_trojan_preserves_existing_outbounds() -> Result<()> 
         })
     );
     assert_eq!(
-        Protocol::Trojan.inbound(&certificate),
+        Protocol::Trojan.inbound(&certificate, None),
         certificate.inbound()
     );
     Ok(())
@@ -1985,7 +2060,7 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
             .dir
             .path()
             .join("cert.pem");
-            let mut inbound = protocol.inbound(&certificate);
+            let mut inbound = protocol.inbound(&certificate, None);
             let key = match protocol {
                 Protocol::Trojan => "password",
                 Protocol::Hysteria2 | Protocol::Tuic => "password",
@@ -2002,6 +2077,7 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                 | Protocol::VlessKcp
                 | Protocol::VlessQuic
                 | Protocol::VlessEncryption
+                | Protocol::VlessReality
                 | Protocol::Vmess => "uuid",
             };
             assert_eq!(
@@ -2044,7 +2120,8 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                             | Protocol::VlessHttp
                             | Protocol::VlessKcp
                             | Protocol::VlessQuic
-                            | Protocol::VlessEncryption => &outbound["settings"]["id"],
+                            | Protocol::VlessEncryption
+                            | Protocol::VlessReality => &outbound["settings"]["id"],
                             // Xray 的 VMess 出站用 vnext[].users[].id。
                             Protocol::Vmess => &outbound["settings"]["vnext"][0]["users"][0]["id"],
                             Protocol::Hysteria2
@@ -2083,10 +2160,15 @@ fn configuration_generation_xudp_enables_udp_without_tcp_mux() -> Result<()> {
     let protocol = Protocol::VlessXudp;
     assert_eq!(protocol.mode(), "vless-xudp");
     assert_eq!(Scenario::WrongCredential.name(protocol), "wrong-uuid");
-    let inbound = protocol.inbound(&certificate);
+    let inbound = protocol.inbound(&certificate, None);
     assert_eq!(inbound["type"], "vless");
     assert_eq!(inbound["xudp"], true);
-    assert!(Protocol::Vless.inbound(&certificate).get("xudp").is_none());
+    assert!(
+        Protocol::Vless
+            .inbound(&certificate, None)
+            .get("xudp")
+            .is_none()
+    );
 
     for client in ["mihomo", "sing-box", "xray"] {
         assert!(protocol.udp_supported(client));
@@ -2634,6 +2716,12 @@ async fn xray_vless_quic_authentication() -> Result<()> {
 #[ignore = "需要已校验官方客户端和执行许可"]
 async fn xray_vless_encryption_authentication() -> Result<()> {
     real_interop("xray", Protocol::VlessEncryption).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn xray_vless_reality_authentication() -> Result<()> {
+    real_interop("xray", Protocol::VlessReality).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
