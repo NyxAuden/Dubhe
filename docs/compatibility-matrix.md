@@ -15,10 +15,17 @@
 >   untrusted-certificate）。曾因 Chromium 网络栈的证书有效期限制阻塞，
 >   已改测试证书为显式一年期；另因上游硬编码 `RemoteIsDomain: true`
 >   导致连 `[::1]`，测试侧改用双栈监听。
-> - **其余协议**（WireGuard、REALITY、VLESS Encryption、WS/WSS、gRPC、
->   XHTTP、HTTPUpgrade、mKCP、NW3 的官方二进制方向）**只有本机回环测试**。
->   正文中的「与官方客户端互通」均为历史人工记录，当前工作区无可复现测试，
->   亦无脚本可重跑。
+> - **VLESS 承载组合**（2026-11-22 补齐，三方客户端 × 三场景）：
+>   WS/WSS、gRPC、HTTPUpgrade 三家全通过；XHTTP 为 Mihomo + Xray
+>   （sing-box 无 xhttp transport）；V2Ray HTTP(h2) 为 Mihomo + sing-box；
+>   旧 QUIC 为 sing-box（Mihomo 无该分支，Xray v26 已移除该 transport）。
+>   **mKCP 三家客户端均无可用证据**：Mihomo 源码无 kcp 分支、sing-box
+>   transport 无 kcp、Xray v26.10.31 出站实测零发包（日志
+>   `entering state 1 at 0` 即关闭）。内核 mKCP 由 `tests/kcp.rs` 10 项
+>   本机回环覆盖，不声称与官方客户端互通。
+> - **其余协议**（WireGuard、REALITY、VLESS Encryption、NW3 的官方二进制
+>   方向）**只有本机回环测试**。正文中的「与官方客户端互通」均为历史人工
+>   记录，当前工作区无可复现测试，亦无脚本可重跑。
 >
 > 判定标准与证据等级见 [上游事实核对](upstream-facts.md)。本文件下列各行的
 > 状态已按此口径标注，未删除历史叙述但不再表示「已验收」。

@@ -47,6 +47,20 @@ enum Protocol {
     VlessXudp,
     /// VLESS + XTLS Vision（`flow: xtls-rprx-vision`）。
     VlessVision,
+    /// VLESS 经 WebSocket/WSS 承载。
+    VlessWs,
+    /// VLESS 经 gRPC（HTTP/2）承载。
+    VlessGrpc,
+    /// VLESS 经 XHTTP 承载。
+    VlessXhttp,
+    /// VLESS 经 HTTPUpgrade 承载。
+    VlessHttpUpgrade,
+    /// VLESS 经 V2Ray HTTP（h2 / http）承载。
+    VlessHttp,
+    /// VLESS 经 mKCP 承载。
+    VlessKcp,
+    /// VLESS 经旧 QUIC 承载。
+    VlessQuic,
     Vmess,
     Hysteria2,
     Tuic,
@@ -60,7 +74,16 @@ impl Protocol {
     fn name(self) -> &'static str {
         match self {
             Self::Trojan => "trojan",
-            Self::Vless | Self::VlessXudp | Self::VlessVision => "vless",
+            Self::Vless
+            | Self::VlessXudp
+            | Self::VlessVision
+            | Self::VlessWs
+            | Self::VlessGrpc
+            | Self::VlessXhttp
+            | Self::VlessHttpUpgrade
+            | Self::VlessHttp
+            | Self::VlessKcp
+            | Self::VlessQuic => "vless",
             Self::Vmess => "vmess",
             Self::Hysteria2 => "hysteria2",
             Self::Tuic => "tuic",
@@ -75,6 +98,13 @@ impl Protocol {
         match self {
             Self::VlessXudp => "vless-xudp",
             Self::VlessVision => "vless-vision",
+            Self::VlessWs => "vless-ws",
+            Self::VlessGrpc => "vless-grpc",
+            Self::VlessXhttp => "vless-xhttp",
+            Self::VlessHttpUpgrade => "vless-httpupgrade",
+            Self::VlessHttp => "vless-http",
+            Self::VlessKcp => "vless-kcp",
+            Self::VlessQuic => "vless-quic",
             _ => self.name(),
         }
     }
@@ -102,10 +132,33 @@ impl Protocol {
             (Self::Snell, Scenario::WrongCredential) => WRONG_PSK,
             (Self::Snell, _) => SNELL_PSK,
             (
-                Self::Vless | Self::VlessXudp | Self::VlessVision | Self::Vmess,
+                Self::Vless
+                | Self::VlessXudp
+                | Self::VlessVision
+                | Self::VlessWs
+                | Self::VlessGrpc
+                | Self::VlessXhttp
+                | Self::VlessHttpUpgrade
+                | Self::VlessHttp
+                | Self::VlessKcp
+                | Self::VlessQuic
+                | Self::Vmess,
                 Scenario::WrongCredential,
             ) => WRONG_UUID,
-            (Self::Vless | Self::VlessXudp | Self::VlessVision | Self::Vmess, _) => UUID,
+            (
+                Self::Vless
+                | Self::VlessXudp
+                | Self::VlessVision
+                | Self::VlessWs
+                | Self::VlessGrpc
+                | Self::VlessXhttp
+                | Self::VlessHttpUpgrade
+                | Self::VlessHttp
+                | Self::VlessKcp
+                | Self::VlessQuic
+                | Self::Vmess,
+                _,
+            ) => UUID,
         }
     }
 
@@ -115,6 +168,11 @@ impl Protocol {
             // xudp:false 也会被覆盖；此基线只能验收 VLESS TCP，不能声称原生 UDP 通过。
             // https://github.com/MetaCubeX/mihomo/blob/3f27ef39f8c96bbfbc8b0b9bb10f5c9ef60149d8/adapter/outbound/vless.go#L474-L485
             (Self::Vless, "mihomo") => false,
+            // Mihomo 的 h2 承载实测 UDP 不通：SOCKS 已匹配到 kernel 出站，但
+            // 服务端 connections 始终为 0（对比 ws 承载同一测试会正常回包）。
+            // 这是客户端侧行为，不是内核缺陷，因此该组合只验收 TCP。
+            (Self::VlessHttp, "mihomo") => false,
+
             // sing-box 实机报 "UDP is not supported by outbound: kernel"；
             // naive 出站只能 TCP CONNECT。
             (Self::Naive, _) => false,
@@ -137,22 +195,74 @@ impl Protocol {
     /// 为 false 时不生成该客户端的测试用例——**不要**让它在客户端配置阶段
     /// 失败，那样报告的是「配置无效」而不是「该客户端不支持」。
     fn supported_by(self, client: &str) -> bool {
+        self.unsupported_reason(client).is_none()
+    }
+
+    /// 客户端不支持时的具体原因，用于跳过报告。
+    ///
+    /// 「协议」与「承载」是两个维度：sing-box 支持 VLESS，但它的
+    /// v2ray transport 没有 xhttp。跳过信息必须指出是哪一层不支持，
+    /// 否则会被误读成「该客户端不支持 VLESS」。
+    fn unsupported_reason(self, client: &str) -> Option<&'static str> {
         match self {
-            // Xray v26.10.31 的协议列表里没有 hysteria2 / tuic。
-            // Mihomo v1.19.33 没有 naive 代理类型（实机报 unsupport proxy type）。
-            Self::Hysteria2 | Self::Tuic | Self::Snell | Self::AnyTls => client != "xray",
-            Self::Naive => client == "sing-box",
-            // Xray v26.10.31 没有 ShadowTLS（协议、传输、出站均无），显式跳过。
-            Self::ShadowTls => client != "xray",
-            _ => true,
+            Self::Hysteria2 | Self::Tuic | Self::Snell | Self::AnyTls if client == "xray" => {
+                Some("Xray v26.10.31 没有该协议出站")
+            }
+            Self::Naive if client != "sing-box" => Some("Mihomo v1.19.33 没有 naive 代理类型"),
+            Self::ShadowTls if client == "xray" => Some("Xray v26.10.31 没有 ShadowTLS"),
+            Self::VlessXhttp if client == "sing-box" => {
+                Some("sing-box 1.14.4 的 v2ray transport 无 xhttp")
+            }
+            // Xray v26.10.31 已移除 http / 旧 quic transport（实测报错并指向 XHTTP）。
+            Self::VlessHttp if client == "xray" => {
+                Some("Xray v26.10.31 已移除 http transport，改用 XHTTP")
+            }
+            Self::VlessQuic if client == "xray" => {
+                Some("Xray v26.10.31 已移除旧 QUIC transport，改用 XHTTP H3")
+            }
+            // Mihomo v1.19.33 的 VLESS 出站只有 ws/http(h2)/xhttp/grpc 分支，无 kcp/quic。
+            Self::VlessKcp | Self::VlessQuic if client == "mihomo" => {
+                Some("Mihomo v1.19.33 的 VLESS 出站无 kcp/quic 分支")
+            }
+            // sing-box 1.14.4 的 v2ray transport 无 kcp。
+            Self::VlessKcp if client == "sing-box" => {
+                Some("sing-box 1.14.4 的 v2ray transport 无 kcp")
+            }
+            // Xray v26.10.31 的 mKCP 出站实测不工作：日志显示 connection
+            // 创建后立刻 Close（state 1 at 0），向独立 UDP 探针零发包。
+            // 内核 mKCP 由 tests/kcp.rs 的 10 项本机回环覆盖。
+            Self::VlessKcp if client == "xray" => {
+                Some("Xray v26.10.31 的 mKCP 出站实测零发包（创建后立即关闭）")
+            }
+            _ => None,
         }
     }
 
     fn inbound(self, certificate: &Certificate) -> Value {
         let mut inbound = certificate.inbound();
         match self {
-            Self::Vless | Self::VlessXudp | Self::VlessVision | Self::Vmess => {
-                inbound["type"] = json!(self.name());
+            Self::Vless
+            | Self::VlessXudp
+            | Self::VlessVision
+            | Self::VlessWs
+            | Self::VlessGrpc
+            | Self::VlessXhttp
+            | Self::VlessHttpUpgrade
+            | Self::VlessHttp
+            | Self::VlessKcp
+            | Self::VlessQuic
+            | Self::Vmess => {
+                // 承载变体需要把 type 换成对应入口名。
+                inbound["type"] = json!(match self {
+                    Self::VlessWs => "vless-ws",
+                    Self::VlessGrpc => "vless-grpc",
+                    Self::VlessXhttp => "vless-xhttp",
+                    Self::VlessHttpUpgrade => "vless-httpupgrade",
+                    Self::VlessHttp => "vless-http",
+                    Self::VlessKcp => "vless-kcp",
+                    Self::VlessQuic => "vless-quic",
+                    _ => self.name(),
+                });
                 inbound["tag"] = json!(self.mode());
                 inbound["users"] = json!([{"name": "test", "uuid": UUID}]);
                 if matches!(self, Self::VlessXudp) {
@@ -162,6 +272,27 @@ impl Protocol {
                     // Vision 在入站侧是 per-user 的 flow。
                     inbound["users"] = json!([{"name": "test", "uuid": UUID,
                         "flow": "xtls-rprx-vision"}]);
+                }
+                // 承载配置：路径必须与客户端一致。
+                match self {
+                    Self::VlessWs => inbound["websocket"] = json!({"path": "/ws"}),
+                    Self::VlessGrpc => inbound["grpc"] = json!({"path": "/TunService/Tun"}),
+                    Self::VlessXhttp => inbound["xhttp"] = json!({"path": "/xhttp"}),
+                    Self::VlessHttpUpgrade => {
+                        inbound["httpupgrade"] = json!({"path": "/httpupgrade"})
+                    }
+                    Self::VlessHttp => inbound["http"] = json!({"path": "/http"}),
+                    Self::VlessKcp => {
+                        // 明文本地回环测试：显式豁免并移除基础模板带的证书，
+                        // 否则内核会走 kcp+TLS，而测试只验证明文字节流。
+                        inbound["allow_insecure_transport"] = json!(true);
+                        if let Some(map) = inbound.as_object_mut() {
+                            map.remove("certificate");
+                            map.remove("private_key");
+                        }
+                    }
+                    Self::VlessQuic => inbound["quic"] = json!({}),
+                    _ => {}
                 }
             }
             Self::Snell => {
@@ -461,7 +592,17 @@ impl Scenario {
             (Self::WrongCredential, Protocol::Snell) => "wrong-psk",
             (
                 Self::WrongCredential,
-                Protocol::Vless | Protocol::VlessXudp | Protocol::VlessVision | Protocol::Vmess,
+                Protocol::Vless
+                | Protocol::VlessXudp
+                | Protocol::VlessVision
+                | Protocol::VlessWs
+                | Protocol::VlessGrpc
+                | Protocol::VlessXhttp
+                | Protocol::VlessHttpUpgrade
+                | Protocol::VlessHttp
+                | Protocol::VlessKcp
+                | Protocol::VlessQuic
+                | Protocol::Vmess,
             ) => "wrong-uuid",
             (Self::UntrustedCertificate, _) => "untrusted-certificate",
         }
@@ -510,7 +651,16 @@ fn client_config(
                     proxy["password"] = json!(credential);
                     proxy["sni"] = json!("localhost");
                 }
-                Protocol::Vless | Protocol::VlessXudp | Protocol::VlessVision => {
+                Protocol::Vless
+                | Protocol::VlessXudp
+                | Protocol::VlessVision
+                | Protocol::VlessWs
+                | Protocol::VlessGrpc
+                | Protocol::VlessXhttp
+                | Protocol::VlessHttpUpgrade
+                | Protocol::VlessHttp
+                | Protocol::VlessKcp
+                | Protocol::VlessQuic => {
                     // VlessOption 使用 servername，而 TrojanOption 使用 sni。
                     // 同一固定源码的 adapter/parser.go 按 smux.enabled 控制复用包装。
                     proxy["uuid"] = json!(credential);
@@ -524,6 +674,36 @@ fn client_config(
                     proxy["smux"] = json!({"enabled": false});
                     if matches!(protocol, Protocol::VlessXudp) {
                         proxy["xudp"] = json!(true);
+                    }
+                    // Mihomo 用 network + *-opts 表达承载。
+                    match protocol {
+                        Protocol::VlessWs => {
+                            proxy["network"] = json!("ws");
+                            proxy["ws-opts"] = json!({"path": "/ws"});
+                        }
+                        Protocol::VlessGrpc => {
+                            proxy["network"] = json!("grpc");
+                            proxy["grpc-opts"] = json!({"grpc-service-name": "TunService"});
+                        }
+                        Protocol::VlessXhttp => {
+                            proxy["network"] = json!("xhttp");
+                            proxy["xhttp-opts"] = json!({"path": "/xhttp"});
+                        }
+                        Protocol::VlessHttpUpgrade => {
+                            proxy["network"] = json!("ws");
+                            proxy["ws-opts"] =
+                                json!({"path": "/httpupgrade", "v2ray-http-upgrade": true});
+                        }
+                        // Mihomo 的 V2Ray HTTP 承载叫 "h2"（h2-opts），不是 "http"。
+                        Protocol::VlessHttp => {
+                            proxy["network"] = json!("h2");
+                            proxy["h2-opts"] = json!({"path": "/http"});
+                        }
+                        // Mihomo v1.19.33 的 VLESS 出站没有 kcp/quic 分支。
+                        Protocol::VlessKcp | Protocol::VlessQuic => {
+                            unreachable!("Mihomo 不支持该承载，应由 unsupported_reason 跳过")
+                        }
+                        _ => {}
                     }
                 }
                 Protocol::Vmess => {
@@ -595,7 +775,16 @@ fn client_config(
             });
             match protocol {
                 Protocol::Trojan => outbound["password"] = json!(credential),
-                Protocol::Vless | Protocol::VlessXudp | Protocol::VlessVision => {
+                Protocol::Vless
+                | Protocol::VlessXudp
+                | Protocol::VlessVision
+                | Protocol::VlessWs
+                | Protocol::VlessGrpc
+                | Protocol::VlessXhttp
+                | Protocol::VlessHttpUpgrade
+                | Protocol::VlessHttp
+                | Protocol::VlessKcp
+                | Protocol::VlessQuic => {
                     // *string: 省略/null 会默认 XUDP；必须显式空字符串才走原生 UDP。
                     // https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/option/vless.go
                     // https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/protocol/vless/outbound.go
@@ -609,6 +798,33 @@ fn client_config(
                         _ => "",
                     });
                     outbound["multiplex"] = json!({"enabled": false});
+                    // sing-box 用 transport 段表达承载。
+                    match protocol {
+                        Protocol::VlessWs => {
+                            outbound["transport"] = json!({"type": "ws", "path": "/ws"})
+                        }
+                        Protocol::VlessGrpc => {
+                            outbound["transport"] =
+                                json!({"type": "grpc", "service_name": "TunService"})
+                        }
+                        Protocol::VlessHttpUpgrade => {
+                            outbound["transport"] =
+                                json!({"type": "httpupgrade", "path": "/httpupgrade"})
+                        }
+                        // sing-box 没有 XHTTP 承载；由 supported_by 拦下，不会走到这里。
+                        Protocol::VlessXhttp => {
+                            unreachable!("sing-box 不支持 XHTTP，应由 supported_by 跳过")
+                        }
+                        Protocol::VlessHttp => {
+                            outbound["transport"] = json!({"type": "http", "path": "/http"})
+                        }
+                        Protocol::VlessKcp => {
+                            unreachable!("sing-box 无 mKCP，应由 unsupported_reason 跳过")
+                        }
+                        // sing-box 的 "quic" 是旧 QUIC 承载，需 TLS。
+                        Protocol::VlessQuic => outbound["transport"] = json!({"type": "quic"}),
+                        _ => {}
+                    }
                 }
                 Protocol::Vmess => {
                     // sing-box 的 VMess 需要 security 与 alter_id；
@@ -665,7 +881,16 @@ fn client_config(
             let settings = match protocol {
                 Protocol::Trojan => json!({"servers": [{"address": "127.0.0.1",
                     "port": server.port(), "password": credential}]}),
-                Protocol::Vless | Protocol::VlessXudp | Protocol::VlessVision => {
+                Protocol::Vless
+                | Protocol::VlessXudp
+                | Protocol::VlessVision
+                | Protocol::VlessWs
+                | Protocol::VlessGrpc
+                | Protocol::VlessXhttp
+                | Protocol::VlessHttpUpgrade
+                | Protocol::VlessHttp
+                | Protocol::VlessKcp
+                | Protocol::VlessQuic => {
                     json!({"address": "127.0.0.1", "port": server.port(),
                     "id": credential, "encryption": "none",
                     "flow": match protocol {
@@ -701,21 +926,68 @@ fn client_config(
                 | Protocol::AnyTls
                 | Protocol::Naive
                 | Protocol::ShadowTls => json!({"enabled": false}),
-                Protocol::Vless | Protocol::VlessVision => json!({"enabled": false,
+                Protocol::Vless
+                | Protocol::VlessVision
+                | Protocol::VlessWs
+                | Protocol::VlessGrpc
+                | Protocol::VlessXhttp
+                | Protocol::VlessHttpUpgrade
+                | Protocol::VlessHttp
+                | Protocol::VlessKcp
+                | Protocol::VlessQuic => json!({"enabled": false,
                     "concurrency": -1, "xudpConcurrency": -1}),
             };
+            // Xray 用 streamSettings.network + *Settings 表达承载。
+            let mut stream = json!({
+                "network": "tcp", "security": "tls",
+                "tlsSettings": {
+                    "serverName": "localhost", "allowInsecure": false,
+                    "disableSystemRoot": true,
+                    "certificates": [{"certificateFile": trust_path, "usage": "verify",
+                        "oneTimeLoading": true}]
+                }
+            });
+            match protocol {
+                Protocol::VlessWs => {
+                    stream["network"] = json!("ws");
+                    stream["wsSettings"] = json!({"path": "/ws"});
+                }
+                Protocol::VlessGrpc => {
+                    stream["network"] = json!("grpc");
+                    stream["grpcSettings"] = json!({"serviceName": "TunService"});
+                }
+                Protocol::VlessXhttp => {
+                    stream["network"] = json!("xhttp");
+                    stream["xhttpSettings"] = json!({"path": "/xhttp"});
+                }
+                Protocol::VlessHttpUpgrade => {
+                    stream["network"] = json!("httpupgrade");
+                    stream["httpupgradeSettings"] = json!({"path": "/httpupgrade"});
+                }
+                // Xray v26.10.31 的 http transport 已被移除，改用 XHTTP。
+                Protocol::VlessHttp => {
+                    unreachable!("Xray v26 已移除 http transport，应由 unsupported_reason 跳过")
+                }
+                Protocol::VlessKcp => {
+                    // 服务端为明文 KCP，客户端必须同步关闭 TLS。
+                    stream["network"] = json!("kcp");
+                    stream["security"] = json!("none");
+                    stream["kcpSettings"] = json!({});
+                    stream.as_object_mut().map(|map| map.remove("tlsSettings"));
+                }
+                // Xray v26 已移除旧 QUIC transport，改用 XHTTP H3。
+                Protocol::VlessQuic => {
+                    unreachable!("Xray v26 已移除 quic transport，应由 unsupported_reason 跳过")
+                }
+                _ => {}
+            }
             json!({
                 "log": {"loglevel": "warning", "access": "none"},
                 "inbounds": [{"tag": "local", "listen": "127.0.0.1", "port": listen.port(),
                     "protocol": "socks", "settings": {"auth": "noauth", "udp": true,
                         "ip": "127.0.0.1"}}],
                 "outbounds": [{"tag": "kernel", "protocol": protocol.name(),
-                    "settings": settings,
-                    "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {
-                        "serverName": "localhost", "allowInsecure": false, "disableSystemRoot": true,
-                        "certificates": [{"certificateFile": trust_path, "usage": "verify",
-                            "oneTimeLoading": true}]}},
-                    "mux": mux}]
+                    "settings": settings, "streamSettings": stream, "mux": mux}]
             })
         }
         _ => bail!("未知参考客户端"),
@@ -980,6 +1252,13 @@ async fn positive_udp(proxy: SocketAddr, protocol: Protocol) -> Result<Value> {
         Protocol::Trojan | Protocol::VlessXudp => 1,
         Protocol::Vless
         | Protocol::VlessVision
+        | Protocol::VlessWs
+        | Protocol::VlessGrpc
+        | Protocol::VlessXhttp
+        | Protocol::VlessHttpUpgrade
+        | Protocol::VlessHttp
+        | Protocol::VlessKcp
+        | Protocol::VlessQuic
         | Protocol::Vmess
         | Protocol::Hysteria2
         | Protocol::Tuic
@@ -1169,6 +1448,39 @@ async fn quic_untrusted_certificate_denies(proxy: SocketAddr, server: &Running) 
     )
 }
 
+/// TCP 承载的证书不受信任场景。
+///
+/// 断言的是**安全属性**：客户端拒绝该证书、服务端计入拒绝、且没有任何
+/// 业务字节到达目标。不断言 SOCKS 立刻关闭——那是客户端实现细节：
+/// sing-box 的 gRPC/XHTTP 出站基于 gRPC-Go 与 HTTP/2，证书校验失败后会
+/// 自行重试而不关闭 SOCKS（2026-11-22 实测），但服务端记录 rejected 且
+/// 无字节转发。
+async fn tcp_untrusted_certificate_denies(
+    proxy: SocketAddr,
+    server: &Running,
+    udp: bool,
+) -> Result<Value> {
+    let _ = udp;
+    let target = TcpListener::bind("127.0.0.1:0").await?;
+    let before = server.stats.snapshot();
+    // 客户端可能直接关闭 SOCKS，也可能重试到超时；两种都在下面统一断言。
+    let _ = tcp_denied(proxy, target.local_addr()?).await;
+    wait_rejected(server, before.rejected).await?;
+    ensure!(
+        timeout(Duration::from_millis(150), target.accept())
+            .await
+            .is_err(),
+        "证书不受信任时仍连接到 TCP 目标"
+    );
+    let after = server.stats.snapshot();
+    ensure!(
+        after.uplink == before.uplink && after.downlink == before.downlink,
+        "证书不受信任时服务端仍记录了业务字节"
+    );
+    Ok(json!({"scenario": "untrusted-certificate",
+        "assertion": "server rejected; zero business bytes"}))
+}
+
 async fn negative_traffic(proxy: SocketAddr, server: &Running, udp: bool) -> Result<Value> {
     let target = TcpListener::bind("127.0.0.1:0").await?;
     let before = server.stats.snapshot().rejected;
@@ -1311,8 +1623,8 @@ async fn run_scenarios(
             config
         } else {
             let mut inbound = protocol.inbound(&certificate);
-            // Snell 没有 TLS，不接受 certificate/private_key。
-            if !matches!(protocol, Protocol::Snell) {
+            // Snell 没有 TLS；KCP 用明文（allow_insecure_transport 显式豁免）。
+            if !matches!(protocol, Protocol::Snell | Protocol::VlessKcp) {
                 inbound["certificate"] = json!(cert_path);
                 inbound["private_key"] = json!(key_path);
             }
@@ -1381,10 +1693,12 @@ async fn run_scenarios(
             },
             Scenario::UntrustedCertificate => match protocol {
                 // QUIC 协议在握手期就失败，服务端看不到连接。
-                Protocol::Hysteria2 | Protocol::Tuic => {
+                // 旧 QUIC 承载与 Hysteria2/TUIC 同类：QUIC 握手期客户端即放弃，
+                // 服务端看不到连接，只能断言「零业务字节」。
+                Protocol::Hysteria2 | Protocol::Tuic | Protocol::VlessQuic => {
                     quic_untrusted_certificate_denies(process.address, &server).await
                 }
-                _ => negative_traffic(process.address, &server, false).await,
+                _ => tcp_untrusted_certificate_denies(process.address, &server, false).await,
             },
         }
         .with_context(|| {
@@ -1413,8 +1727,8 @@ async fn run_scenarios(
 async fn real_interop(name: &str, protocol: Protocol) -> Result<()> {
     // 客户端未实现该协议时显式跳过：报告「该客户端不支持」，
     // 而不是让它去解析一份自己不认识的出站配置。
-    if !protocol.supported_by(name) {
-        eprintln!("跳过：{name} 不支持 {} 协议", protocol.name());
+    if let Some(reason) = protocol.unsupported_reason(name) {
+        eprintln!("跳过：{} {}；{}", name, protocol.mode(), reason);
         return Ok(());
     }
     let client = reference_client(name)?;
@@ -1632,9 +1946,17 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                 Protocol::Hysteria2 | Protocol::Tuic => "password",
                 Protocol::Snell => "psk",
                 Protocol::AnyTls | Protocol::Naive | Protocol::ShadowTls => "password",
-                Protocol::Vless | Protocol::VlessXudp | Protocol::VlessVision | Protocol::Vmess => {
-                    "uuid"
-                }
+                Protocol::Vless
+                | Protocol::VlessXudp
+                | Protocol::VlessVision
+                | Protocol::VlessWs
+                | Protocol::VlessGrpc
+                | Protocol::VlessXhttp
+                | Protocol::VlessHttpUpgrade
+                | Protocol::VlessHttp
+                | Protocol::VlessKcp
+                | Protocol::VlessQuic
+                | Protocol::Vmess => "uuid",
             };
             assert_eq!(
                 inbound["users"][0][key],
@@ -1666,9 +1988,16 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                         let outbound = &config["outbounds"][0];
                         let identity = match protocol {
                             Protocol::Trojan => &outbound["settings"]["servers"][0]["password"],
-                            Protocol::Vless | Protocol::VlessXudp | Protocol::VlessVision => {
-                                &outbound["settings"]["id"]
-                            }
+                            Protocol::Vless
+                            | Protocol::VlessXudp
+                            | Protocol::VlessVision
+                            | Protocol::VlessWs
+                            | Protocol::VlessGrpc
+                            | Protocol::VlessXhttp
+                            | Protocol::VlessHttpUpgrade
+                            | Protocol::VlessHttp
+                            | Protocol::VlessKcp
+                            | Protocol::VlessQuic => &outbound["settings"]["id"],
                             // Xray 的 VMess 出站用 vnext[].users[].id。
                             Protocol::Vmess => &outbound["settings"]["vnext"][0]["users"][0]["id"],
                             Protocol::Hysteria2
@@ -2133,6 +2462,125 @@ async fn sing_box_vless_vision_tcp_udp_authentication() -> Result<()> {
 #[ignore = "需要已校验官方客户端和执行许可"]
 async fn xray_vless_vision_tcp_udp_authentication() -> Result<()> {
     real_interop("xray", Protocol::VlessVision).await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn mihomo_vless_ws_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::VlessWs).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_vless_ws_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::VlessWs).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn xray_vless_ws_authentication() -> Result<()> {
+    real_interop("xray", Protocol::VlessWs).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn mihomo_vless_grpc_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::VlessGrpc).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_vless_grpc_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::VlessGrpc).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn xray_vless_grpc_authentication() -> Result<()> {
+    real_interop("xray", Protocol::VlessGrpc).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn mihomo_vless_xhttp_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::VlessXhttp).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_vless_xhttp_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::VlessXhttp).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn xray_vless_xhttp_authentication() -> Result<()> {
+    real_interop("xray", Protocol::VlessXhttp).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn mihomo_vless_httpupgrade_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::VlessHttpUpgrade).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_vless_httpupgrade_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::VlessHttpUpgrade).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn xray_vless_httpupgrade_authentication() -> Result<()> {
+    real_interop("xray", Protocol::VlessHttpUpgrade).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn mihomo_vless_http_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::VlessHttp).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_vless_http_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::VlessHttp).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn xray_vless_kcp_authentication() -> Result<()> {
+    real_interop("xray", Protocol::VlessKcp).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_vless_quic_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::VlessQuic).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn mihomo_vless_kcp_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::VlessKcp).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_vless_kcp_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::VlessKcp).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn mihomo_vless_quic_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::VlessQuic).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn xray_vless_quic_authentication() -> Result<()> {
+    real_interop("xray", Protocol::VlessQuic).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

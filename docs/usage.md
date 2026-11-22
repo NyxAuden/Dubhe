@@ -49,15 +49,15 @@ dubhe export \
 | VLESS + WS / gRPC | ✅ | ✅ | ✅ | ✅ |
 | VLESS + HTTPUpgrade | ✅ | ✅ | ✅ | ✅ |
 | VLESS + XHTTP | ✅ | — | ✅ | ✅ |
-| VLESS + mKCP | ✅ᵈ | — | ✅ | — |
+| VLESS + mKCP | ✅ᵈ | — | —ᵍ | — |
 | VLESS + v2ray-HTTP | —ᵇ | ✅ | ✅ | — |
 | VLESS + V2Ray QUIC | —ᶜ | ✅ | — | — |
 | VMess（RAW / REALITY / WS / gRPC / HTTP） | ✅ | ✅ | ✅ | — |
-| VMess + mKCP / QUIC | ✅ᵈ | 部分 | ✅ | — |
+| VMess + mKCP / QUIC | ✅ᵈ | 部分 | —ᵍ | — |
 | Trojan（RAW / REALITY / WS / gRPC / HTTP） | ✅ | ✅ | ✅ | ✅ |
-| Trojan + mKCP / QUIC | ✅ᵈ | 部分 | ✅ | — |
+| Trojan + mKCP / QUIC | ✅ᵈ | 部分 | —ᵍ | — |
 | Shadowsocks | ✅ | ✅ | ✅ | ✅ |
-| Hysteria2（含 obfs 与带宽） | — | ✅ | ✅ | ✅ |
+| Hysteria2（含 obfs 与带宽） | ✅ᶠ | ✅ | ✅ | ✅ |
 | TUIC v5（含拥塞控制） | — | ✅ | ✅ | — |
 | AnyTLS | — | ✅ | ✅ | ✅ |
 | Snell v4/v5 | — | ✅ | ✅ | — |
@@ -70,6 +70,11 @@ dubhe export \
 ᶜ Xray v26 已移除旧 QUIC transport，官方建议改用 XHTTP/3。
 ᵈ 仅当目标是私有地址；Xray 禁止明文 VLESS/Trojan 指向公网。
 ᵉ Mihomo v1.19.33 实测拒绝 Snell v6（文档写支持 1-6，与实机不符）。
+ᶠ Xray v26.10.31 的 `hysteria` 出站用 `protocol: "hysteria"` +
+`settings.version: 2` + `streamSettings.network: "hysteria"` +
+`hysteriaSettings`，实测 `Configuration OK`。
+ᵍ Mihomo v1.19.33 的 VLESS/VMess/Trojan 出站源码只有 ws/http(h2)/xhttp/grpc
+分支，没有 kcp/quic；此前标 ✅ 是按旧版 Clash 文档写的，实测无法加载。
 
 Anywhere 输出是 AJSON 订阅文档（`anywhere: 1`），每个代理带稳定 `id`，
 客户端刷新后仍保持选中项；NW3 在 AJSON 里是 `nowhere` 协议，固定 TLS 1.3，
