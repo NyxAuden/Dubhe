@@ -37,8 +37,15 @@ mihomo、v2ray-core、tuic）的公开实践。
 ### 已完成
 
 - [x] 版本控制与线性提交历史
-- [x] CI 三平台（Linux x86_64 / Linux ARM64 / macOS ARM64）fmt + clippy + 测试 + release 构建
-- [x] `deny.toml` 无 ignore，`cargo deny` 作为独立 job
+- [x] Linux x86_64 / Linux ARM64 由 CI 实跑：fmt + clippy + 全量测试 + release 构建
+- [ ] **macOS（`macos-14`）CI job 从未真正执行**：该 job 在分配 runner 阶段
+      就被取消，`steps` 为空、`started_at` 与 `completed_at` 同秒（2026-11-22
+      核对了全部历史 run，无一次例外）。因此 macOS ARM64 的证据来自**本地
+      实跑**（fmt、clippy `-D warnings`、全量 1476 项），不是 CI。
+      修好它需要可用的 macOS runner；在拿到之前不宣称「CI 三平台」。
+- [x] `cargo deny` 作为独立 job；`deny.toml` 现有 1 条带理由的 ignore
+      （RUSTSEC-2026-0542 humantime，实测该版本零依赖，公告前提不成立），
+      其余许可证/来源/重复项均为强制门禁
 - [x] Clippy `-D warnings` 清零
 - [x] SBOM 本地生成（CycloneDX）
 - [x] 可复现构建记录（macOS ARM64 双目录比对）
