@@ -45,6 +45,8 @@ enum Protocol {
     Trojan,
     Vless,
     VlessXudp,
+    /// VLESS + XTLS Vision（`flow: xtls-rprx-vision`）。
+    VlessVision,
     Vmess,
     Hysteria2,
     Tuic,
@@ -58,7 +60,7 @@ impl Protocol {
     fn name(self) -> &'static str {
         match self {
             Self::Trojan => "trojan",
-            Self::Vless | Self::VlessXudp => "vless",
+            Self::Vless | Self::VlessXudp | Self::VlessVision => "vless",
             Self::Vmess => "vmess",
             Self::Hysteria2 => "hysteria2",
             Self::Tuic => "tuic",
@@ -72,6 +74,7 @@ impl Protocol {
     fn mode(self) -> &'static str {
         match self {
             Self::VlessXudp => "vless-xudp",
+            Self::VlessVision => "vless-vision",
             _ => self.name(),
         }
     }
@@ -98,8 +101,11 @@ impl Protocol {
             ) => PASSWORD,
             (Self::Snell, Scenario::WrongCredential) => WRONG_PSK,
             (Self::Snell, _) => SNELL_PSK,
-            (Self::Vless | Self::VlessXudp | Self::Vmess, Scenario::WrongCredential) => WRONG_UUID,
-            (Self::Vless | Self::VlessXudp | Self::Vmess, _) => UUID,
+            (
+                Self::Vless | Self::VlessXudp | Self::VlessVision | Self::Vmess,
+                Scenario::WrongCredential,
+            ) => WRONG_UUID,
+            (Self::Vless | Self::VlessXudp | Self::VlessVision | Self::Vmess, _) => UUID,
         }
     }
 
@@ -145,12 +151,17 @@ impl Protocol {
     fn inbound(self, certificate: &Certificate) -> Value {
         let mut inbound = certificate.inbound();
         match self {
-            Self::Vless | Self::VlessXudp | Self::Vmess => {
+            Self::Vless | Self::VlessXudp | Self::VlessVision | Self::Vmess => {
                 inbound["type"] = json!(self.name());
                 inbound["tag"] = json!(self.mode());
                 inbound["users"] = json!([{"name": "test", "uuid": UUID}]);
                 if matches!(self, Self::VlessXudp) {
                     inbound["xudp"] = json!(true);
+                }
+                if matches!(self, Self::VlessVision) {
+                    // Vision 在入站侧是 per-user 的 flow。
+                    inbound["users"] = json!([{"name": "test", "uuid": UUID,
+                        "flow": "xtls-rprx-vision"}]);
                 }
             }
             Self::Snell => {
@@ -448,9 +459,10 @@ impl Scenario {
                 | Protocol::ShadowTls,
             ) => "wrong-password",
             (Self::WrongCredential, Protocol::Snell) => "wrong-psk",
-            (Self::WrongCredential, Protocol::Vless | Protocol::VlessXudp | Protocol::Vmess) => {
-                "wrong-uuid"
-            }
+            (
+                Self::WrongCredential,
+                Protocol::Vless | Protocol::VlessXudp | Protocol::VlessVision | Protocol::Vmess,
+            ) => "wrong-uuid",
             (Self::UntrustedCertificate, _) => "untrusted-certificate",
         }
     }
@@ -498,11 +510,15 @@ fn client_config(
                     proxy["password"] = json!(credential);
                     proxy["sni"] = json!("localhost");
                 }
-                Protocol::Vless | Protocol::VlessXudp => {
+                Protocol::Vless | Protocol::VlessXudp | Protocol::VlessVision => {
                     // VlessOption 使用 servername，而 TrojanOption 使用 sni。
                     // 同一固定源码的 adapter/parser.go 按 smux.enabled 控制复用包装。
                     proxy["uuid"] = json!(credential);
-                    proxy["flow"] = json!("");
+                    // Vision 必须显式声明 flow；空串是普通 VLESS。
+                    proxy["flow"] = json!(match protocol {
+                        Protocol::VlessVision => "xtls-rprx-vision",
+                        _ => "",
+                    });
                     proxy["tls"] = json!(true);
                     proxy["servername"] = json!("localhost");
                     proxy["smux"] = json!({"enabled": false});
@@ -579,12 +595,15 @@ fn client_config(
             });
             match protocol {
                 Protocol::Trojan => outbound["password"] = json!(credential),
-                Protocol::Vless | Protocol::VlessXudp => {
+                Protocol::Vless | Protocol::VlessXudp | Protocol::VlessVision => {
                     // *string: 省略/null 会默认 XUDP；必须显式空字符串才走原生 UDP。
                     // https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/option/vless.go
                     // https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/protocol/vless/outbound.go
                     outbound["uuid"] = json!(credential);
-                    outbound["flow"] = json!("");
+                    outbound["flow"] = json!(match protocol {
+                        Protocol::VlessVision => "xtls-rprx-vision",
+                        _ => "",
+                    });
                     outbound["packet_encoding"] = json!(match protocol {
                         Protocol::VlessXudp => "xudp",
                         _ => "",
@@ -646,9 +665,13 @@ fn client_config(
             let settings = match protocol {
                 Protocol::Trojan => json!({"servers": [{"address": "127.0.0.1",
                     "port": server.port(), "password": credential}]}),
-                Protocol::Vless | Protocol::VlessXudp => {
+                Protocol::Vless | Protocol::VlessXudp | Protocol::VlessVision => {
                     json!({"address": "127.0.0.1", "port": server.port(),
-                    "id": credential, "flow": "", "encryption": "none"})
+                    "id": credential, "encryption": "none",
+                    "flow": match protocol {
+                        Protocol::VlessVision => "xtls-rprx-vision",
+                        _ => "",
+                    }})
                 }
                 Protocol::Vmess => {
                     // Xray 的 VMess 出站用 vnext/servers 形状，且 security 必填
@@ -678,8 +701,8 @@ fn client_config(
                 | Protocol::AnyTls
                 | Protocol::Naive
                 | Protocol::ShadowTls => json!({"enabled": false}),
-                Protocol::Vless => json!({"enabled": false, "concurrency": -1,
-                    "xudpConcurrency": -1}),
+                Protocol::Vless | Protocol::VlessVision => json!({"enabled": false,
+                    "concurrency": -1, "xudpConcurrency": -1}),
             };
             json!({
                 "log": {"loglevel": "warning", "access": "none"},
@@ -956,6 +979,7 @@ async fn positive_udp(proxy: SocketAddr, protocol: Protocol) -> Result<Value> {
     let association_count = match protocol {
         Protocol::Trojan | Protocol::VlessXudp => 1,
         Protocol::Vless
+        | Protocol::VlessVision
         | Protocol::Vmess
         | Protocol::Hysteria2
         | Protocol::Tuic
@@ -1608,7 +1632,9 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                 Protocol::Hysteria2 | Protocol::Tuic => "password",
                 Protocol::Snell => "psk",
                 Protocol::AnyTls | Protocol::Naive | Protocol::ShadowTls => "password",
-                Protocol::Vless | Protocol::VlessXudp | Protocol::Vmess => "uuid",
+                Protocol::Vless | Protocol::VlessXudp | Protocol::VlessVision | Protocol::Vmess => {
+                    "uuid"
+                }
             };
             assert_eq!(
                 inbound["users"][0][key],
@@ -1640,7 +1666,9 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                         let outbound = &config["outbounds"][0];
                         let identity = match protocol {
                             Protocol::Trojan => &outbound["settings"]["servers"][0]["password"],
-                            Protocol::Vless | Protocol::VlessXudp => &outbound["settings"]["id"],
+                            Protocol::Vless | Protocol::VlessXudp | Protocol::VlessVision => {
+                                &outbound["settings"]["id"]
+                            }
                             // Xray 的 VMess 出站用 vnext[].users[].id。
                             Protocol::Vmess => &outbound["settings"]["vnext"][0]["users"][0]["id"],
                             Protocol::Hysteria2
@@ -2087,6 +2115,24 @@ async fn sing_box_vless_tcp_udp_authentication() -> Result<()> {
 #[ignore = "需要已校验官方客户端和执行许可"]
 async fn xray_vless_tcp_udp_authentication() -> Result<()> {
     real_interop("xray", Protocol::Vless).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn mihomo_vless_vision_tcp_udp_authentication() -> Result<()> {
+    real_interop("mihomo", Protocol::VlessVision).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn sing_box_vless_vision_tcp_udp_authentication() -> Result<()> {
+    real_interop("sing-box", Protocol::VlessVision).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn xray_vless_vision_tcp_udp_authentication() -> Result<()> {
+    real_interop("xray", Protocol::VlessVision).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
