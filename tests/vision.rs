@@ -128,7 +128,13 @@ async fn vision_example_checks_starts_and_transfers_after_placeholder_replacemen
         .arg(&path)
         .output()
         .unwrap();
-    assert!(checked.status.success());
+    // 断言必须带上 stderr：静默失败会让人误以为是并发/资源问题。
+    assert!(
+        checked.status.success(),
+        "dubhe check 失败（exit {:?}）：{}",
+        checked.status.code(),
+        String::from_utf8_lossy(&checked.stderr)
+    );
     let server = Running::start(value).await;
     let echo = Echo::tcp("127.0.0.1", false).await;
     let mut s = connect(&cert, server.address, true).await;

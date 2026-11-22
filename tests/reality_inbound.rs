@@ -167,7 +167,12 @@ async fn example_placeholder_replacement_real_check_start_and_vision_data() {
         .arg(file)
         .output()
         .unwrap();
-    assert!(checked.status.success());
+    assert!(
+        checked.status.success(),
+        "dubhe check 失败（exit {:?}）：{}",
+        checked.status.code(),
+        String::from_utf8_lossy(&checked.stderr)
+    );
     let server = Running::start(value).await;
     let echo = Echo::tcp("127.0.0.1", false).await;
     let mut c = PreparedClient::new(Default::default())
