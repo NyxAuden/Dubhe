@@ -170,7 +170,9 @@ async fn short_writes_and_pending_accept_each_business_byte_once_with_fixed_segm
         let written = io.output.clone();
         let mut socket = WebSocket::new(io, vec![], vec![]).await;
         let data: Vec<u8> = (0..80_019).map(|n| (n % 251) as u8).collect();
-        tokio::time::timeout(Duration::from_secs(3), async {
+        // 8 万字节按 1/7/17 字节分片写入，单核争抢时 3 秒不够；
+        // 放宽到 15 秒只影响失败等待时间，不改变断言语义。
+        tokio::time::timeout(Duration::from_secs(15), async {
             socket.write_all(&data).await.unwrap();
             socket.flush().await.unwrap();
         })

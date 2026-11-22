@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_dubhe");
-const WAIT: Duration = Duration::from_secs(5);
+// CLI 子进程启动 + 证书轮换在 2 核 CI runner 上可能超过 5 秒；
+// 这里是等待上限，不是性能断言，放宽不放松正确性要求。
+const WAIT: Duration = Duration::from_secs(20);
 const CONFIG_PASSWORD: &str = "configured-password-do-not-log-317";
 
 struct CliProcess {
