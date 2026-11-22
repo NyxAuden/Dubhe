@@ -114,8 +114,12 @@ Xray 输出按 v26 结构生成：
 - TUIC 的 `alpn` 非空时按 sing-box `tls.alpn`、Mihomo 顶层 `alpn` 导出；
   服务端配置后客户端必须发送其一，不导出会握手失败。
 - 目标格式不支持的协议会写进 stderr 报告并跳过，不生成半可用配置。
-- VLESS Encryption（`decryption` 非 `none`）跳过并报告：客户端 `encryption`
-  公钥与它成对生成，无法从服务端私钥推导，需用 `xray vlessenc` 另生成后手工填写。
+- VLESS Encryption（`decryption` 非 `none`）的客户端 `encryption` 由服务端配置
+  **现场派生**：X25519 私钥 → 公钥是标量乘；ML-KEM-768 种子 → 封装公钥是确定性
+  展开。`mode` 与 `padding` 原样保留，`time` 按服务端是否启用票据改写为
+  `0rtt`/`1rtt`。四目标（Xray / sing-box / Mihomo / Anywhere）都会写入。
+  已用 `xray vlessenc` + `xray x25519 -i` 的官方输出逐字节核对推导结果，
+  并用官方 Xray v26.10.31 客户端实连完成双向回显。
 - `socks5`/`http`/`mixed`/`dokodemo-door` 是本地或透明入口，`wireguard` 的客户端
   需要客户端自己的私钥，`shadowtls` 需与内层协议组合成两条出站；这六类都会按名字
   报告「不可导出」，不会静默消失。

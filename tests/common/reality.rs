@@ -823,8 +823,24 @@ pub enum TargetBehavior {
     /// 读入 CH 后不输出，用于绝对期限/取消测试。
     Silent,
 }
+/// target 证书的签名算法。
+///
+/// 这不是可选美学：官方 Xray 客户端用 uTLS 的 Chrome fingerprint，其
+/// `signature_algorithms` 扩展只声明 ECDSA/RSA 系列，不含 Ed25519。
+/// 用 Ed25519 证书做 target 会让 rustls 找不到共同签名算法，客户端拿到
+/// `UnexpectedEof`（2026-11-22 实测）。本机回环测试默认 Ed25519 保持不变，
+/// 官方客户端互通用例必须显式选 EcdsaP256。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TargetCertAlg {
+    #[default]
+    Ed25519,
+    EcdsaP256,
+}
+
 pub struct TargetOptions {
     pub group: TargetGroup,
+    /// target 证书签名算法；官方客户端互通必须用 EcdsaP256。
+    pub cert_alg: TargetCertAlg,
     /// rcgen 自定义非关键扩展的真实字节，扩大标准 TLS 聚合 flight，不使用 REALITY hook。
     pub certificate_padding: usize,
     /// target 支持的 ALPN；REALITY 的 SH 模板会携带该选择。
@@ -835,6 +851,7 @@ impl Default for TargetOptions {
     fn default() -> Self {
         Self {
             group: TargetGroup::X25519,
+            cert_alg: TargetCertAlg::Ed25519,
             certificate_padding: 8192,
             alpn: Vec::new(),
             behavior: TargetBehavior::Echo,
@@ -868,7 +885,13 @@ pub struct TargetPeer {
 impl TargetPeer {
     pub async fn start(options: TargetOptions) -> Result<Self> {
         ensure!(options.certificate_padding <= 12000, "测试 target 证书上限");
-        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)?;
+        let key = match options.cert_alg {
+            TargetCertAlg::Ed25519 => rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)?,
+            // 官方客户端的 signature_algorithms 只含 ECDSA/RSA。
+            TargetCertAlg::EcdsaP256 => {
+                rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?
+            }
+        };
         let mut params = rcgen::CertificateParams::new(vec!["localhost".into()])?;
         if options.certificate_padding > 0 {
             params

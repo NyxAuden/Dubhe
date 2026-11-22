@@ -24,6 +24,8 @@ pub struct Node {
     pub security: Security,
     pub transport: Transport,
     pub credential: Credential,
+    /// VLESS Encryption 的客户端 `encryption` 串；由服务端 `decryption` 推导。
+    pub vless_encryption: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,25 +276,22 @@ fn port_of(address: &SocketAddr) -> u16 {
     address.port()
 }
 
-/// VLESS Encryption 的客户端公钥与 `decryption` 是成对生成的两套材料，
-/// 无法从服务端私钥推导；导出明文 VLESS 会连不上，因此直接拒绝。
-fn ensure_plain_vless(decryption: &Option<String>) -> Result<()> {
+/// 由服务端 `decryption` 推导客户端 `encryption`。
+///
+/// 两侧是同一密钥对的两半：X25519 私钥 → 公钥是标量乘，ML-KEM-768 种子 →
+/// 封装公钥是确定性展开。因此导出不需要用户再跑一次 `xray vlessenc`。
+/// 2026-11-22 用 `xray v25519 -i` / `xray mlkem768 -i` 的官方输出逐字节核对过。
+fn vless_encryption_of(decryption: &Option<String>) -> Result<Option<String>> {
     let Some(value) = decryption.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
-    // 显式写 "none" 等同于未启用。
-    if crate::config::vless_encryption::parse(value)?.is_some() {
-        anyhow::bail!(
-            "VLESS Encryption 需客户端 encryption 公钥，无法从服务端 decryption 推导；请用 `xray vlessenc` 生成后手工填写"
-        );
-    }
-    Ok(())
+    crate::config::vless_encryption::client_from_decryption(value)
 }
 
 fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
     let tag = inbound.tag().to_owned();
     let port = port_of(&inbound.listen());
-    let base = |protocol, security, transport, credential| Node {
+    let base = |protocol, security, transport, credential, vless_encryption: Option<String>| Node {
         tag: tag.clone(),
         host: host.to_owned(),
         port,
@@ -300,13 +299,14 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
         security,
         transport,
         credential,
+        vless_encryption,
     };
 
     let node = match inbound {
         Inbound::VlessKcp {
             users, decryption, ..
         } => {
-            ensure_plain_vless(decryption)?;
+            let vless_encryption = vless_encryption_of(decryption)?;
             let Some(user) = users.first() else {
                 return Ok(None);
             };
@@ -318,6 +318,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                vless_encryption,
             )
         }
         Inbound::VmessKcp { users, .. } => {
@@ -332,6 +333,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                None,
             )
         }
         Inbound::TrojanKcp { users, .. } => {
@@ -345,6 +347,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 Credential::Password {
                     password: user.password.clone(),
                 },
+                None,
             )
         }
         Inbound::Vless {
@@ -353,7 +356,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
             certificate,
             ..
         } => {
-            ensure_plain_vless(decryption)?;
+            let vless_encryption = vless_encryption_of(decryption)?;
             let Some(user) = users.first() else {
                 return Ok(None);
             };
@@ -365,6 +368,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: flow(&user.flow),
                 },
+                vless_encryption,
             )
         }
         Inbound::VlessReality {
@@ -373,7 +377,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
             reality,
             ..
         } => {
-            ensure_plain_vless(decryption)?;
+            let vless_encryption = vless_encryption_of(decryption)?;
             let Some(user) = users.first() else {
                 return Ok(None);
             };
@@ -385,6 +389,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: flow(&user.flow),
                 },
+                vless_encryption,
             )
         }
         Inbound::VlessWs {
@@ -395,7 +400,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
             certificate,
             ..
         } => {
-            ensure_plain_vless(decryption)?;
+            let vless_encryption = vless_encryption_of(decryption)?;
             let Some(user) = users.first() else {
                 return Ok(None);
             };
@@ -410,6 +415,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                vless_encryption,
             )
         }
         Inbound::VlessGrpc {
@@ -420,7 +426,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
             certificate,
             ..
         } => {
-            ensure_plain_vless(decryption)?;
+            let vless_encryption = vless_encryption_of(decryption)?;
             let Some(user) = users.first() else {
                 return Ok(None);
             };
@@ -435,6 +441,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                vless_encryption,
             )
         }
         Inbound::VlessXhttp {
@@ -445,7 +452,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
             certificate,
             ..
         } => {
-            ensure_plain_vless(decryption)?;
+            let vless_encryption = vless_encryption_of(decryption)?;
             let Some(user) = users.first() else {
                 return Ok(None);
             };
@@ -461,6 +468,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                vless_encryption,
             )
         }
         Inbound::VlessHttpUpgrade {
@@ -471,7 +479,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
             certificate,
             ..
         } => {
-            ensure_plain_vless(decryption)?;
+            let vless_encryption = vless_encryption_of(decryption)?;
             let Some(user) = users.first() else {
                 return Ok(None);
             };
@@ -486,6 +494,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                vless_encryption,
             )
         }
         Inbound::Vmess {
@@ -502,6 +511,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                None,
             )
         }
         Inbound::VmessWs {
@@ -525,6 +535,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                None,
             )
         }
         Inbound::VmessGrpc {
@@ -548,6 +559,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                None,
             )
         }
         Inbound::VmessXhttp {
@@ -572,6 +584,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                None,
             )
         }
         Inbound::VmessHttpUpgrade {
@@ -595,6 +608,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                None,
             )
         }
         Inbound::Trojan { users, .. } => {
@@ -608,6 +622,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 Credential::Password {
                     password: user.password.clone(),
                 },
+                None,
             )
         }
         Inbound::TrojanReality { users, reality, .. } => {
@@ -621,6 +636,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 Credential::Password {
                     password: user.password.clone(),
                 },
+                None,
             )
         }
         Inbound::TrojanWs {
@@ -643,6 +659,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 Credential::Password {
                     password: user.password.clone(),
                 },
+                None,
             )
         }
         Inbound::Shadowsocks {
@@ -655,6 +672,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 method: method_name(*method),
                 password: password.0.clone(),
             },
+            None,
         ),
         Inbound::Hysteria2 {
             users,
@@ -685,6 +703,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                         max_packet_size: obfs.max_packet_size,
                     }),
                 },
+                None,
             )
         }
         Inbound::Tuic {
@@ -706,6 +725,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     congestion_control: congestion_control.clone(),
                     alpn: alpn.clone(),
                 },
+                None,
             )
         }
         Inbound::AnyTls { users, .. } => {
@@ -719,6 +739,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 Credential::Password {
                     password: user.password.clone(),
                 },
+                None,
             )
         }
         Inbound::Snell {
@@ -740,6 +761,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 mode: mode.clone(),
                 obfs_mode: obfs_mode.clone(),
             },
+            None,
         ),
         Inbound::VlessHttp {
             users,
@@ -748,7 +770,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
             certificate,
             ..
         } => {
-            ensure_plain_vless(decryption)?;
+            let vless_encryption = vless_encryption_of(decryption)?;
             let Some(user) = users.first() else {
                 return Ok(None);
             };
@@ -763,6 +785,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                vless_encryption,
             )
         }
         Inbound::VmessHttp {
@@ -785,6 +808,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                None,
             )
         }
         Inbound::TrojanHttp {
@@ -806,6 +830,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 Credential::Password {
                     password: user.password.clone(),
                 },
+                None,
             )
         }
         Inbound::VlessQuic {
@@ -814,7 +839,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
             certificate,
             ..
         } => {
-            ensure_plain_vless(decryption)?;
+            let vless_encryption = vless_encryption_of(decryption)?;
             let Some(user) = users.first() else {
                 return Ok(None);
             };
@@ -826,6 +851,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                vless_encryption,
             )
         }
         Inbound::VmessQuic {
@@ -842,6 +868,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                None,
             )
         }
         Inbound::TrojanQuic {
@@ -857,6 +884,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 Credential::Password {
                     password: user.password.clone(),
                 },
+                None,
             )
         }
         Inbound::Naive {
@@ -878,6 +906,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     username: user.name.clone(),
                     password: user.password.clone(),
                 },
+                None,
             )
         }
         Inbound::Nw3 {
@@ -902,6 +931,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 key: key.clone(),
                 morph: *morph,
             },
+            None,
         ),
         Inbound::VmessReality { users, reality, .. } => {
             let Some(user) = users.first() else {
@@ -915,6 +945,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                     uuid: user.uuid.clone(),
                     flow: None,
                 },
+                None,
             )
         }
         Inbound::TrojanGrpc {
@@ -937,6 +968,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 Credential::Password {
                     password: user.password.clone(),
                 },
+                None,
             )
         }
         Inbound::TrojanHttpUpgrade {
@@ -959,6 +991,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 Credential::Password {
                     password: user.password.clone(),
                 },
+                None,
             )
         }
         Inbound::TrojanXhttp {
@@ -982,6 +1015,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 Credential::Password {
                     password: user.password.clone(),
                 },
+                None,
             )
         }
         // 本地代理入口：用户连的是本机端口，导出成远端节点没有意义。
@@ -1220,6 +1254,11 @@ fn xray_outbound(node: &Node) -> std::result::Result<Value, String> {
             if let Some(flow) = flow {
                 settings["flow"] = json!(flow);
             }
+            // 由服务端 decryption 推导出的客户端 encryption；
+            // 未启用时保持上面的 "none"。
+            if let Some(encryption) = &node.vless_encryption {
+                settings["encryption"] = json!(encryption);
+            }
             out.insert("settings".into(), settings);
         }
         (Protocol::Vmess, Credential::Uuid { uuid, .. }) => {
@@ -1344,6 +1383,9 @@ fn sing_box_outbound(node: &Node) -> std::result::Result<Value, String> {
             out.insert("uuid".into(), json!(uuid));
             if let Some(flow) = flow {
                 out.insert("flow".into(), json!(flow));
+            }
+            if let Some(encryption) = &node.vless_encryption {
+                out.insert("encryption".into(), json!(encryption));
             }
         }
         (Protocol::Vmess, Credential::Uuid { uuid, .. }) => {
@@ -1563,6 +1605,9 @@ fn mihomo_proxy(node: &Node) -> std::result::Result<Value, String> {
             out.insert("uuid".into(), json!(uuid));
             if let Some(flow) = flow {
                 out.insert("flow".into(), json!(flow));
+            }
+            if let Some(encryption) = &node.vless_encryption {
+                out.insert("encryption".into(), json!(encryption));
             }
         }
         (Protocol::Vmess, Credential::Uuid { uuid, .. }) => {
@@ -1787,6 +1832,9 @@ fn anywhere_proxy(node: &Node, index: usize) -> std::result::Result<Value, Strin
             out.insert("uuid".into(), json!(uuid));
             if let Some(flow) = flow {
                 out.insert("flow".into(), json!(flow));
+            }
+            if let Some(encryption) = &node.vless_encryption {
+                out.insert("encryption".into(), json!(encryption));
             }
         }
         (Protocol::Trojan, Credential::Password { password }) => {
@@ -2413,6 +2461,7 @@ mod xray_shape_tests {
                 uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
                 flow: None,
             },
+            vless_encryption: None,
         };
         let mut report = ExportReport::default();
         let value = export(Target::Xray, std::slice::from_ref(&node), &mut report).unwrap();
@@ -2982,7 +3031,7 @@ mod unrepresentable_field_tests {
     }
 
     #[test]
-    fn vless_encryption_is_skipped_because_the_client_key_cannot_be_derived() {
+    fn vless_encryption_is_derived_into_all_targets() {
         let config = build(json!([
             {"type": "vless", "tag": "enc", "listen": "0.0.0.0:443",
              "users": [{"name": "a", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
@@ -2997,15 +3046,56 @@ mod unrepresentable_field_tests {
         let mut report = ExportReport::default();
         let nodes = nodes(&config, "example.com", &mut report);
         let tags: Vec<&str> = nodes.iter().map(|node| node.tag.as_str()).collect();
-        assert_eq!(tags, ["plain"]);
+        // 两个节点都必须导出：服务端 decryption 可以推导出客户端 encryption。
+        assert_eq!(tags, ["enc", "plain"], "{:?}", report.notes);
+
+        let enc = nodes.iter().find(|node| node.tag == "enc").unwrap();
+        let encryption = enc
+            .vless_encryption
+            .as_deref()
+            .expect("必须推导出 encryption");
+        // time 语义不同：服务端 600s（有票据）→ 客户端 0rtt。
         assert!(
-            report
-                .notes
-                .iter()
-                .any(|note| note.contains("enc") && note.contains("VLESS Encryption")),
-            "{:?}",
-            report.notes
+            encryption.starts_with("mlkem768x25519plus.native.0rtt."),
+            "{encryption}"
         );
+        // 推导出的公钥不能与私钥相同（那不是公钥）。
+        assert!(!encryption.contains("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"));
+
+        // 明文节点的 encryption 必须保持 None（导出时写 "none"）。
+        let plain = nodes.iter().find(|node| node.tag == "plain").unwrap();
+        assert!(plain.vless_encryption.is_none());
+
+        // 三个能表达该字段的目标都要写进去。
+        let xray = export(
+            Target::Xray,
+            std::slice::from_ref(enc),
+            &mut ExportReport::default(),
+        )
+        .unwrap();
+        // outbounds[0] 是 direct，节点从 [1] 开始。
+        assert_eq!(xray["outbounds"][1]["settings"]["encryption"], encryption);
+        let sing = export(
+            Target::SingBox,
+            std::slice::from_ref(enc),
+            &mut ExportReport::default(),
+        )
+        .unwrap();
+        assert_eq!(sing["outbounds"][1]["encryption"], encryption);
+        let mihomo = export(
+            Target::Mihomo,
+            std::slice::from_ref(enc),
+            &mut ExportReport::default(),
+        )
+        .unwrap();
+        assert_eq!(mihomo["proxies"][0]["encryption"], encryption);
+        let anywhere = export(
+            Target::Anywhere,
+            std::slice::from_ref(enc),
+            &mut ExportReport::default(),
+        )
+        .unwrap();
+        assert_eq!(anywhere["proxies"][0]["encryption"], encryption);
     }
 
     #[test]

@@ -23,7 +23,12 @@
 >   transport 无 kcp、Xray v26.10.31 出站实测零发包（日志
 >   `entering state 1 at 0` 即关闭）。内核 mKCP 由 `tests/kcp.rs` 10 项
 >   本机回环覆盖，不声称与官方客户端互通。
-> - **其余协议**（WireGuard、REALITY、VLESS Encryption、NW3 的官方二进制
+> - **VLESS Encryption**（2026-11-22）：Xray v26.10.31 客户端三场景通过
+>   （valid / wrong-uuid / untrusted-certificate）。密钥不再需要手工填——
+>   服务端 `decryption` 可确定性推导客户端 `encryption`（X25519 标量乘、
+>   ML-KEM-768 种子展开），已用 `xray vlessenc` + `xray x25519 -i` 官方输出
+>   逐字节核对。sing-box/Mihomo 的 VLESS 出站无该字段，用例显式跳过。
+> - **其余协议**（WireGuard、REALITY、NW3 的官方二进制
 >   方向）**只有本机回环测试**。正文中的「与官方客户端互通」均为历史人工
 >   记录，当前工作区无可复现测试，亦无脚本可重跑。
 >

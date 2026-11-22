@@ -33,6 +33,15 @@ const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 const SNELL_PSK: &str = "snell-reference-test-psk";
 const WRONG_PSK: &str = "deliberately-wrong-snell-psk";
 const WRONG_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30812";
+/// VLESS Encryption 的固定密钥对，由 `xray vlessenc` 生成后固化。
+///
+/// 两半是同一密钥对：服务端持有 `decryption`（私钥），客户端需要
+/// `encryption`（公钥）。公钥由私钥确定性推导，见
+/// `xray x25519 -i "<private>"`（2026-11-22 逐字节核对）。
+const VLESS_ENCRYPTION_PRIVATE: &str = "-DqEf18Ai3PxV9ZMJToAvlwY2XMlcMYlJItT-8oQBWg";
+/// 服务端 `decryption`：启用 600s 票据，因此客户端用 `0rtt`。
+const VLESS_ENCRYPTION_CLIENT: &str =
+    "mlkem768x25519plus.native.0rtt.MvcuFHxUUqUmO0_v_XgyVRuQDNZtWvoroqUfEaBZCy0";
 /// ShadowTLS 只是 TLS 伪装层，必须叠加内层协议；这里固定内层为
 /// Shadowsocks 2022（两家参考客户端都支持，且与 Mihomo `ss + shadow-tls`
 /// 插件的常规形态一致）。密码是 16 字节 0x5a 的标准 Base64。
@@ -61,6 +70,8 @@ enum Protocol {
     VlessKcp,
     /// VLESS 经旧 QUIC 承载。
     VlessQuic,
+    /// VLESS Encryption（`mlkem768x25519plus`）。
+    VlessEncryption,
     Vmess,
     Hysteria2,
     Tuic,
@@ -83,7 +94,8 @@ impl Protocol {
             | Self::VlessHttpUpgrade
             | Self::VlessHttp
             | Self::VlessKcp
-            | Self::VlessQuic => "vless",
+            | Self::VlessQuic
+            | Self::VlessEncryption => "vless",
             Self::Vmess => "vmess",
             Self::Hysteria2 => "hysteria2",
             Self::Tuic => "tuic",
@@ -105,6 +117,7 @@ impl Protocol {
             Self::VlessHttp => "vless-http",
             Self::VlessKcp => "vless-kcp",
             Self::VlessQuic => "vless-quic",
+            Self::VlessEncryption => "vless-encryption",
             _ => self.name(),
         }
     }
@@ -142,6 +155,7 @@ impl Protocol {
                 | Self::VlessHttp
                 | Self::VlessKcp
                 | Self::VlessQuic
+                | Self::VlessEncryption
                 | Self::Vmess,
                 Scenario::WrongCredential,
             ) => WRONG_UUID,
@@ -156,6 +170,7 @@ impl Protocol {
                 | Self::VlessHttp
                 | Self::VlessKcp
                 | Self::VlessQuic
+                | Self::VlessEncryption
                 | Self::Vmess,
                 _,
             ) => UUID,
@@ -228,6 +243,12 @@ impl Protocol {
             Self::VlessKcp if client == "sing-box" => {
                 Some("sing-box 1.14.4 的 v2ray transport 无 kcp")
             }
+            // sing-box 与 Mihomo 的 VLESS 出站没有 encryption 字段的实现
+            // （sing-box option/vless.go 无该字段；Mihomo VlessOption 无该字段），
+            // 写进去会让客户端拒绝加载或忽略，因此只对 Xray 生成用例。
+            Self::VlessEncryption if client != "xray" => {
+                Some("只有 Xray 的 VLESS 出站支持 encryption 字段")
+            }
             // Xray v26.10.31 的 mKCP 出站实测不工作：日志显示 connection
             // 创建后立刻 Close（state 1 at 0），向独立 UDP 探针零发包。
             // 内核 mKCP 由 tests/kcp.rs 的 10 项本机回环覆盖。
@@ -251,6 +272,7 @@ impl Protocol {
             | Self::VlessHttp
             | Self::VlessKcp
             | Self::VlessQuic
+            | Self::VlessEncryption
             | Self::Vmess => {
                 // 承载变体需要把 type 换成对应入口名。
                 inbound["type"] = json!(match self {
@@ -261,10 +283,17 @@ impl Protocol {
                     Self::VlessHttp => "vless-http",
                     Self::VlessKcp => "vless-kcp",
                     Self::VlessQuic => "vless-quic",
+                    Self::VlessEncryption => "vless",
                     _ => self.name(),
                 });
                 inbound["tag"] = json!(self.mode());
                 inbound["users"] = json!([{"name": "test", "uuid": UUID}]);
+                if matches!(self, Self::VlessEncryption) {
+                    // 服务端持有私钥；客户端公钥由它确定性推导。
+                    inbound["decryption"] = json!(format!(
+                        "mlkem768x25519plus.native.600s.{VLESS_ENCRYPTION_PRIVATE}"
+                    ));
+                }
                 if matches!(self, Self::VlessXudp) {
                     inbound["xudp"] = json!(true);
                 }
@@ -602,6 +631,7 @@ impl Scenario {
                 | Protocol::VlessHttp
                 | Protocol::VlessKcp
                 | Protocol::VlessQuic
+                | Protocol::VlessEncryption
                 | Protocol::Vmess,
             ) => "wrong-uuid",
             (Self::UntrustedCertificate, _) => "untrusted-certificate",
@@ -660,7 +690,8 @@ fn client_config(
                 | Protocol::VlessHttpUpgrade
                 | Protocol::VlessHttp
                 | Protocol::VlessKcp
-                | Protocol::VlessQuic => {
+                | Protocol::VlessQuic
+                | Protocol::VlessEncryption => {
                     // VlessOption 使用 servername，而 TrojanOption 使用 sni。
                     // 同一固定源码的 adapter/parser.go 按 smux.enabled 控制复用包装。
                     proxy["uuid"] = json!(credential);
@@ -674,6 +705,9 @@ fn client_config(
                     proxy["smux"] = json!({"enabled": false});
                     if matches!(protocol, Protocol::VlessXudp) {
                         proxy["xudp"] = json!(true);
+                    }
+                    if matches!(protocol, Protocol::VlessEncryption) {
+                        proxy["encryption"] = json!(VLESS_ENCRYPTION_CLIENT);
                     }
                     // Mihomo 用 network + *-opts 表达承载。
                     match protocol {
@@ -784,7 +818,8 @@ fn client_config(
                 | Protocol::VlessHttpUpgrade
                 | Protocol::VlessHttp
                 | Protocol::VlessKcp
-                | Protocol::VlessQuic => {
+                | Protocol::VlessQuic
+                | Protocol::VlessEncryption => {
                     // *string: 省略/null 会默认 XUDP；必须显式空字符串才走原生 UDP。
                     // https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/option/vless.go
                     // https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/protocol/vless/outbound.go
@@ -798,6 +833,9 @@ fn client_config(
                         _ => "",
                     });
                     outbound["multiplex"] = json!({"enabled": false});
+                    if matches!(protocol, Protocol::VlessEncryption) {
+                        outbound["encryption"] = json!(VLESS_ENCRYPTION_CLIENT);
+                    }
                     // sing-box 用 transport 段表达承载。
                     match protocol {
                         Protocol::VlessWs => {
@@ -890,9 +928,14 @@ fn client_config(
                 | Protocol::VlessHttpUpgrade
                 | Protocol::VlessHttp
                 | Protocol::VlessKcp
-                | Protocol::VlessQuic => {
+                | Protocol::VlessQuic
+                | Protocol::VlessEncryption => {
                     json!({"address": "127.0.0.1", "port": server.port(),
-                    "id": credential, "encryption": "none",
+                    "id": credential,
+                    "encryption": match protocol {
+                        Protocol::VlessEncryption => VLESS_ENCRYPTION_CLIENT,
+                        _ => "none",
+                    },
                     "flow": match protocol {
                         Protocol::VlessVision => "xtls-rprx-vision",
                         _ => "",
@@ -934,7 +977,8 @@ fn client_config(
                 | Protocol::VlessHttpUpgrade
                 | Protocol::VlessHttp
                 | Protocol::VlessKcp
-                | Protocol::VlessQuic => json!({"enabled": false,
+                | Protocol::VlessQuic
+                | Protocol::VlessEncryption => json!({"enabled": false,
                     "concurrency": -1, "xudpConcurrency": -1}),
             };
             // Xray 用 streamSettings.network + *Settings 表达承载。
@@ -1259,6 +1303,7 @@ async fn positive_udp(proxy: SocketAddr, protocol: Protocol) -> Result<Value> {
         | Protocol::VlessHttp
         | Protocol::VlessKcp
         | Protocol::VlessQuic
+        | Protocol::VlessEncryption
         | Protocol::Vmess
         | Protocol::Hysteria2
         | Protocol::Tuic
@@ -1956,6 +2001,7 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                 | Protocol::VlessHttp
                 | Protocol::VlessKcp
                 | Protocol::VlessQuic
+                | Protocol::VlessEncryption
                 | Protocol::Vmess => "uuid",
             };
             assert_eq!(
@@ -1997,7 +2043,8 @@ fn configuration_generation_scenarios_keep_identity_and_trust_separate() -> Resu
                             | Protocol::VlessHttpUpgrade
                             | Protocol::VlessHttp
                             | Protocol::VlessKcp
-                            | Protocol::VlessQuic => &outbound["settings"]["id"],
+                            | Protocol::VlessQuic
+                            | Protocol::VlessEncryption => &outbound["settings"]["id"],
                             // Xray 的 VMess 出站用 vnext[].users[].id。
                             Protocol::Vmess => &outbound["settings"]["vnext"][0]["users"][0]["id"],
                             Protocol::Hysteria2
@@ -2581,6 +2628,12 @@ async fn mihomo_vless_quic_authentication() -> Result<()> {
 #[ignore = "需要已校验官方客户端和执行许可"]
 async fn xray_vless_quic_authentication() -> Result<()> {
     real_interop("xray", Protocol::VlessQuic).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
+async fn xray_vless_encryption_authentication() -> Result<()> {
+    real_interop("xray", Protocol::VlessEncryption).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

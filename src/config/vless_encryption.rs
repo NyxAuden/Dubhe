@@ -84,6 +84,78 @@ pub(crate) struct ClientEncryption {
 }
 
 /// 解析出站 `encryption` 字段；与入站共享语法，但密钥是公钥。
+/// 由服务端 `decryption` 推导客户端 `encryption`。
+///
+/// 两侧材料是同一密钥对的两半：服务端持有私钥/种子，客户端需要公钥。
+/// X25519 私钥 → 公钥是标量乘；ML-KEM-768 种子 → 封装公钥是确定性展开
+/// （`DecapsulationKey::from_seed`）。因此导出不需要用户手工再跑一次
+/// `xray vlessenc`。
+///
+/// 两侧的 `time` 字段语义不同：服务端写票据有效期（如 `600s`），
+/// 客户端写 `0rtt`/`1rtt`。这里按服务端是否启用票据（`seconds_from > 0`
+/// 或 `seconds_to > 0`）选择 `0rtt`，否则 `1rtt`。
+pub(crate) fn client_from_decryption(value: &str) -> Result<Option<String>> {
+    let Some(decryption) = parse(value)? else {
+        return Ok(None);
+    };
+    let mode = match decryption.xor_mode {
+        XorMode::Native => "native",
+        XorMode::Public => "xorpub",
+        XorMode::Random => "random",
+    };
+    let time = if decryption.seconds_from > 0 || decryption.seconds_to > 0 {
+        "0rtt"
+    } else {
+        "1rtt"
+    };
+    let mut out = format!("{PREFIX}.{mode}.{time}");
+    let padding = format_padding(&decryption.padding_lens, &decryption.padding_gaps);
+    if !padding.is_empty() {
+        out.push('.');
+        out.push_str(&padding);
+    }
+    for key in &decryption.keys {
+        out.push('.');
+        out.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&public_of(key)?));
+    }
+    Ok(Some(out))
+}
+
+/// 私钥/种子 → 线路公钥字节（X25519 32 字节 / ML-KEM-768 1184 字节）。
+fn public_of(key: &AuthenticationKey) -> Result<Vec<u8>> {
+    match key {
+        AuthenticationKey::X25519(seed) => {
+            use aws_lc_rs::agreement::{PrivateKey, X25519};
+            let private = PrivateKey::from_private_key(&X25519, seed)
+                .map_err(|_| anyhow::anyhow!("VLESS Encryption X25519 私钥无效"))?;
+            let public = private
+                .compute_public_key()
+                .map_err(|_| anyhow::anyhow!("VLESS Encryption X25519 公钥推导失败"))?;
+            Ok(public.as_ref().to_vec())
+        }
+        AuthenticationKey::MlKem768(seed) => {
+            use ml_kem::kem::KeyExport as _;
+            let key =
+                ml_kem::DecapsulationKey::<ml_kem::MlKem768>::from_seed(ml_kem::Seed::from(*seed));
+            Ok(key.encapsulation_key().to_bytes().as_slice().to_vec())
+        }
+    }
+}
+
+/// 还原 padding 串：每组用 `-` 连接，组间用 `.`；偶数组是长度、奇数组是间隔。
+fn format_padding(lens: &[[u32; 3]], gaps: &[[u32; 3]]) -> String {
+    let mut groups = Vec::with_capacity(lens.len() + gaps.len());
+    for index in 0..lens.len().max(gaps.len()) {
+        if let Some(group) = lens.get(index) {
+            groups.push(format!("{}-{}-{}", group[0], group[1], group[2]));
+        }
+        if let Some(group) = gaps.get(index) {
+            groups.push(format!("{}-{}-{}", group[0], group[1], group[2]));
+        }
+    }
+    groups.join(".")
+}
+
 pub(crate) fn parse_client(value: &str) -> Result<Option<ClientEncryption>> {
     let value = value.trim();
     if value.is_empty() || value == "none" {
@@ -385,6 +457,48 @@ mod tests {
         assert!(parse(&value).is_err());
         let value = format!("mlkem768x25519plus.native.65535s.{KEY32}");
         assert!(parse(&value).unwrap().is_some());
+    }
+
+    #[test]
+    fn derives_client_encryption_from_decryption() {
+        // 金标准来自 `xray vlessenc` + `xray x25519 -i`（v26.10.31）：
+        // 同一私钥必须推出官方打印的那一个公钥，逐字节一致。
+        const PRIVATE: &str = "-DqEf18Ai3PxV9ZMJToAvlwY2XMlcMYlJItT-8oQBWg";
+        const PUBLIC: &str = "MvcuFHxUUqUmO0_v_XgyVRuQDNZtWvoroqUfEaBZCy0";
+        let decryption = format!("mlkem768x25519plus.native.600s.{PRIVATE}");
+        let derived = client_from_decryption(&decryption).unwrap().unwrap();
+        // time 语义不同：服务端 600s（启用票据）→ 客户端 0rtt。
+        assert_eq!(derived, format!("mlkem768x25519plus.native.0rtt.{PUBLIC}"));
+    }
+
+    #[test]
+    fn derives_mlkem_public_from_seed() {
+        // `xray mlkem768 -i <seed>` 的 Client 输出即封装公钥（1184 字节）。
+        const SEED: &str = "td4uId_9VRHfPYzhZSXDp4sYDEPInd-SWRLuOJEXPLAsqFTsqAwxXBzwwdxpuFm-NUueEHuL8nXA2eFkEA7hnw";
+        let decryption = format!("mlkem768x25519plus.native.0.{SEED}");
+        let derived = client_from_decryption(&decryption).unwrap().unwrap();
+        let key = derived.rsplit('.').next().unwrap();
+        // 1184 字节 base64url（无 padding）为 1579 字符。
+        assert_eq!(key.len(), 1579, "ML-KEM-768 公钥长度异常");
+    }
+
+    #[test]
+    fn round_trips_padding_and_mode() {
+        const PRIVATE: &str = "-DqEf18Ai3PxV9ZMJToAvlwY2XMlcMYlJItT-8oQBWg";
+        // 首组必须 >= 100-35-N；随后奇数组是发送间隔。
+        let value = format!("mlkem768x25519plus.random.0.100-35-40.25-1-5.{PRIVATE}");
+        let derived = client_from_decryption(&value).unwrap().unwrap();
+        assert!(
+            derived.starts_with("mlkem768x25519plus.random.1rtt.100-35-40.25-1-5."),
+            "{derived}"
+        );
+    }
+
+    #[test]
+    fn client_from_decryption_rejects_none_and_garbage() {
+        assert!(client_from_decryption("none").unwrap().is_none());
+        assert!(client_from_decryption("").unwrap().is_none());
+        assert!(client_from_decryption("not-a-valid-config").is_err());
     }
 
     #[test]

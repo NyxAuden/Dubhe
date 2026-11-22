@@ -48,6 +48,7 @@ async fn tls_target_with_alpn(group: TargetGroup, alpn: Vec<Vec<u8>>) -> TargetP
         certificate_padding: 8192,
         alpn,
         behavior: reality_peer::TargetBehavior::Echo,
+        ..Default::default()
     })
     .await
     .unwrap()

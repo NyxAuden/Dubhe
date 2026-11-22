@@ -128,6 +128,27 @@ openspec validate add-reality-vless-inbound --strict --no-interactive
 
 环境：macOS ARM64，rustc1.95.0/cargo1.95.0，OpenSpec1.12.0。磁盘末轮约50GiB可用，未清理/删除文件。Xray与REALITY固定版本见[协议说明](reality.md)，rustls原归档SHA256 `48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf`。
 
+## 与官方客户端互通时的 target 约束（2026-11-22 实测）
+
+服务端 `reality.target` 必须是**完整 TLS 1.3 服务端**，且满足三条硬约束，
+否则官方客户端会在 target 侧断开（表现为 `UnexpectedEof`）：
+
+1. **证书签名算法必须是 ECDSA 或 RSA，不能是 Ed25519。**
+   官方 Xray 客户端用 uTLS 的 Chrome fingerprint，其 `signature_algorithms`
+   扩展只声明 ECDSA/RSA 系列。用 Ed25519 证书做 target 时 rustls 找不到共同
+   签名算法，握手直接断开。
+   `tests/common/reality.rs` 的 `TargetOptions::cert_alg` 提供
+   `TargetCertAlg::EcdsaP256` 供此类用例显式选择；默认仍为 Ed25519，
+   不影响本机回环测试。
+2. **ServerHello 必须回显客户端提供的 32 字节 session_id**（Xray 依赖）。
+3. **flight 形状必须落在 `RecordPlan` 可表达范围内**
+   （`vendor/rustls/src/server/reality.rs`）。因此 OpenSSL `s_server`
+   不能直接当 target——实测报「REALITY 目标模板截断」。
+
+target 不需要公网可达：用本内核自己的 `trojan` 入站（ECDSA 证书、独立端口）
+即可。注意 `src/config/reality.rs` 的自环检查会拒绝 target 与任一监听器
+地址+端口相同（含回环别名同端口），且 target 必须监听具体 IP 而非泛洪地址。
+
 ## 未执行与公开边界
 
 第7–9组8项仍未完成：本批三家官方客户端/组合能力静态矩阵与实际互通、能力簇macOS全量、Linux ARM64/x86_64、精确Rust1.91、release及最终验收结论。官方执行前须另取本批许可；不沿用旧33项授权。Vision保持18/27、VMess21/30，各9项集中验收同样未完成。
