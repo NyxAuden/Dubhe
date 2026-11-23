@@ -7,6 +7,7 @@ pub mod dns;
 pub mod export;
 mod fallback;
 pub mod forward;
+pub mod geo;
 pub(crate) mod mux;
 pub mod outbound;
 pub mod protocol;

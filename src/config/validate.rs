@@ -1995,10 +1995,24 @@ impl Config {
                 rule.ports.iter().all(|range| range.start <= range.end),
                 "route.rules[{index}].ports 的起始端口不得大于结束端口"
             );
+            // 域名项可以是具体域名，也可以是地理数据集引用
+            // （`geosite:cn` / `rule_set:ads`）。
             ensure!(
-                rule.domains.iter().all(|domain| valid_domain(domain)),
-                "route.rules[{index}].domains 必须是非空的 ASCII 精确域名"
+                rule.domains.iter().all(|domain| {
+                    crate::geo::code_of(domain).is_some() || valid_domain(domain)
+                }),
+                "route.rules[{index}].domains 必须是非空的 ASCII 精确域名或 geosite:/rule_set: 引用"
             );
+            // `ip_cidrs` 的字符串项只能是地理引用；其它字符串在这里拒绝，
+            // 且错误信息不回显原文（可能是敏感输入）。
+            for entry in &rule.ip_cidrs {
+                if let crate::config::IpEntry::Geo(value) = entry {
+                    ensure!(
+                        crate::geo::code_of(value).is_some(),
+                        "route.rules[{index}].ip_cidrs 的字符串项必须是 geoip: 或 mmdb: 引用"
+                    );
+                }
+            }
             ensure!(
                 rule.domain_suffix
                     .iter()

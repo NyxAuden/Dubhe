@@ -189,6 +189,9 @@ impl Server {
             api.load_token()?;
         }
         crate::route::check_outbounds(config)?;
+        // 地理数据集引用（`geosite:` 等）在路由编译期展开；`check` 必须
+        // 走到这里，否则配置写错要等到真正启动才暴露。
+        crate::route::Router::new(config)?;
         for inbound in &config.inbounds {
             if let Some((certificate, private_key)) = inbound.tls_paths() {
                 tls::load(certificate, private_key)?;

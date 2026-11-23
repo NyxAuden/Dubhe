@@ -68,6 +68,9 @@ pub struct Config {
     /// NW3 Egress 出口服务：无本地监听，主动连接远端 Portal 并注册为出口。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nw3_egress: Option<Nw3Egress>,
+    /// 外部地理数据集；省略时不支持 `geosite:` / `geoip:` / `mmdb:` 规则。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geo: Option<GeoConfig>,
     /// 管理/统计 API；只允许回环监听，必须提供 Bearer token。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiConfig>,
@@ -1591,6 +1594,35 @@ impl OutboundKind {
     }
 }
 
+/// 外部地理数据集路径。
+///
+/// 内核**只读取、不内置、不下载、不校验**用户提供的文件：数据正确性由数据源
+/// 负责，本项目不为第三方列表背书。
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeoConfig {
+    /// Xray/Mihomo 的 `geosite.dat`（protobuf）；供 `geosite:<code>` 使用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geosite: Option<PathBuf>,
+    /// Xray/Mihomo 的 `geoip.dat`（protobuf）；供 `geoip:<code>` 使用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geoip: Option<PathBuf>,
+    /// MaxMind `mmdb` 数据库；供 `mmdb:<code>` 使用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmdb: Option<PathBuf>,
+    /// sing-box rule-set source JSON（非 SRS 二进制）；供 `rule_set:<tag>` 使用。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_sets: Vec<RuleSetSource>,
+}
+
+/// 一个 sing-box rule-set source JSON 文件。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleSetSource {
+    pub tag: String,
+    pub path: PathBuf,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
@@ -1615,6 +1647,14 @@ pub enum DomainStrategy {
     IpIfNonMatch,
 }
 
+/// `ip_cidrs` 的一项：要么是具体 CIDR，要么是地理数据集引用。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum IpEntry {
+    Cidr(IpNet),
+    Geo(String),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
@@ -1633,8 +1673,11 @@ pub struct Rule {
     /// 域名正则匹配（RE2 语法，作用于小写域名）；对齐 sing-box `domain_regex`。
     #[serde(default)]
     pub domain_regex: Vec<String>,
+    /// IP 目标匹配：可以是 CIDR（`10.0.0.0/8`），也可以是地理数据集引用
+    /// （`geoip:cn`、`mmdb:CN`）。后者在配置加载阶段展开或转为运行期匹配，
+    /// 与 Xray 的 `"ip": ["geoip:cn"]` 写法一致。
     #[serde(default)]
-    pub ip_cidrs: Vec<IpNet>,
+    pub ip_cidrs: Vec<IpEntry>,
     /// `true` 时匹配私有/内网目标地址；对齐 Xray `geoip:private`、sing-box `ip_is_private`。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ip_is_private: bool,

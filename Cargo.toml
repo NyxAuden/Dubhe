@@ -27,6 +27,7 @@ crc32fast = "=1.5.4"
 cryptoxide = { version = "=0.5.1", default-features = false, features = ["hmac", "sha2"] }
 ctr = { version = "=0.10.1", default-features = false }
 md-5 = { version = "=0.11.0", default-features = false }
+maxminddb = "=0.33.0"
 prost = { version = "=0.14.4", default-features = false, features = ["derive", "std"] }
 quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 # 与 quinn 0.11.11 已解析的 quinn-proto 版本相同；仅直接命名

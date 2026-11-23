@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use ipnet::IpNet;
 
-use crate::config::{Config, DomainStrategy, Outbound, OutboundKind, PortRange};
+use crate::config::{Config, DomainStrategy, Outbound, OutboundKind, PortRange, Rule};
 use crate::session::{Host, Network, Target};
 
 #[derive(Clone, Debug)]
@@ -19,6 +19,53 @@ pub struct Router {
     urltest_groups: Vec<Arc<UrltestGroup>>,
     /// 已编译的代理出站；反向 Bridge 需要按 tag 取得与普通路由相同的实例。
     proxies: HashMap<String, Arc<ProxyOutbound>>,
+}
+
+/// 展开一条规则里的地理数据引用。
+///
+/// 没有配置 `geo` 段时，出现 `geosite:` 等引用会直接报错——静默跳过会让
+/// 用户以为规则生效了。
+fn expand_geo(
+    geo_data: Option<&crate::geo::GeoData>,
+    rule: &Rule,
+) -> Result<(
+    Vec<crate::geo::DomainMatcher>,
+    Vec<crate::geo::Cidr>,
+    Vec<String>,
+)> {
+    let geo_ip_refs: Vec<String> = rule
+        .ip_cidrs
+        .iter()
+        .filter_map(|entry| match entry {
+            crate::config::IpEntry::Geo(value) => Some(value.clone()),
+            crate::config::IpEntry::Cidr(_) => None,
+        })
+        .collect();
+    let has_domain_refs = rule
+        .domains
+        .iter()
+        .any(|value| crate::geo::code_of(value).is_some());
+    if !has_domain_refs && geo_ip_refs.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    let Some(data) = geo_data else {
+        let sample = rule
+            .domains
+            .iter()
+            .find(|value| crate::geo::code_of(value).is_some())
+            .map(String::as_str)
+            .or_else(|| geo_ip_refs.first().map(String::as_str))
+            .unwrap_or("geosite:");
+        anyhow::bail!(
+            "规则引用了 {sample}，但配置里没有 geo 段；请设置 geo.geosite / geo.geoip / geo.mmdb，或改成具体值"
+        );
+    };
+    crate::geo::expand(data, &rule.domains, &geo_ip_refs)
+}
+
+fn ipnet_of(cidr: crate::geo::Cidr) -> Result<IpNet> {
+    IpNet::new(cidr.addr, cidr.prefix)
+        .with_context(|| format!("地理数据里的 CIDR 无效: {}/{}", cidr.addr, cidr.prefix))
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +79,10 @@ struct CompiledRule {
     domain_regex: Vec<regex::Regex>,
     ip_cidrs: Vec<IpNet>,
     ip_is_private: bool,
+    /// `mmdb:<code>`：只能运行期按 IP 查国家码，不能预先展开成 CIDR。
+    mmdb_codes: Vec<String>,
+    /// 运行期 mmdb 查询需要的数据集；没配 `geo` 时为 None。
+    geo: Option<std::sync::Arc<crate::geo::GeoData>>,
     ports: Vec<PortRange>,
     /// 反转本条规则的匹配结果。
     invert: bool,
@@ -345,43 +396,79 @@ impl Router {
         let mut resolve = |tag: &str| {
             resolve_outbound(tag, &outbounds, &proxies, &mut groups, &mut HashSet::new())
         };
+        // 数据集只加载一次，由所有规则共享（Arc）。
+        let geo_data = match config.geo.as_ref() {
+            Some(geo) => Some(std::sync::Arc::new(crate::geo::load(geo)?)),
+            None => None,
+        };
         let rules = config
             .route
             .rules
             .iter()
             .map(|rule| {
                 let destination = resolve(&rule.outbound)?;
+                // `geosite:` / `geoip:` 在此展开成具体项；`mmdb:` 留到运行期。
+                let (geo_domains, geo_ips, mmdb_codes) = expand_geo(geo_data.as_deref(), rule)?;
+                let mut domains: Vec<String> = rule
+                    .domains
+                    .iter()
+                    .filter(|value| crate::geo::code_of(value).is_none())
+                    .map(|domain| normalize_domain(domain))
+                    .collect();
+                let mut domain_suffix: Vec<String> = rule
+                    .domain_suffix
+                    .iter()
+                    .map(|suffix| normalize_domain(suffix))
+                    .collect();
+                let mut domain_keyword: Vec<String> = rule
+                    .domain_keyword
+                    .iter()
+                    .map(|keyword| keyword.to_ascii_lowercase())
+                    .collect();
+                let mut domain_regex: Vec<regex::Regex> = rule
+                    .domain_regex
+                    .iter()
+                    .map(|pattern| {
+                        regex::Regex::new(pattern).map_err(|error| {
+                            anyhow::anyhow!("route.rules 的 domain_regex {pattern:?} 无效: {error}")
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                // 展开结果按类型并入对应集合。
+                for item in geo_domains {
+                    match item {
+                        crate::geo::DomainMatcher::Full(value) => domains.push(value),
+                        crate::geo::DomainMatcher::Suffix(value) => domain_suffix.push(value),
+                        crate::geo::DomainMatcher::Keyword(value) => domain_keyword.push(value),
+                        crate::geo::DomainMatcher::Regex(value) => {
+                            domain_regex.push(regex::Regex::new(&value).map_err(|error| {
+                                anyhow::anyhow!("geosite 数据里的正则 {value:?} 无效: {error}")
+                            })?);
+                        }
+                    }
+                }
+                let mut ip_cidrs: Vec<IpNet> = rule
+                    .ip_cidrs
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        crate::config::IpEntry::Cidr(net) => Some(*net),
+                        crate::config::IpEntry::Geo(_) => None,
+                    })
+                    .collect();
+                for cidr in geo_ips {
+                    ip_cidrs.push(ipnet_of(cidr)?);
+                }
                 Ok(CompiledRule {
                     inbounds: rule.inbounds.clone(),
                     networks: rule.networks.clone(),
-                    domains: rule
-                        .domains
-                        .iter()
-                        .map(|domain| normalize_domain(domain))
-                        .collect(),
-                    domain_suffix: rule
-                        .domain_suffix
-                        .iter()
-                        .map(|suffix| normalize_domain(suffix))
-                        .collect(),
-                    domain_keyword: rule
-                        .domain_keyword
-                        .iter()
-                        .map(|keyword| keyword.to_ascii_lowercase())
-                        .collect(),
-                    domain_regex: rule
-                        .domain_regex
-                        .iter()
-                        .map(|pattern| {
-                            regex::Regex::new(pattern).map_err(|error| {
-                                anyhow::anyhow!(
-                                    "route.rules 的 domain_regex {pattern:?} 无效: {error}"
-                                )
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                    ip_cidrs: rule.ip_cidrs.clone(),
+                    domains,
+                    domain_suffix,
+                    domain_keyword,
+                    domain_regex,
+                    ip_cidrs,
                     ip_is_private: rule.ip_is_private,
+                    mmdb_codes,
+                    geo: geo_data.clone(),
                     ports: rule.ports.clone(),
                     invert: rule.invert,
                     destination,
@@ -1000,9 +1087,30 @@ impl CompiledRule {
                             .any(|ip| self.ip_cidrs.iter().any(|cidr| cidr.contains(ip)))
                     }),
                 })
-            && (!self.ip_is_private || self.matches_private(target, resolved));
+            && (!self.ip_is_private || self.matches_private(target, resolved))
+            && (self.mmdb_codes.is_empty() || self.matches_mmdb(target, resolved));
         // invert 只翻转本条规则，不影响其它规则。
         if self.invert { !matched } else { matched }
+    }
+
+    /// 目标 IP 是否落在 `mmdb:<code>` 指定的国家。
+    ///
+    /// 与 CIDR 一致：目标是域名且未解析时按未命中处理。
+    fn matches_mmdb(&self, target: &Target, resolved: Option<&[IpAddr]>) -> bool {
+        let Some(geo) = self.geo.as_deref() else {
+            return false;
+        };
+        let hit = |ip: IpAddr| {
+            self.mmdb_codes
+                .iter()
+                .any(|code| geo.mmdb_matches(code, ip) == Some(true))
+        };
+        match &target.host {
+            Host::Ip(ip) => hit(*ip),
+            Host::Domain(_) => {
+                resolved.is_some_and(|addresses| addresses.iter().any(|ip| hit(*ip)))
+            }
+        }
     }
 
     /// 目标是否落在私有/内网地址。域名未解析时按未命中处理，与 `ip_cidrs` 一致。

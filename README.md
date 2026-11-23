@@ -138,9 +138,13 @@ dubhe convert --from xray --input xray-config.json --output dubhe.json
 dubhe check -c dubhe.json
 ```
 
-支持入口、出站、静态路由与 DNS。高级语义（geosite / geoip 规则集、
-`downloadSettings`、`balancerTag` 等）会被显式拒绝而非静默丢弃。
-字段对照见[迁移指南](docs/migration.md)。
+支持入口、出站、静态路由与 DNS。路由规则可直接引用地理数据集：
+`geosite:` / `geoip:`（Xray、Mihomo 的 `.dat`）、`mmdb:`（MaxMind）、
+`rule_set:`（sing-box source JSON）——内核只读用户提供的数据文件，
+不内置、不下载、不校验，见[地理数据集](docs/geo.md)。
+
+其余高级语义（`downloadSettings`、`balancerTag` 等）会被显式拒绝而非
+静默丢弃。字段对照见[迁移指南](docs/migration.md)。
 
 ## 工程门槛
 

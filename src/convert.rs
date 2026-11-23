@@ -907,9 +907,22 @@ fn convert_routing(
                 let mut exact = Vec::new();
                 for domain in domains.iter().filter_map(Value::as_str) {
                     if domain.starts_with("geosite:") || domain.starts_with("ext:") {
-                        report.note(format!(
-                            "routing.rules[{index}] 的 {domain} 需要外部规则集，已跳过"
-                        ));
+                        // dubhe 支持 geosite:，但要求配置里给出 geo.geosite 数据文件；
+                        // 转换结果直接保留该引用，让用户在 dubhe 侧配数据路径即可。
+                        if domain.starts_with("geosite:") {
+                            rule.entry("domains")
+                                .or_insert_with(|| json!([]))
+                                .as_array_mut()
+                                .expect("刚刚插入的是数组")
+                                .push(json!(domain));
+                            report.note(format!(
+                                "routing.rules[{index}] 的 {domain} 已保留；在 dubhe 配置里设置 geo.geosite 指向 geosite.dat 才会生效"
+                            ));
+                        } else {
+                            report.note(format!(
+                                "routing.rules[{index}] 的 {domain} 需要外部规则集，已跳过；可用 geo.rule_sets 引用 sing-box source JSON"
+                            ));
+                        }
                     } else if let Some(suffix) = domain.strip_prefix("domain:") {
                         rule.entry("domain_suffix")
                             .or_insert_with(|| json!([]))
