@@ -22,6 +22,85 @@ fn valid_value() -> Value {
     })
 }
 
+/// 两个 TCP 入口抢占同一地址时，`check` 就该失败——否则要到 `run` 的
+/// 绑定阶段才以 `AddrInUse` 整体退出。
+#[test]
+fn duplicate_tcp_listen_is_rejected() {
+    let mut value = valid_value();
+    value["inbounds"] = json!([
+        {"type": "socks5", "tag": "a", "listen": "127.0.0.1:8080"},
+        {"type": "http", "tag": "b", "listen": "127.0.0.1:8080"}
+    ]);
+    let error = parse_value(&value).unwrap_err().to_string();
+    assert!(error.contains("在端口 8080 上冲突"), "{error}");
+    assert!(error.contains("TCP 冲突"), "{error}");
+}
+
+/// 通配监听与具体地址在 macOS 上能同时绑定成功（SO_REUSEADDR），但连接
+/// 由哪个套接字接收不确定；必须提前拦下。
+#[test]
+fn wildcard_and_specific_listen_overlap_is_rejected() {
+    let mut value = valid_value();
+    value["inbounds"] = json!([
+        {"type": "socks5", "tag": "a", "listen": "0.0.0.0:8080", "allow_insecure": true},
+        {"type": "http", "tag": "b", "listen": "127.0.0.1:8080", "allow_insecure": true}
+    ]);
+    let error = parse_value(&value).unwrap_err().to_string();
+    assert!(error.contains("未指定地址"), "{error}");
+}
+
+/// `::` 在双栈模式下同时占用 IPv4 端口，因此与 IPv4 通配/具体地址冲突。
+#[test]
+fn ipv6_wildcard_conflicts_with_ipv4() {
+    let mut value = valid_value();
+    value["inbounds"] = json!([
+        {"type": "socks5", "tag": "a", "listen": "[::]:8080", "allow_insecure": true},
+        {"type": "http", "tag": "b", "listen": "0.0.0.0:8080", "allow_insecure": true}
+    ]);
+    let error = parse_value(&value).unwrap_err().to_string();
+    assert!(error.contains("在端口 8080 上冲突"), "{error}");
+}
+
+/// 相同端口、不同具体地址不算冲突（Linux 与 macOS 都能正常绑定）。
+#[test]
+fn distinct_specific_addresses_on_same_port_are_allowed() {
+    let mut value = valid_value();
+    value["inbounds"] = json!([
+        {"type": "socks5", "tag": "a", "listen": "127.0.0.1:8080"},
+        {"type": "http", "tag": "b", "listen": "127.0.0.2:8080", "allow_insecure": true}
+    ]);
+    parse_value(&value).expect("不同具体地址可以共用端口");
+}
+
+/// TCP 与 UDP 占同一端口不冲突：Hysteria2 只监听 UDP，可以和 TCP 入口共存。
+#[test]
+fn tcp_and_udp_may_share_a_port() {
+    let mut value = valid_value();
+    value["inbounds"] = json!([
+        {"type": "socks5", "tag": "a", "listen": "127.0.0.1:8080"},
+        {"type": "hysteria2", "tag": "b", "listen": "127.0.0.1:8080", "udp": true,
+         "users": [{"name": "u", "password": "test-secret-password"}],
+         "certificate": "test-cert.pem", "private_key": "test-key.pem"}
+    ]);
+    parse_value(&value).expect("TCP 与 UDP 同端口应通过");
+}
+
+/// 两个只监听 UDP 的入口抢同一端口仍然冲突。
+#[test]
+fn duplicate_udp_listen_is_rejected() {
+    let mut value = valid_value();
+    value["inbounds"] = json!([
+        {"type": "hysteria2", "tag": "a", "listen": "127.0.0.1:8080", "udp": true,
+         "users": [{"name": "u", "password": "test-secret-password"}],
+         "certificate": "test-cert.pem", "private_key": "test-key.pem"},
+        {"type": "tuic", "tag": "b", "listen": "127.0.0.1:8080",
+         "users": [{"name": "u", "uuid": "11111111-1111-1111-1111-111111111111", "password": "test-secret-password"}],
+         "certificate": "test-cert.pem", "private_key": "test-key.pem"}
+    ]);
+    let error = parse_value(&value).unwrap_err().to_string();
+    assert!(error.contains("UDP 冲突"), "{error}");
+}
+
 fn parse_value(value: &Value) -> Result<Config> {
     Config::from_json(&serde_json::to_string(value).unwrap())
 }

@@ -28,7 +28,7 @@ dubhe check -c dubhe.json
 | `protocol: "vless"` + `security: "none"` | `type: "vless"` | 无证书为明文 VLESS |
 | `protocol: "vless"` + `security: "tls"` | `type: "vless"` + `certificate`/`private_key` | |
 | `protocol: "vless"` + `security: "reality"` | `type: "vless-reality"` + `reality` | |
-| `network: "ws"` | `type: "vless-ws"` 等 | 传输层是类型的一部分，不是独立字段 |
+| `network: "ws"` | `type: "vless-ws"` 等 | 传输层是类型的一部分，不是独立字段（见下方「与出站不一致」） |
 | `network: "grpc"` | `type: "vless-grpc"` + `grpc.path` | `path` 必填完整 RPC 路径 |
 | `network: "xhttp"` | `type: "vless-xhttp"` + `xhttp` | 四种模式；`downloadSettings` 直接拒绝 |
 | `extra` 里的 `downloadSettings` | **拒绝转换** | 会改变下行语义，需手工配置 |
@@ -37,6 +37,7 @@ dubhe check -c dubhe.json
 | `listen` + `port` | `listen: "HOST:PORT"` | 本项目是一个 SocketAddr 字符串 |
 | `settings.clients[].id` | `users[].uuid` | 标准 36 字符 UUID |
 | `settings.clients[].email` | `users[].name` | 同时是统计归因的键 |
+| — | — | **入站与出站的表达方式不同**：出站是 `type: "vless"` + `transport: {"type": "ws"}`（与上游一致的正交设计）；入站把承载写进类型名（`vless-ws`）。三种协议 × 九种承载 = 27 个入站类型值，没有 `transport` 字段。这是已知的结构债，见 `docs/architecture.md` 的「入站结构」一节 |
 | `settings.clients[].flow` | `users[].flow` | 仅支持 `xtls-rprx-vision` |
 | `settings.decryption` | `decryption` | `none` 省略；VLESS Encryption 原样保留 |
 | `streamSettings.tlsSettings.certificates[]` | `certificate` / `private_key` | 只取第一组 |

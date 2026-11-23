@@ -32,7 +32,10 @@
 - **只做服务端。** 不开发终端客户端、不提供运营面板、不包装其他内核子进程。
 - **线协议兼容，不追求配置兼容。** 本项目的配置是自定义 schema；从 Xray / sing-box
   迁移由独立的 `dubhe convert` 完成，避免运行时双 schema 维护。
-- **一个进程，多协议共存。** 同一端口可按 ALPN / 首包分流到不同协议栈。
+- **一个进程，多协议共存。** 不同协议默认各占一个监听端口。单端口内承载多协议
+  只有两种情形：`mixed`（按首字节区分 SOCKS5 / HTTP）与 `fallbacks`
+  （认证失败后回放到本机另一个入口）。**不支持**按 ALPN / SNI 在同一端口
+  自动分流到不同协议栈。
 - **编译期模块化。** 不支持的协议不会被编译进二进制。
 
 **明确不做**：TUN / redirect / tproxy 等系统级透明代理、出站 BIND、
@@ -58,6 +61,11 @@
 | **WireGuard** | 用户态服务端，无 TUN |
 | **NW3** | Portal 入站（含 `direct` / `egress` / SOCKS5 出口） |
 | **通用** | SOCKS5（CONNECT / UDP ASSOCIATE / BIND）· HTTP · Mixed · dokodemo-door |
+
+**13 个协议族，不是 40 个协议。** 上表的 `-ws` / `-grpc` 等是同一协议的承载变体，
+配置里写作独立类型名（`type: "vless-ws"`）；VLESS/VMess/Trojan × 9 种承载共 27 个
+类型值。这与出站（`type: "vless"` + `transport`）以及上游 Xray/sing-box 都不一致，
+属已知结构债，代价见[架构概览](docs/architecture.md#入站结构协议与承载被扁平化)。
 
 ### 出站
 
@@ -145,6 +153,30 @@ dubhe check -c dubhe.json
 
 其余高级语义（`downloadSettings`、`balancerTag` 等）会被显式拒绝而非
 静默丢弃。字段对照见[迁移指南](docs/migration.md)。
+
+**一个端口接多个协议**：上游 Xray 的做法是 `fallbacks`（认证失败后把字节
+回放到本地目标），sing-box 则要求每个入站各占一个端口。本内核与前者一致：
+
+```json
+{
+  "type": "vless", "tag": "front", "listen": "0.0.0.0:443",
+  "users": [{"uuid": "..."}],
+  "certificate": "/path/fullchain.pem", "private_key": "/path/key.pem",
+  "fallbacks": [{"dest": "127.0.0.1:8443"}]
+}
+```
+
+把 443 上 VLESS 认证失败的连接交给本机 8443 的另一个入口。
+
+限制（实测）：
+
+- **回放的是 TLS 解密后的明文**，所以 `dest` 只能是接受明文的目标——
+  本机的 `http` / `mixed` / `socks5` 入口、普通 Web 服务，或 Unix 套接字。
+  指向另一个 TLS 入口（例如 `trojan`）不会工作：对端读到的是密文，
+  实测报 `InvalidData`。
+- 匹配依据只有 `name`（SNI）/ `alpn` / `path`，**不是协议嗅探**。
+  未通过认证的流量按你写的 `dest` 走，不会「自动落到正确的协议栈」。
+- 按 SNI/ALPN 在不同协议栈之间自动选择，本内核**不支持**。
 
 ## 工程门槛
 

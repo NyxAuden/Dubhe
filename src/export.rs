@@ -2955,13 +2955,14 @@ mod exhaustive_audit_tests {
              "reality": {"target": {"host": "www.example.com", "port": 443},
                          "private_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
                          "server_names": ["www.example.com"], "short_ids": ["ab"]}},
-            {"type": "trojan-grpc", "tag": "tr-grpc", "listen": "0.0.0.0:443",
+            // 每个入口独占一个端口：同 (地址, 端口, TCP) 会被 check 拒绝。
+            {"type": "trojan-grpc", "tag": "tr-grpc", "listen": "0.0.0.0:8443",
              "users": [{"name": "a", "password": "pw"}], "grpc": {"path": "/T"},
              "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"},
-            {"type": "trojan-httpupgrade", "tag": "tr-hu", "listen": "0.0.0.0:443",
+            {"type": "trojan-httpupgrade", "tag": "tr-hu", "listen": "0.0.0.0:8444",
              "users": [{"name": "a", "password": "pw"}], "httpupgrade": {"path": "/u"},
              "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"},
-            {"type": "trojan-xhttp", "tag": "tr-xhttp", "listen": "0.0.0.0:443",
+            {"type": "trojan-xhttp", "tag": "tr-xhttp", "listen": "0.0.0.0:8445",
              "users": [{"name": "a", "password": "pw"}], "xhttp": {"path": "/x"},
              "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"}
         ]));
@@ -3037,8 +3038,8 @@ mod unrepresentable_field_tests {
              "users": [{"name": "a", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
              "decryption": "mlkem768x25519plus.native.600s.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
              "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"},
-            // 显式 none 是明文，必须照常导出。
-            {"type": "vless", "tag": "plain", "listen": "0.0.0.0:443",
+            // 显式 none 是明文，必须照常导出。端口与上面区分，避免 check 拒绝。
+            {"type": "vless", "tag": "plain", "listen": "0.0.0.0:8443",
              "users": [{"name": "a", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
              "decryption": "none",
              "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"}

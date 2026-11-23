@@ -1033,6 +1033,61 @@ impl Inbound {
         }
     }
 
+    /// 该入口实际会占用的网络类型 `(tcp, udp)`。
+    ///
+    /// 与 `runtime.rs` 的绑定路径一一对应：多数入口绑 TCP；Hysteria2 / TUIC /
+    /// WireGuard / mKCP / V2Ray QUIC 只绑 UDP；dokodemo-door 依 `network`；
+    /// Shadowsocks 与 Naive H3 联合绑定；XHTTP/3 额外占用 UDP。
+    pub fn networks(&self) -> (bool, bool) {
+        match self {
+            // 只占 TCP。
+            Self::Socks5 { .. }
+            | Self::Http { .. }
+            | Self::Mixed { .. }
+            | Self::AnyTls { .. }
+            | Self::Trojan { .. }
+            | Self::Vless { .. }
+            | Self::VlessReality { .. }
+            | Self::VmessReality { .. }
+            | Self::TrojanReality { .. }
+            | Self::Vmess { .. }
+            | Self::VlessWs { .. }
+            | Self::VmessWs { .. }
+            | Self::TrojanWs { .. }
+            | Self::VlessGrpc { .. }
+            | Self::VmessGrpc { .. }
+            | Self::TrojanGrpc { .. }
+            | Self::VlessHttpUpgrade { .. }
+            | Self::VmessHttpUpgrade { .. }
+            | Self::TrojanHttpUpgrade { .. }
+            | Self::VlessHttp { .. }
+            | Self::VmessHttp { .. }
+            | Self::TrojanHttp { .. }
+            | Self::Snell { .. }
+            | Self::ShadowTls { .. }
+            | Self::Nw3 { .. } => (true, false),
+            // 只占 UDP。
+            Self::Hysteria2 { .. } | Self::Tuic { .. } | Self::Wireguard { .. } => (false, true),
+            // 联合绑定 TCP + UDP。
+            Self::Shadowsocks { .. } => (true, true),
+            Self::Naive { h3, .. } => (true, *h3),
+            // mKCP 只占 UDP。
+            Self::VlessKcp { .. } | Self::VmessKcp { .. } | Self::TrojanKcp { .. } => (false, true),
+            // V2Ray 旧 QUIC 只占 UDP；`http` 承载在 UDP 之上。
+            Self::VlessQuic { .. } | Self::VmessQuic { .. } | Self::TrojanQuic { .. } => {
+                (false, true)
+            }
+            // XHTTP：h3 走 UDP，h1/h2 走 TCP。
+            Self::VlessXhttp { xhttp, .. }
+            | Self::VmessXhttp { xhttp, .. }
+            | Self::TrojanXhttp { xhttp, .. } => (true, xhttp.h3),
+            // dokodemo-door 依 `network` 字段。
+            Self::DokodemoDoor { network, .. } => {
+                crate::config::dokodemo_networks(network).unwrap_or((true, true))
+            }
+        }
+    }
+
     /// 该入口配置的 REALITY 安全层；未配置时为 `None`。
     pub fn reality(&self) -> Option<&Reality> {
         match self {

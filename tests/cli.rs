@@ -149,8 +149,11 @@ async fn check_validates_both_inbounds_without_binding_or_accepting_connections(
     let mut configuration = socks_config();
     configuration["inbounds"][0]["listen"] = json!(address);
     configuration["inbounds"][0]["users"] = json!([{"name":"tester", "password":CONFIG_PASSWORD}]);
+    // 两个入口必须用不同端口：同 (地址, 端口, TCP) 现在会被 check 拒绝。
+    // 测的是「check 不实际绑定」——端口由本测试自己占着，check 仍应通过。
     let mut trojan = certificate.inbound();
-    trojan["listen"] = json!(address);
+    let trojan_address = std::net::SocketAddr::from(([127, 0, 0, 1], address.port() + 1));
+    trojan["listen"] = json!(trojan_address);
     configuration["inbounds"]
         .as_array_mut()
         .unwrap()
@@ -595,12 +598,18 @@ async fn vmess_check_accepts_direct_and_tls_without_binding_or_connecting() {
     tls["tag"] = json!("vmess-tls");
     tls["certificate"] = json!(certificate.dir.path().join("cert.pem"));
     tls["private_key"] = json!(certificate.dir.path().join("key.pem"));
+    let mut tls_other_port = tls.clone();
+    tls_other_port["listen"] = json!(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        address.port() + 1
+    )));
+    // 两个入口必须用不同端口：同一 (地址, 端口, TCP) 现在由 check 静态拒绝。
+    // 这里验证的是「check 不真实 bind」——地址由本测试占着，check 仍应通过。
     for inbounds in [
         json!([direct.clone()]),
         json!([tls.clone()]),
-        json!([direct, tls]),
+        json!([direct, tls_other_port]),
     ] {
-        // 同一地址由本测试持有；两个入口也可共用声明，check不得真实bind。
         configuration["inbounds"] = inbounds;
         let mut process = CliProcess::spawn("check", Some(&configuration.to_string()));
         assert!(process.wait_exit().await.success());

@@ -32,6 +32,37 @@ UDP 走另一条：`udp.rs` 的 `Association` 负责目标映射、预算和回�
 | `telemetry.rs` | 计数、Prometheus 文本、按用户归因 | 业务逻辑 |
 | `admin.rs` | 只读管理 API | 配置写入 |
 
+## 入站结构：协议与承载被扁平化
+
+`config/inbound.rs` 的 `Inbound` 枚举有 40 个变体。其中 27 个是
+**协议 × 承载** 的笛卡尔积：
+
+| | RAW | reality | ws | grpc | xhttp | httpupgrade | kcp | http | quic |
+|---|---|---|---|---|---|---|---|---|---|
+| VLESS | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| VMess | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Trojan | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+配置上表现为 `type: "vless-ws"`、`type: "vless-grpc"` 等 27 个类型值，
+没有独立的 `transport` 字段。
+
+**这与出站不一致，也与上游不一致**：出站是 `type: "vless"` +
+`transport: {"type": "ws"}`（`OutboundKind` 17 个变体 + `OutboundTransport`
+6 种承载），Xray 是 `protocol` + `streamSettings.network`，sing-box 是
+`type` + `transport`。三家都是正交的。
+
+**代价（实测）**：
+
+- 40 个变体产生 39 种不同的字段组合签名，只有 `Http` 与 `Mixed` 字段集相同；
+- `tag` / `listen` 在 40 个变体里各重复 40 次；
+- 新增一种承载要改 27 个文件（`export.rs` 59 处、`inbound.rs` 30 处、
+  `validate.rs` 27 处、`convert.rs` 27 处）；
+- 分派靠 `runtime/accept.rs` 的 40 路 `if/else`，其中一处单行列出 20 个变体名。
+
+**这是已知结构债，不是有意的设计**。改成 `Inbound { protocol, transport }`
+需要在同一提交里改动配置、校验、分派、导出与转换五处，属较大重构；
+在此之前新增承载的成本保持在上述量级。
+
 ## 加一个协议要改哪里
 
 1. `config/`：新增配置结构与校验，必须带 `deny_unknown_fields`。

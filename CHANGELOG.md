@@ -48,6 +48,13 @@
 
 ### 修复
 
+- `check` 现在拒绝两个入口抢占同一 `(地址, 端口, TCP/UDP)`。此前 `check`
+  通过，`run` 才在绑定阶段报 `AddrInUse` 并整体退出。TCP 与 UDP 同端口
+  仍然允许（例如 `socks5` + `hysteria2`）。
+- README 更正「同一端口可按 ALPN / 首包分流」的不实表述：实际只有 `mixed`
+  （按首字节分 SOCKS5/HTTP）与 `fallbacks`（认证失败后回放明文到本地目标），
+  不支持按 ALPN/SNI 选择协议栈。并补充 `fallbacks` 的真实边界——回放的是
+  TLS 解密后的明文，指向另一个 TLS 入口不会工作。
 - 显式配置 `is_private_ip` 集合：补 multicast，移除错误的 CGNAT 判定。
 - Hysteria2 非法目标地址不再静默关闭，按规范回 TCPResponse Error。
 - 导出模块补齐此前静默丢弃的 4 个协议变体与 7 个入口。

@@ -4,6 +4,28 @@
 
 use super::*;
 
+/// 两个监听 IP 是否会争用同一端口。
+///
+/// - 相同地址直接冲突；
+/// - 同族里任一侧是未指定地址（`0.0.0.0` / `::`）时覆盖全族，与具体地址冲突；
+/// - `::` 在双栈模式下还会占用 IPv4 端口（macOS 实测 `IPV6_V6ONLY=0`，
+///   之后绑 `0.0.0.0:同端口` 直接 `EADDRINUSE`），因此 `::` 与任何 IPv4
+///   地址也冲突。
+///
+/// 反过来，具体 IPv6 地址与具体 IPv4 地址不冲突。
+fn overlapping(left: std::net::IpAddr, right: std::net::IpAddr) -> bool {
+    use std::net::IpAddr::{V4, V6};
+    if left == right {
+        return true;
+    }
+    match (left, right) {
+        (V4(a), V4(b)) => a.is_unspecified() || b.is_unspecified(),
+        (V6(a), V6(b)) => a.is_unspecified() || b.is_unspecified(),
+        // `::` 双栈时同时占用 IPv4。
+        (V6(a), V4(_)) | (V4(_), V6(a)) => a.is_unspecified(),
+    }
+}
+
 impl Config {
     /// 解析并执行纯静态校验；证书读取、密钥匹配和监听准备由运行器完成。
     pub fn from_json(input: &str) -> Result<Self> {
@@ -1108,6 +1130,56 @@ impl Config {
                 shadowtls_detour_allowed(target),
                 "inbounds[{index}].detour 目标必须是明文 TCP 入站（shadowsocks/snell/socks5/http/mixed/无TLS的vmess）"
             );
+        }
+
+        // 监听地址冲突：两个入口抢占同一 (地址, 端口, 网络类型) 时行为不可靠。
+        //
+        // 两种情况都要拦：
+        // - 地址完全相同 → `run` 报 `AddrInUse` 并整体退出；
+        // - 一个是未指定地址（`0.0.0.0` / `::`）而另一个落在其覆盖范围内 →
+        //   macOS 上靠 SO_REUSEADDR 能同时绑定成功，但连接由哪个套接字接收
+        //   不确定（实测两个入口都 ready），Linux 上直接 EADDRINUSE。
+        //   两种结果都不能接受，且都不是「按协议分流」。
+        //
+        // TCP 与 UDP 互不冲突（Hysteria2 等只占 UDP）。
+        for (index, inbound) in self.inbounds.iter().enumerate() {
+            let (tcp, udp) = inbound.networks();
+            let address = inbound.listen();
+            for earlier in self.inbounds.iter().take(index) {
+                // 端口 0 由内核分配实际端口，两个入口会各得一个，不构成冲突。
+                if address.port() == 0
+                    || earlier.listen().port() != address.port()
+                    || !overlapping(earlier.listen().ip(), address.ip())
+                {
+                    continue;
+                }
+                let (earlier_tcp, earlier_udp) = earlier.networks();
+                let tcp_clash = tcp && earlier_tcp;
+                let udp_clash = udp && earlier_udp;
+                let same_ip = earlier.listen().ip() == address.ip();
+                ensure!(
+                    !tcp_clash && !udp_clash,
+                    "inbounds[{index}]（{}，监听 {}）与更早的 {}（监听 {}）在端口 {} 上冲突\
+                     （{}）：{}。每个 (地址, 端口, TCP/UDP) 只能由一个入口占用；\
+                     需要单端口承载多协议时，用 `mixed`（SOCKS5/HTTP）或前一个入口的 `fallbacks` 回放",
+                    inbound.tag(),
+                    address,
+                    earlier.tag(),
+                    earlier.listen(),
+                    address.port(),
+                    match (tcp_clash, udp_clash) {
+                        (true, true) => "TCP 与 UDP 均冲突",
+                        (true, false) => "TCP 冲突",
+                        (false, true) => "UDP 冲突",
+                        (false, false) => unreachable!(),
+                    },
+                    if same_ip {
+                        "地址相同"
+                    } else {
+                        "其中一个监听未指定地址（0.0.0.0 / ::），覆盖另一个"
+                    }
+                );
+            }
         }
 
         if let Some(sniffing) = &self.sniffing {

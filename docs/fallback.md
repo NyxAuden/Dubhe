@@ -53,7 +53,11 @@
 ## 明确不支持
 
 - VMess fallback、REALITY fallback。
-- fallback 到另一代理协议（例如把失败流量再喂给本进程的 `vless` 入口）。
+- **把失败流量交给另一个 TLS 入口**（例如 `vless` 的 fallback 指向本进程的
+  `trojan` 入口）：回放的是 TLS 解密后的明文，对端读到的是密文，实测直接
+  `InvalidData`。可以指向明文入口（`http` / `mixed` / `socks5`）、普通 Web 服务
+  或 Unix 套接字。
+- 按 SNI/ALPN 自动选择协议栈：`fallbacks` 只按配置里写的 `dest` 回放，不做协议嗅探。
 - 依据 `Forwarded`/`X-Forwarded-*` 推断真实客户端。
 - 官方客户端集中验收尚未执行。
 
