@@ -88,7 +88,17 @@ jobs:
         # 下载失败就让 job 失败：静默跳过等于假装验证过真实数据。
         run: ./tools/fetch_geodata.sh
       - name: Test geodata integration
-        run: cargo test --locked --test geo_routing
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --test geo_routing 2>&1 | tee geo-real.log
+      - name: Upload geodata test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: geo-real-log
+          path: geo-real.log
+          retention-days: 7
 
   reproducibility:
     name: reproducibility
