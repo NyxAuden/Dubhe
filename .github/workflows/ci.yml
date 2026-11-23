@@ -72,6 +72,24 @@ jobs:
       - name: Deny advisories, licenses, sources
         run: cargo deny check
 
+  geo-real:
+    name: geo-real
+    # 真实地理数据集的兼容性只在 ubuntu 上验一次：数据与平台无关。
+    # 不放进三平台矩阵，是因为 34 MB 下载 × 3 既慢又放大网络失败面。
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: .test-artifacts/geodata
+          # 与 tools/fetch_geodata.sh 里钉的版本保持一致；改数据版本时同步改这里。
+          key: geodata-202611222203-20261112
+      - name: Fetch real geodata
+        # 下载失败就让 job 失败：静默跳过等于假装验证过真实数据。
+        run: ./tools/fetch_geodata.sh
+      - name: Test geodata integration
+        run: cargo test --locked --test geo_routing
+
   reproducibility:
     name: reproducibility
     if: github.event_name == 'workflow_dispatch'

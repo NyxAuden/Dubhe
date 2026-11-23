@@ -1204,6 +1204,42 @@ pub(crate) fn matches_domain_suffix(domain: &str, suffix: &str) -> bool {
 }
 
 #[cfg(test)]
+mod geo_expand_tests {
+    use super::*;
+
+    /// 真实数据展开后，规则里必须真的出现 `google.com` 的后缀项。
+    #[test]
+    fn real_geosite_expands_into_rule() {
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".test-artifacts/geodata");
+        if !dir.join("geosite.dat").is_file() {
+            eprintln!("跳过：未下载真实数据集");
+            return;
+        }
+        let geo = crate::config::GeoConfig {
+            geosite: Some(dir.join("geosite.dat")),
+            ..Default::default()
+        };
+        let data = crate::geo::load(&geo).unwrap();
+        let rule: Rule = serde_json::from_value(serde_json::json!({
+            "domains": ["geosite:google"],
+            "outbound": "direct"
+        }))
+        .unwrap();
+        let (expanded, _, _) = expand_geo(Some(&data), &rule).unwrap();
+        eprintln!("展开项数: {}", expanded.len());
+        let suffix = expanded
+            .iter()
+            .filter(
+                |item| matches!(item, crate::geo::DomainMatcher::Suffix(v) if v == "google.com"),
+            )
+            .count();
+        eprintln!("Suffix=google.com: {suffix}");
+        assert!(suffix > 0, "google.com 应作为后缀项出现在展开结果里");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use base64::Engine as _;

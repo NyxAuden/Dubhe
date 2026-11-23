@@ -232,6 +232,44 @@ pub fn domain(name: &str, port: u16) -> Vec<u8> {
     b.extend(port.to_be_bytes());
     b
 }
+/// 读完整的 SOCKS5 应答，返回回复码与 BND 地址。
+///
+/// **必须读完**：SOCKS5 应答是变长的（4 字节头 + 地址 + 2 字节端口）。
+/// 只读前 3～4 字节会让剩余地址留在缓冲区里，被后续读取误当成业务数据——
+/// 这个坑在 `tcp_denied`、反向 Bridge 与 geosite 用例里各踩过一次。
+pub async fn read_socks_reply<R: AsyncRead + Unpin>(r: &mut R) -> (u8, SocketAddr) {
+    let mut head = [0u8; 4];
+    read_exact(r, &mut head).await;
+    assert_eq!(head[0], 5, "无效 SOCKS 回复");
+    let code = head[1];
+    // 地址类型：1=IPv4、4=IPv6、3=域名。域名要先读长度。
+    let bound = match head[3] {
+        1 => {
+            let mut b = [0; 4];
+            read_exact(r, &mut b).await;
+            let port = r.read_u16().await.unwrap();
+            SocketAddr::new(std::net::IpAddr::from(b), port)
+        }
+        4 => {
+            let mut b = [0; 16];
+            read_exact(r, &mut b).await;
+            let port = r.read_u16().await.unwrap();
+            SocketAddr::new(std::net::IpAddr::from(b), port)
+        }
+        3 => {
+            let mut length = [0u8; 1];
+            read_exact(r, &mut length).await;
+            let mut name = vec![0u8; usize::from(length[0])];
+            read_exact(r, &mut name).await;
+            // 域名形式的 BND 无法转成 SocketAddr；返回未指定地址。
+            let _port = r.read_u16().await.unwrap();
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        }
+        other => panic!("无效 SOCKS BND 地址类型 {other}"),
+    };
+    (code, bound)
+}
+
 pub async fn socks(command: u8, target: Vec<u8>, addr: SocketAddr) -> (TcpStream, SocketAddr) {
     let mut s = TcpStream::connect(addr).await.unwrap();
     s.write_all(&[5, 1, 0]).await.unwrap();
@@ -241,10 +279,8 @@ pub async fn socks(command: u8, target: Vec<u8>, addr: SocketAddr) -> (TcpStream
     let mut request = vec![5, command, 0];
     request.extend(target);
     s.write_all(&request).await.unwrap();
-    let mut head = [0; 3];
-    read_exact(&mut s, &mut head).await;
-    assert_eq!(head, [5, 0, 0]);
-    let bound = read_address(&mut s).await;
+    let (code, bound) = read_socks_reply(&mut s).await;
+    assert_eq!(code, 0, "SOCKS 拒绝：code={code}");
     (s, bound)
 }
 pub async fn read_address<R: AsyncRead + Unpin>(r: &mut R) -> SocketAddr {

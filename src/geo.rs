@@ -591,6 +591,30 @@ mod tests {
         assert!(error.contains("geosite:absent"), "{error}");
     }
 
+    /// 真实数据集冒烟：确认解析层能读出预期项。
+    ///
+    /// 数据集缺失时跳过（不静默通过）：CI 不下载数据，本地跑才有意义。
+    #[test]
+    fn real_geosite_parses_google_entry() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".test-artifacts/geodata/geosite.dat");
+        if !path.is_file() {
+            eprintln!("跳过：未下载真实数据集");
+            return;
+        }
+        let sites = parse_geosite(&path).unwrap();
+        let google = sites.get("google").expect("应有 GOOGLE 分类");
+        // 实测该版本：GOOGLE 共 1080 项，`google.com` 是 Domain（后缀）而非 Full。
+        // 这个事实决定 `www.google.com` 会命中而 `google.com` 的整域匹配来自
+        // 后缀语义——两者都要在路由用例里体现。
+        assert!(google.len() > 100, "GOOGLE 分类项数异常: {}", google.len());
+        let suffix = google
+            .iter()
+            .filter(|item| matches!(item, DomainMatcher::Suffix(value) if value == "google.com"))
+            .count();
+        assert_eq!(suffix, 1, "google.com 应作为唯一的 Suffix 项存在");
+    }
+
     #[test]
     fn plain_values_are_left_alone() {
         let data = GeoData::default();

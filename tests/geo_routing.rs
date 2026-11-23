@@ -95,6 +95,9 @@ fn write(dir: &Path, name: &str, bytes: &[u8]) -> String {
 
 fn config(geo: Value, rule: Value) -> Value {
     let mut value = socks_config();
+    // 关掉 DNS 解析：本文件测的是路由匹配，不是域名解析。
+    // 有域名规则时若先解析，解析失败会掩盖匹配结果。
+    value["route"]["domain_strategy"] = json!("AsIs");
     value["geo"] = geo;
     value["outbounds"] = json!([
         {"type": "direct", "tag": "direct"},
@@ -132,19 +135,17 @@ async fn assert_rejected(server: &Running, target: &str, port: u16) {
     request.extend(port.to_be_bytes());
     stream.write_all(&request).await.unwrap();
 
-    let mut head = [0u8; 3];
-    if stream.read_exact(&mut head).await.is_err() {
-        return;
-    }
-    assert_eq!(head[0], 5, "无效 SOCKS 回复");
-    if head[1] != 0 {
+    // 统一走 common 的完整读取，避免「只读前缀、剩余地址被当成回显」。
+    let (code, _) = common::read_socks_reply(&mut stream).await;
+    if code != 0 {
         return;
     }
     let mut buffer = [0u8; 8];
     let read = tokio::time::timeout(Duration::from_millis(800), stream.read(&mut buffer)).await;
+    let detail = format!("target={target}:{port} read={read:?}");
     assert!(
         matches!(read, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
-        "reject 规则下不应收到回显"
+        "reject 规则下不应收到回显；{detail}"
     );
 }
 
@@ -247,4 +248,110 @@ async fn missing_geosite_code_fails_loudly() {
     let config = dubhe::Config::from_json(&value.to_string()).unwrap();
     let error = dubhe::Server::check(&config).unwrap_err().to_string();
     assert!(error.contains("geosite:absent"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// 真实数据集（需要先下载；缺失时跳过，不静默通过）
+// ---------------------------------------------------------------------------
+
+/// 真实数据集目录。用 `tools/fetch_geodata.sh` 下载。
+fn real_geodata() -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".test-artifacts/geodata");
+    let needed = ["geosite.dat", "geoip.dat", "Country.mmdb"];
+    if needed.iter().all(|name| dir.join(name).is_file()) {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// 用真实 `geosite.dat` 判断域名归属。
+///
+/// **样本选择依据**（实测该版本 dat 的类型分布，不是猜测）：
+/// - `GOOGLE` 有 239 条 `Full`、839 条 `Domain`（后缀）。
+///   `google.com` 是 **Full**，所以 `www.google.com` **不会**命中——
+///   `Full` 只匹配整域相等，这是 Xray 的语义。
+/// - `gmail` 是 `Domain`（后缀），所以 `mail.gmail.com` 命中。
+///
+/// 因此这里验证两组：整域命中和后缀命中。数据更新导致样本失效时，
+/// 用例会失败而不是悄悄跳过——需要重新挑选样本。
+#[tokio::test]
+async fn real_geosite_classifies_known_domains() {
+    let Some(dir) = real_geodata() else {
+        eprintln!("跳过：未下载真实数据集（tools/fetch_geodata.sh）");
+        return;
+    };
+    let server = Running::start(config(
+        json!({"geosite": dir.join("geosite.dat").display().to_string()}),
+        json!({"domains": ["geosite:google"], "outbound": "reject"}),
+    ))
+    .await;
+    let echo = Echo::tcp("127.0.0.1", false).await;
+
+    // Full 语义：只有整域相等才命中。
+    assert_rejected(&server, "google.com", echo.address.port()).await;
+    // Domain 语义：后缀命中，子域也命中。
+    assert_rejected(&server, "mail.gmail.com", echo.address.port()).await;
+    // 不在该分类里：正常放行（证明不是无条件拒绝）。
+    assert_relayed(&server, echo.address, b"baidu").await;
+    server.shutdown().await;
+}
+
+/// `Full` 与 `Domain` 的语义差异必须可见，否则用户会误以为
+/// `geosite:google` 能匹配所有 `*.google.com`。
+#[tokio::test]
+async fn real_geosite_full_does_not_match_subdomain() {
+    let Some(dir) = real_geodata() else {
+        eprintln!("跳过：未下载真实数据集");
+        return;
+    };
+    let server = Running::start(config(
+        json!({"geosite": dir.join("geosite.dat").display().to_string()}),
+        json!({"domains": ["geosite:google"], "outbound": "reject"}),
+    ))
+    .await;
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    // `www.google.com` 不在 Full 列表，也不是任何后缀项的子域 → 放行。
+    assert_relayed(&server, echo.address, b"www").await;
+    server.shutdown().await;
+}
+
+/// 用真实 `geoip.dat` 判断 IP 归属。
+#[tokio::test]
+async fn real_geoip_classifies_known_addresses() {
+    let Some(dir) = real_geodata() else {
+        eprintln!("跳过：未下载真实数据集");
+        return;
+    };
+    // 阿里云公共 DNS 223.5.5.5 属于 CN。
+    let server = Running::start(config(
+        json!({"geoip": dir.join("geoip.dat").display().to_string()}),
+        json!({"ip_cidrs": ["geoip:cn"], "outbound": "reject"}),
+    ))
+    .await;
+    assert_rejected(&server, "223.5.5.5", 80).await;
+    // 8.8.8.8 不属于 CN。
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    assert_relayed(&server, echo.address, b"dns").await;
+    server.shutdown().await;
+}
+
+/// 用真实 `mmdb` 判断 IP 的国家码。
+#[tokio::test]
+async fn real_mmdb_classifies_known_addresses() {
+    let Some(dir) = real_geodata() else {
+        eprintln!("跳过：未下载真实数据集");
+        return;
+    };
+    let server = Running::start(config(
+        json!({"mmdb": dir.join("Country.mmdb").display().to_string()}),
+        json!({"ip_cidrs": ["mmdb:CN"], "outbound": "reject"}),
+    ))
+    .await;
+    // 223.5.5.5 是中国地址（阿里公共 DNS）。
+    assert_rejected(&server, "223.5.5.5", 80).await;
+    // 8.8.8.8 不是中国地址。
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    assert_relayed(&server, echo.address, b"8").await;
+    server.shutdown().await;
 }

@@ -97,4 +97,31 @@ MaxMind 数据库的 API 是「输入 IP → 查国家码」，**无法反向列
 - `rule_set:` 后缀命中（含子域）
 - 缺少 `geo` 段 / 缺 code / 类型放错字段时在 `check` 阶段报错
 
-`src/geo.rs` 另有 8 项单元测试覆盖解析层（含 SRS 二进制的可操作报错）。
+`src/geo.rs` 另有单元测试覆盖解析层（含 SRS 二进制的可操作报错）。
+
+### 真实数据集用例
+
+`tests/geo_routing.rs` 里另有 3 项用**真实数据集**验证归属判断
+（`geosite:google` 的 Full 与后缀语义、`geoip:cn`、`mmdb:CN`）。
+
+获取数据：
+
+```bash
+./tools/fetch_geodata.sh
+```
+
+脚本里的版本是**钉死**的（`V2RAY_RULES_TAG` / `MAXMIND_GEOIP_TAG`），
+不用 `latest`——数据每周在变，`latest` 会让结果无法复现。要更新数据时
+改这两个变量，并同步 CI 的缓存 key，然后重跑全部用例。
+
+没有数据时这 3 项会打印「跳过：未下载真实数据集」并返回——**不静默通过**。
+
+CI 有独立的 `geo-real` job（仅 ubuntu，缓存数据文件）跑这 3 项：下载失败
+就让 job 失败，而不是跳过。数据与平台无关，不必在三平台矩阵里重复。
+
+### 真实数据暴露过的一个缺陷
+
+`regex` 默认特性关闭时缺 `unicode-perl`，而真实 `geosite.dat` 里有
+`^cdn\d-epicgames-\d+\.file\.myqcloud\.com$` 这类 Perl 字符类，
+整份数据会因此加载失败。这个只有在真实数据上才会暴露——手造样本永远
+发现不了。已在 `Cargo.toml` 里显式启用该特性并注明原因。

@@ -46,7 +46,9 @@ h3-quinn = { version = "=0.0.10", default-features = false, features = ["datagra
 ipnet = { version = "2", features = ["serde"] }
 rcgen = { version = "=0.13.2", default-features = false }
 # 已在 env_filter 的依赖树内；直接命名用于路由 domain_regex。
-regex = { version = "=1.13.1", default-features = false, features = ["std", "perf"] }
+# unicode-perl 是必需的：真实 geosite.dat 里有 `\d` 这类 Perl 字符类
+# （例如 ^cdn\d-epicgames-\d+\.file\.myqcloud\.com$），缺了它整条规则会被拒。
+regex = { version = "=1.13.1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "aws_lc_rs", "std", "tls12", "reality"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
