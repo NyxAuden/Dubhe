@@ -50,7 +50,7 @@ regex = { version = "=1.13.1", default-features = false, features = ["std", "per
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "aws_lc_rs", "std", "tls12", "reality"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 boringtun = { version = "=0.7.1", default-features = false }
 smoltcp = { version = "=0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 shadowsocks = { version = "=1.25.0", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "aead-2022-no-udp-cipher-cache"] }
