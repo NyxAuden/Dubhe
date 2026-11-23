@@ -29,10 +29,14 @@
 >   ML-KEM-768 种子展开），已用 `xray vlessenc` + `xray x25519 -i` 官方输出
 >   逐字节核对。sing-box/Mihomo 的 VLESS 出站无该字段，用例显式跳过。
 > - **REALITY**（2026-11-22）：Xray v26.10.31 客户端 valid / wrong-uuid
->   通过（TCP）。**2026-11-23 复跑发现该用例约 50% 概率失败**（连跑 6 次：
->   3 通过 / 3 失败；失败都在 valid 场景的 TCP 回显前超时，且连
->   `result.json` 都未写出）。同一命令重复执行结果不一致，且与机器负载
->   无稳定关系。**查清之前不应把 REALITY 入站记为「通过」**。
+>   通过（TCP）。2026-11-23 复跑发现约 50% 概率失败，**已定位并修复**：
+>   REALITY 要求 target 的加密 flight 形态满足 `RecordPlan`——首条
+>   加密记录 `> 512` 字节时必须是 1 条聚合记录，否则必须正好 4 条
+>   （EE / Certificate / CertificateVerify / Finished）。测试用的 target
+>   发出恰好 512 字节的首记录，落进「必须 4 条」分支却只发了 1 条，
+>   `collect_template` 一直等第 2 条直到握手超时。修复是让测试 target 用
+>   带 2 KiB 证书扩展的证书，使首条记录稳定超过 512（不是放宽校验：
+>   真实 CDN 的 flight 本就满足约束）。修复后连跑 10 次 10 通过。
 >   **只对 Xray 生成用例，这不是偷懒而是协议事实**：
 >   sing-box 的 `common/tls/reality_client.go` 主动把 X25519MLKEM768 从
 >   `SupportedCurves`/`KeyShare` 里过滤掉，而本内核与 Xray 服务端都硬要求

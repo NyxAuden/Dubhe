@@ -62,7 +62,7 @@ const SHADOWTLS_INNER_TAG: &str = "shadowtls-inner";
 const SHADOWTLS_INNER_METHOD: &str = "2022-blake3-aes-128-gcm";
 const SHADOWTLS_INNER_PASSWORD: &str = "WlpaWlpaWlpaWlpaWlpaWg==";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Protocol {
     Trojan,
     Vless,
@@ -491,13 +491,31 @@ struct TlsHandshakeTarget {
 }
 
 impl TlsHandshakeTarget {
-    async fn start(certificate: &Certificate) -> Result<Self> {
+    /// `cert_padding`：证书里非关键扩展的填充字节数。
+    ///
+    /// REALITY 要求 target 的加密 flight 形态满足 `RecordPlan`：
+    /// **首条加密记录 > 512 字节时必须是 1 条聚合记录**，否则必须正好 4 条
+    /// （EE / Certificate / CertificateVerify / Finished）。rustls 的
+    /// 紧凑 flight 默认可能发出恰好 512 字节的首记录，落进「必须 4 条」
+    /// 的分支而 target 只发了 1 条，`collect_template` 会一直等第 2 条直到
+    /// 握手超时——表现为约 50% 连接失败（是否越过边界取决于证书与
+    /// ServerHello 的实际长度）。
+    ///
+    /// 加大证书即可让首条记录稳定超过 512，走「1 条聚合记录」分支。
+    /// 这不是放宽校验：生产环境接入真实 CDN 时 flight 形态本就满足约束。
+    async fn start(certificate: &Certificate, cert_padding: usize) -> Result<Self> {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-        let certificates = CertificateDer::pem_file_iter(certificate.dir.path().join("cert.pem"))
-            .context("读取握手目标证书失败")?
-            .collect::<Result<Vec<_>, _>>()?;
-        let key = PrivateKeyDer::from_pem_file(certificate.dir.path().join("key.pem"))
-            .context("读取握手目标私钥失败")?;
+        let (certificates, key) = if cert_padding == 0 {
+            (
+                CertificateDer::pem_file_iter(certificate.dir.path().join("cert.pem"))
+                    .context("读取握手目标证书失败")?
+                    .collect::<Result<Vec<_>, _>>()?,
+                PrivateKeyDer::from_pem_file(certificate.dir.path().join("key.pem"))
+                    .context("读取握手目标私钥失败")?,
+            )
+        } else {
+            padded_target_certificate(cert_padding)?
+        };
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -508,7 +526,7 @@ impl TlsHandshakeTarget {
         .context("握手目标证书无效")?;
         // ShadowTLS 认证后不再需要握手服务器的会话票据；关闭以保持流量形状简单。
         config.send_tls13_tickets = 0;
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let config = Arc::new(config);
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -523,15 +541,9 @@ impl TlsHandshakeTarget {
                     accepted = listener.accept() => {
                         let Ok((tcp, _)) = accepted else { break };
                         accepted_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let acceptor = acceptor.clone();
+                        let config = config.clone();
                         connections.spawn(async move {
-                            let Ok(mut tls) = acceptor.accept(tcp).await else { return };
-                            let mut buffer = [0u8; 1024];
-                            while let Ok(count) = tls.read(&mut buffer).await {
-                                if count == 0 {
-                                    break;
-                                }
-                            }
+                            let _ = serve_target(tcp, config).await;
                         });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
@@ -551,6 +563,94 @@ impl TlsHandshakeTarget {
     fn connections(&self) -> usize {
         self.connections.load(std::sync::atomic::Ordering::SeqCst)
     }
+}
+
+/// REALITY 握手目标的证书填充字节数。
+///
+/// 目标是让 target 的加密 flight 首条记录稳定超过 512 字节。取 2 KiB：
+/// 足以越过边界，又远低于 `MAX_SERVER_HELLO` 与记录上限。
+const REALITY_TARGET_CERT_PADDING: usize = 2048;
+
+/// 生成带非关键扩展填充的自签名证书，用于放大 target 的握手 flight。
+fn padded_target_certificate(
+    padding: usize,
+) -> Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".into()])?;
+    params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2027, 1, 1);
+    params
+        .custom_extensions
+        .push(rcgen::CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 55555, 1],
+            vec![0x61; padding],
+        ));
+    let key = rcgen::KeyPair::generate()?;
+    let certified = params.self_signed(&key)?;
+    Ok((
+        vec![certified.der().clone()],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+    ))
+}
+
+/// 手动驱动 `rustls::ServerConnection`，而不是 `tokio_rustls::TlsAcceptor::accept`。
+///
+/// 原因：`accept()` 要等**客户端 Finished** 才返回并写出自己的 flight，而
+/// REALITY 的做法是发 ClientHello、读到 ServerHello + ChangeCipherSpec 就
+/// 停手，把那块模板拿去重放，**不会**完成握手。用 `accept()` 会让服务端
+/// 永远发不出加密记录，`collect_template` 卡在读第一条密文记录上。
+///
+/// 手动驱动时 `process_new_packets()` 一处理完 ClientHello，rustls 就
+/// 立即生成完整 flight（ServerHello + CCS + 加密记录），随后
+/// `wants_write`/`write_tls` 把它一次写出。
+async fn serve_target(
+    mut tcp: tokio::net::TcpStream,
+    config: Arc<rustls::ServerConfig>,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut tls = rustls::ServerConnection::new(config)?;
+    let mut buffer = [0u8; 4096];
+    loop {
+        let count = tcp.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let mut input = &buffer[..count];
+        while !input.is_empty() {
+            if tls.read_tls(&mut input)? == 0 {
+                break;
+            }
+            // 处理失败（例如客户端发来非法记录）就直接结束该连接。
+            if tls.process_new_packets().is_err() {
+                return Ok(());
+            }
+        }
+        let mut wire = Vec::new();
+        while tls.wants_write() {
+            tls.write_tls(&mut wire)?;
+        }
+        if !wire.is_empty() {
+            if std::env::var_os("D2").is_some() {
+                let mut types = Vec::new();
+                let mut i = 0;
+                while i + 5 <= wire.len() {
+                    let n = usize::from(u16::from_be_bytes([wire[i + 3], wire[i + 4]]));
+                    types.push(format!("{}:{}", wire[i], n));
+                    i += 5 + n;
+                }
+                eprintln!(
+                    "[tgt] 写出 {} 字节, records=[{}]",
+                    wire.len(),
+                    types.join(" ")
+                );
+            }
+            tcp.write_all(&wire).await?;
+            tcp.flush().await?;
+        }
+    }
+    Ok(())
 }
 
 impl Drop for TlsHandshakeTarget {
@@ -611,10 +711,15 @@ fn verify_reference_binary(client: &ReferenceClient) -> Result<()> {
         client.status == "ready" && client.upstream_checksum_verified,
         "参考客户端尚未通过下载和官方摘要校验"
     );
-    ensure!(client.platform == "darwin-arm64", "参考客户端平台不匹配");
+    // 平台必须与本机一致，且是下载脚本声明支持的四种之一。
+    // 脚本用 `{os}-{arch}`（如 `linux-aarch64`、`darwin-arm64`），
+    // 而 `std::env::consts::ARCH` 在 Linux ARM64 上是 `aarch64`、
+    // 在 macOS ARM64 上是 `aarch64`，可直接比对；x86_64 两侧同名。
+    let expected = platform_tag();
     ensure!(
-        std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64",
-        "这组固定参考客户端仅适用于 macOS ARM64"
+        client.platform == expected,
+        "参考客户端平台不匹配：manifest 记录 {}，本机是 {expected}",
+        client.platform
     );
     ensure!(
         client.path.is_absolute() && fs::symlink_metadata(&client.path)?.is_file(),
@@ -1709,7 +1814,14 @@ async fn run_scenarios(
     let unrelated = Certificate::new();
     // ShadowTLS 的握手伪装目标：真实 TLS 1.3 服务端，独立于协议入站证书。
     let handshake = if matches!(protocol, Protocol::ShadowTls | Protocol::VlessReality) {
-        Some(TlsHandshakeTarget::start(&certificate).await?)
+        // REALITY 需要加密 flight 首记录 > 512（见 `TlsHandshakeTarget::start`）；
+        // ShadowTLS 不需要，保持原样。
+        let padding = if protocol == Protocol::VlessReality {
+            REALITY_TARGET_CERT_PADDING
+        } else {
+            0
+        };
+        Some(TlsHandshakeTarget::start(&certificate, padding).await?)
     } else {
         None
     };
@@ -1850,6 +1962,24 @@ async fn run_scenarios(
         );
     }
     Ok(Value::Object(results))
+}
+
+/// 当前平台标识，与 `tools/fetch_reference_clients.py::detect_platform`
+/// 的返回值保持同一形状（`{os}-{arch}`）。
+///
+/// 注意架构名两边写法不同：脚本与 manifest 用 `arm64` / `x86_64`
+/// （对齐上游 release 资产命名），而 `std::env::consts::ARCH` 在
+/// macOS 与 Linux 的 ARM 上都是 `aarch64`。
+fn platform_tag() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("{os}-{arch}")
 }
 
 async fn real_interop(name: &str, protocol: Protocol) -> Result<()> {

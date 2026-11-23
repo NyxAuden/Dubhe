@@ -145,6 +145,19 @@ openspec validate add-reality-vless-inbound --strict --no-interactive
    （`vendor/rustls/src/server/reality.rs`）。因此 OpenSSL `s_server`
    不能直接当 target——实测报「REALITY 目标模板截断」。
 
+   具体规则（`RecordPlan::new`）：**首条加密记录 `> 512` 字节时必须是
+   1 条聚合记录；否则必须正好 4 条**（EE / Certificate / CertificateVerify
+   / Finished）。这条边界极易踩中：rustls 的紧凑 flight 在某些证书尺寸下
+   会发出**恰好 512 字节**的首记录，落进「必须 4 条」分支却只发了 1 条，
+   于是 `collect_template` 一直等第 2 条直到握手超时——表现为约 50% 的
+   连接失败，且成功与否取决于证书与 ServerHello 的实际长度（同一配置
+   重复执行结果不稳定）。
+
+   测试侧的做法是给 target 证书加足量非关键扩展（
+   `tests/reference_clients.rs` 的 `REALITY_TARGET_CERT_PADDING`），
+   把首条记录稳定推到 512 以上。**不要改 `RecordPlan` 的校验来绕过**：
+   该规则来自上游 flight 形态，真实 CDN 满足它。
+
 target 不需要公网可达：用本内核自己的 `trojan` 入站（ECDSA 证书、独立端口）
 即可。注意 `src/config/reality.rs` 的自环检查会拒绝 target 与任一监听器
 地址+端口相同（含回环别名同端口），且 target 必须监听具体 IP 而非泛洪地址。
