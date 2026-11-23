@@ -93,11 +93,12 @@ pub(crate) async fn serve<S>(
     ctx: Arc<Context>,
     inbound: String,
     allow_udp: bool,
+    user: Option<&str>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    serve_scoped(stream, ctx, inbound, allow_udp, None).await
+    serve_scoped(stream, ctx, inbound, allow_udp, None, user).await
 }
 
 /// 与 [`serve`] 相同，并按上层 RPC 生命周期持有租约。
@@ -107,11 +108,15 @@ pub(crate) async fn serve_scoped<S>(
     inbound: String,
     allow_udp: bool,
     lease: Option<Lease>,
+    user: Option<&str>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let _lease = lease;
+    // Mux 的子流在上层握手时已完成认证，这里只需把用户身份带给每条子流，
+    // 否则客户开 mux 后该用户的流量完全不计入 `/stats/users`。
+    let user_counter = user.map(|name| ctx.stats.user_counter(&inbound, name));
     let (read, write) = tokio::io::split(stream);
     let inbound_budget = Arc::new(Semaphore::new(QUEUE_BYTES));
     let out_budget = Arc::new(Semaphore::new(QUEUE_BYTES));
@@ -135,6 +140,7 @@ where
         out: out_tx,
         inbound_budget,
         out_budget,
+        user_counter,
     };
 
     let mut last_activity = Instant::now();
@@ -581,6 +587,8 @@ struct Mux {
     out: mpsc::Sender<OutFrame>,
     inbound_budget: Arc<Semaphore>,
     out_budget: Arc<Semaphore>,
+    /// 上层握手已认证的用户；用于给每条子流归因业务字节。
+    user_counter: Option<Arc<crate::telemetry::UserCounters>>,
 }
 
 impl Mux {
@@ -751,10 +759,11 @@ impl Mux {
         let ctx = self.ctx.clone();
         let inbound = self.inbound.clone();
         let budget = self.inbound_budget.clone();
+        let user = self.user_counter.clone();
         let tracker = ctx.children.clone();
         let task = self.tasks.spawn(tracker.track_future(async move {
             tcp_session(
-                id, generation, target, incoming, events, ctx, inbound, budget,
+                id, generation, target, incoming, events, ctx, inbound, budget, user,
             )
             .await;
         }));
@@ -871,6 +880,11 @@ impl Mux {
                     .stats
                     .downlink
                     .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                // 全局计数已在这里，补一份按用户的归因（此前 mux 只计上行
+                // 的用户字节，下行完全不计）。
+                if let Some(counter) = &self.user_counter {
+                    counter.add(false, payload.len());
+                }
                 self.enqueue(bytes).await?;
             }
             Event::TcpEnd {
@@ -895,6 +909,9 @@ impl Mux {
                         .stats
                         .downlink
                         .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    if let Some(counter) = &self.user_counter {
+                        counter.add(false, payload.len());
+                    }
                     self.enqueue(bytes).await?;
                 } else {
                     self.ctx.stats.drop_packet();
@@ -1017,6 +1034,7 @@ async fn tcp_session(
     ctx: Arc<Context>,
     inbound: String,
     budget: Arc<Semaphore>,
+    user: Option<Arc<crate::telemetry::UserCounters>>,
 ) {
     // 子流首包在拨号前嗅探；已消费的前缀必须原样写回上游。
     let (route, dial, prefix) = sniff_prefix(&ctx, &inbound, &target, &mut incoming).await;
@@ -1066,6 +1084,9 @@ async fn tcp_session(
                         }
                         ctx.stats.uplink
                             .fetch_add(chunk.payload.len() as u64, Ordering::Relaxed);
+                        if let Some(counter) = &user {
+                            counter.add(true, chunk.payload.len());
+                        }
                     }
                     None => {
                         let _ = write.shutdown().await;

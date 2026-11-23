@@ -83,9 +83,11 @@ pub(super) async fn serve_controlled_vless<
         return match accepted.vision {
             Some(uuid) => {
                 let stream = tls::vision::Vision::new(stream, uuid);
-                crate::mux::serve(stream, ctx, tag.to_owned(), allow_udp).await
+                crate::mux::serve(stream, ctx, tag.to_owned(), allow_udp, user.as_deref()).await
             }
-            None => crate::mux::serve(stream, ctx, tag.to_owned(), allow_udp).await,
+            None => {
+                crate::mux::serve(stream, ctx, tag.to_owned(), allow_udp, user.as_deref()).await
+            }
         };
     }
     if let vless::Accepted::Single(request) = &accepted.accepted
@@ -212,9 +214,11 @@ pub(super) async fn serve_plain_vision_vless_impl<
         return match accepted.vision {
             Some(uuid) => {
                 let stream = tls::vision::Vision::new_plain(stream, uuid);
-                crate::mux::serve(stream, ctx, tag.to_owned(), allow_udp).await
+                crate::mux::serve(stream, ctx, tag.to_owned(), allow_udp, user.as_deref()).await
             }
-            None => crate::mux::serve(stream, ctx, tag.to_owned(), allow_udp).await,
+            None => {
+                crate::mux::serve(stream, ctx, tag.to_owned(), allow_udp, user.as_deref()).await
+            }
         };
     }
     if let vless::Accepted::Single(request) = &accepted.accepted
@@ -447,7 +451,15 @@ pub(crate) async fn serve_vmess_scoped<
             accepted.key,
             accepted.iv,
         )?;
-        return crate::mux::serve_scoped(stream, ctx, tag.to_owned(), allow_udp, lease).await;
+        return crate::mux::serve_scoped(
+            stream,
+            ctx,
+            tag.to_owned(),
+            allow_udp,
+            lease,
+            Some(user.as_str()),
+        )
+        .await;
     }
     // 克隆模式以避免 `reply(&mut accepted)` 与目标借用冲突；Target 很小。
     match accepted.mode.clone() {
@@ -656,7 +668,15 @@ pub(crate) async fn serve_plain_vless_scoped<
             timeout(deadline, vless::reply(&mut stream))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "应答超时"))??;
-            return crate::mux::serve_scoped(stream, ctx, tag.to_owned(), allow_udp, lease).await;
+            return crate::mux::serve_scoped(
+                stream,
+                ctx,
+                tag.to_owned(),
+                allow_udp,
+                lease,
+                user.as_deref(),
+            )
+            .await;
         }
     };
     // 命令 1 + v1.mux.cool 也进入 Mux；先于 UoT 判断，避免与发现目标混淆。
@@ -664,7 +684,15 @@ pub(crate) async fn serve_plain_vless_scoped<
         timeout(deadline, vless::reply(&mut stream))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "应答超时"))??;
-        return crate::mux::serve_scoped(stream, ctx, tag.to_owned(), allow_udp, lease).await;
+        return crate::mux::serve_scoped(
+            stream,
+            ctx,
+            tag.to_owned(),
+            allow_udp,
+            lease,
+            user.as_deref(),
+        )
+        .await;
     }
     match request.command {
         Command::Connect if udp::uot_version(&request.target).is_some() => {

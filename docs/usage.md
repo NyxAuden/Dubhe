@@ -236,6 +236,28 @@ JSON 日志写到 stderr，后台队列最多 1024 条，满时允许丢日志�
 读入客户端计上行、写出客户端计下行，只算业务载荷。**未归因**：WireGuard（只有 peer 公钥，没有用户名）、Shadowsocks 单密钥
 （没有用户身份）。这些路径只进全局计数；需要按用户计费时不要把本接口当成完整账本。
 
+### 用户计数的清零与配额
+
+| 端点 | 作用 |
+|---|---|
+| `GET /stats/users` | 每个条目含 `uplink` / `downlink` / `since_ms` / `quota_bytes` / `expires_at_ms` |
+| `POST /stats/users/reset` | 清零计数并把 `since_ms` 移到当前时刻；`?inbound=` / `?user=` 可缩小范围 |
+| `POST /stats/users/limits` | 设置软配额与到期：`?quota_bytes=` / `?expires_at_ms=`（unix 毫秒） |
+
+**当前边界（不要当成已实现）**：
+
+- `quota_bytes` / `expires_at_ms` 目前**只被记录和返回，不会拒绝新连接**。
+  内核已经具备判定函数（`UserCounters::admits_new_connection`），但统一的拨号
+  入口 `forward::selected` 拿不到用户身份，接上需要给 18 个 `count_user`
+  调用点加参数。在接上之前，配额只能由外部面板读取 `GET /stats/users` 后自行
+  处置。
+- 清零与并发累加之间有极小竞态（`store` 与 `fetch_add` 之间到达的字节可能
+  丢失），与 Xray `StatsService` 的语义一致：重置是运维动作，不追求逐字节精确。
+- 计数不持久化，重启归零。
+
+此前所有带查询串的管理请求都会被 `parse()` 里的 `path.contains('?')` 直接
+拒绝并返回 400；该限制已移除，现按「不含查询串的路径」路由。
+
 - 真实外部客户端矩阵目前只覆盖报告指定的 macOS ARM64 构建；Linux 测试不自动等同所有 Linux 客户端已验证。
 - Linux x86_64在ARM64 Colima中经QEMU运行，本批209项普通回归及vendor25项通过；AWS-LC构建使用编译器局部QEMU虚拟地址预留，有编译器家族探测及memcmp检查跳过警告，具体环境/原始证据见[验收报告](shadowsocks-acceptance.md)。不表示默认QEMU环境已修复，也不能拿其耗时作为原生x86_64性能结果。
 - 三平台历史口径为 **macOS ARM64、Linux ARM64、Linux x86_64（QEMU）**，不含 Windows。2026-11-13 已按用户要求新建 Colima default 实例（2 CPU / 8 GiB / 30 GiB 稀疏磁盘，不切全局 Docker context），用固定 Rust 1.95 多架构镜像完成 Linux ARM64 check、全量与 release；Linux x86_64 的 check 通过，但 QEMU 下 cargo 的 fork/exec 偶发死锁，未能取得可信全量结果，x86_64 release 未完成。Windows 没有 target/工具链。Linux 结果不能自动外推到 Windows 或其他 libc/架构。

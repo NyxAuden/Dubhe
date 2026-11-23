@@ -239,7 +239,7 @@ async fn start_ctx(
     allow_udp: bool,
 ) -> (DuplexStream, tokio::task::JoinHandle<io::Result<()>>) {
     let (client, server) = tokio::io::duplex(64 * 1024);
-    let task = tokio::spawn(mux::serve(server, ctx, "test".into(), allow_udp));
+    let task = tokio::spawn(mux::serve(server, ctx, "test".into(), allow_udp, None));
     (client, task)
 }
 
@@ -689,4 +689,67 @@ async fn tcp_sniff_dest_override_replaces_the_dial_target() {
 
     drop(client);
     task.await.unwrap().unwrap();
+}
+
+/// Mux 子流的业务字节必须归到上层握手认证的用户。
+///
+/// 此前 `mux::serve` 的签名里没有 user，子流只累加全局计数，于是「客户端
+/// 开 mux 后该用户的流量完全不计入 `/stats/users`」。顺带修正了另一处：
+/// mux 只计上行、不计下行，这里一并覆盖。
+#[tokio::test]
+async fn mux_substreams_attribute_bytes_to_the_authenticated_user() {
+    let echo = echo().await;
+    let ctx = context();
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let task = tokio::spawn(mux::serve(
+        server,
+        ctx.clone(),
+        "test".into(),
+        false,
+        Some("alice"),
+    ));
+
+    // 上行 5 字节，服务端回显 5 字节。
+    client
+        .write_all(&new_frame(
+            9,
+            NETWORK_TCP,
+            "127.0.0.1",
+            echo.port(),
+            Some(b"hello"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let mut echoed = Vec::new();
+    timeout(Duration::from_secs(5), async {
+        while echoed.as_slice() != b"hello" {
+            let frame = decode(&mut client).await.unwrap().unwrap();
+            echoed.extend_from_slice(&frame.payload.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+
+    let snapshot = ctx
+        .stats
+        .user_snapshots()
+        .into_iter()
+        .find(|item| item.user == "alice")
+        .expect("alice 应该有计数条目");
+    assert!(
+        snapshot.uplink >= 5,
+        "上行应归到 alice，实际 {}",
+        snapshot.uplink
+    );
+    assert!(
+        snapshot.downlink >= 5,
+        "下行也应归到 alice（此前 mux 完全不计下行），实际 {}",
+        snapshot.downlink
+    );
+    assert_eq!(snapshot.inbound, "test");
+
+    let _ = client.shutdown().await;
+    drop(client);
+    let _ = timeout(Duration::from_secs(5), task).await;
 }

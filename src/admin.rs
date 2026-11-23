@@ -97,12 +97,23 @@ async fn handle(
         )
         .await;
     }
+    // 路由按**不含查询串**的路径匹配；`?inbound=` 等参数另行解析。
+    let route = request
+        .path
+        .split_once('?')
+        .map_or(request.path, |(path, _)| path);
     let known = matches!(
-        request.path,
-        "/healthz" | "/stats" | "/stats/users" | "/metrics" | "/connections"
-    ) || request.path.starts_with("/connections/");
-    // `/metrics` 是只读端点，不接受 DELETE；其余管理端点允许 GET/DELETE。
-    if request.path == "/metrics" && request.method != "GET" {
+        route,
+        "/healthz"
+            | "/stats"
+            | "/stats/users"
+            | "/stats/users/reset"
+            | "/stats/users/limits"
+            | "/metrics"
+            | "/connections"
+    ) || route.starts_with("/connections/");
+    // `/metrics` 是只读端点，不接受 DELETE；其余管理端点允许 GET/DELETE/POST。
+    if route == "/metrics" && request.method != "GET" {
         return respond(
             &mut stream,
             deadline,
@@ -113,7 +124,12 @@ async fn handle(
         )
         .await;
     }
-    if !matches!(request.method, "GET" | "DELETE") {
+    // POST 只有两个写端点；其余路径一律按方法不允许处理，避免
+    // `POST /stats` 之类落到 404（那会误导成「端点不存在」）。
+    let post_allowed = route == "/stats/users/reset" || route == "/stats/users/limits";
+    let method_ok =
+        matches!(request.method, "GET" | "DELETE") || (request.method == "POST" && post_allowed);
+    if !method_ok {
         let (code, reason, headers) = if known {
             (405, "Method Not Allowed", "Allow: GET, DELETE\r\n")
         } else {
@@ -121,7 +137,7 @@ async fn handle(
         };
         return respond(&mut stream, deadline, code, reason, headers, b"").await;
     }
-    match (request.method, request.path) {
+    match (request.method, route) {
         ("GET", "/healthz") => {
             respond(&mut stream, deadline, 200, "OK", "", br#"{"status":"ok"}"#).await
         }
@@ -133,6 +149,39 @@ async fn handle(
         ("GET", "/stats/users") => {
             let body = serde_json::to_vec(&stats.user_snapshots())
                 .map_err(|_| io::Error::other("用户统计序列化失败"))?;
+            respond(&mut stream, deadline, 200, "OK", "", &body).await
+        }
+        // 清零累计字节。`?inbound=` / `?user=` 可缩小范围，省略则清全部。
+        ("POST", _) if route.starts_with("/stats/users/reset") => {
+            let (inbound, user) = query_filters(request.path);
+            let count = stats.reset_users(inbound.as_deref(), user.as_deref());
+            let body = serde_json::to_vec(&serde_json::json!({ "reset": count }))
+                .map_err(|_| io::Error::other("重置结果序列化失败"))?;
+            respond(&mut stream, deadline, 200, "OK", "", &body).await
+        }
+        // 设置软配额与到期时间（`?quota_bytes=` / `?expires_at_ms=`）。
+        // 只影响之后的新连接，不断开已有连接。
+        ("POST", _) if route.starts_with("/stats/users/limits") => {
+            // 从**原始** `request.path` 取查询串：`route` 已把 `?...` 去掉。
+            let (inbound, user) = query_filters(request.path);
+            let quota =
+                query_value(request.path, "quota_bytes").and_then(|value| value.parse().ok());
+            let expires =
+                query_value(request.path, "expires_at_ms").and_then(|value| value.parse().ok());
+            if quota.is_none() && expires.is_none() {
+                return respond(
+                    &mut stream,
+                    deadline,
+                    400,
+                    "Bad Request",
+                    "",
+                    br#"{"error":"quota_bytes or expires_at_ms required"}"#,
+                )
+                .await;
+            }
+            let count = stats.set_user_limits(inbound.as_deref(), user.as_deref(), quota, expires);
+            let body = serde_json::to_vec(&serde_json::json!({ "updated": count }))
+                .map_err(|_| io::Error::other("限额结果序列化失败"))?;
             respond(&mut stream, deadline, 200, "OK", "", &body).await
         }
         ("GET", "/metrics") => {
@@ -174,6 +223,58 @@ struct Request<'a> {
     authorization: Option<&'a str>,
 }
 
+/// 从 `?a=b&c=d` 形式的路径里取查询串。
+fn query_of(path: &str) -> Option<&str> {
+    path.split_once('?').map(|(_, query)| query)
+}
+
+fn query_value(path: &str, key: &str) -> Option<String> {
+    query_of(path)?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| *name == key)
+        .map(|(_, value)| percent_decode(value))
+}
+
+/// 取 `inbound` 与 `user` 两个过滤项。空字符串视为未指定。
+fn query_filters(path: &str) -> (Option<String>, Option<String>) {
+    let pick = |key: &str| query_value(path, key).filter(|value| !value.is_empty());
+    (pick("inbound"), pick("user"))
+}
+
+/// 只解码 `%XX` 与 `+`；这两个接口的取值是 tag 与用户名，不含其它需要转义的字符。
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+                match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                    Some(byte) => {
+                        out.push(byte);
+                        index += 3;
+                    }
+                    None => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn parse(head: &[u8]) -> Option<Request<'_>> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut request = httparse::Request::new(&mut headers);
@@ -185,7 +286,9 @@ fn parse(head: &[u8]) -> Option<Request<'_>> {
     }
     let method = request.method?;
     let path = request.path?;
-    if path.contains('?') {
+    // 查询串是合法输入（`/stats/users/reset?inbound=x`），保留原样交给路由层；
+    // 早期实现直接拒绝带 `?` 的请求，导致所有带参数的端点都回 400。
+    if path.len() > 2048 {
         return None;
     }
     let authorization = request

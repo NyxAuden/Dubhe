@@ -32,14 +32,41 @@ pub struct Stats {
 }
 
 /// 单个用户的累计字节。只统计已接入归因的协议路径。
-#[derive(Default)]
 pub struct UserCounters {
     uplink: AtomicU64,
     downlink: AtomicU64,
+    /// 计数起点（unix 毫秒）。`reset` 时更新，用于告诉面板「这个数字从什么时候开始算」。
+    since_ms: AtomicU64,
+    /// 配额上限（字节）；`0` 表示不限制。超限后拒绝**新连接**，不断开已有连接。
+    quota_bytes: AtomicU64,
+    /// 到期时间（unix 毫秒）；`0` 表示不过期。
+    expires_at_ms: AtomicU64,
+}
+
+impl Default for UserCounters {
+    fn default() -> Self {
+        Self {
+            uplink: AtomicU64::new(0),
+            downlink: AtomicU64::new(0),
+            since_ms: AtomicU64::new(now_ms()),
+            quota_bytes: AtomicU64::new(0),
+            expires_at_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 impl UserCounters {
-    pub(crate) fn add(&self, uplink: bool, bytes: usize) {
+    /// 计入一批业务字节。
+    ///
+    /// 公开是因为 `tests/mux_cool.rs` 以 `#[path]` 方式把 `src/mux.rs` 编进
+    /// 测试 crate，那里的 `pub(crate)` 指向测试 crate 自己。
+    pub fn add(&self, uplink: bool, bytes: usize) {
         let counter = if uplink { &self.uplink } else { &self.downlink };
         counter.fetch_add(bytes as u64, Ordering::Relaxed);
     }
@@ -51,6 +78,47 @@ impl UserCounters {
     pub fn downlink(&self) -> u64 {
         self.downlink.load(Ordering::Relaxed)
     }
+
+    pub fn since_ms(&self) -> u64 {
+        self.since_ms.load(Ordering::Relaxed)
+    }
+
+    /// 清零累计字节并把计数起点移到当前时刻。
+    ///
+    /// 与并发累加有极小竞态（`store` 与 `fetch_add` 之间到达的字节可能丢失），
+    /// 这与 Xray 的 `StatsService` 语义一致：重置是运维动作，不追求逐字节精确。
+    pub fn reset(&self) {
+        self.uplink.store(0, Ordering::Relaxed);
+        self.downlink.store(0, Ordering::Relaxed);
+        self.since_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    pub fn set_quota(&self, bytes: u64) {
+        self.quota_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    pub fn set_expires_at(&self, at_ms: u64) {
+        self.expires_at_ms.store(at_ms, Ordering::Relaxed);
+    }
+
+    /// 该用户是否仍允许建立新连接。
+    ///
+    /// 只检查「到期」与「累计用量」，**不断开已建立的连接**：与 Xray/sing-box
+    /// 一致，配额是准入控制而不是强制中断。
+    pub fn admits_new_connection(&self) -> bool {
+        let expires = self.expires_at_ms.load(Ordering::Relaxed);
+        if expires != 0 && now_ms() >= expires {
+            return false;
+        }
+        let quota = self.quota_bytes.load(Ordering::Relaxed);
+        if quota != 0 {
+            let used = self.uplink() + self.downlink();
+            if used >= quota {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// 管理接口返回的单用户快照。
@@ -60,6 +128,12 @@ pub struct UserSnapshot {
     pub user: String,
     pub uplink: u64,
     pub downlink: u64,
+    /// 计数起点（unix 毫秒）。`reset` 会更新它，面板据此判断「这个数字算的是哪一段」。
+    pub since_ms: u64,
+    /// 配额上限（字节）；`0` 表示不限制。
+    pub quota_bytes: u64,
+    /// 到期时间（unix 毫秒）；`0` 表示不过期。
+    pub expires_at_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -241,6 +315,9 @@ impl Stats {
                 user: user.clone(),
                 uplink: counter.uplink(),
                 downlink: counter.downlink(),
+                since_ms: counter.since_ms(),
+                quota_bytes: counter.quota_bytes.load(Ordering::Relaxed),
+                expires_at_ms: counter.expires_at_ms.load(Ordering::Relaxed),
             })
             .collect();
         items.sort_by(|left, right| {
@@ -251,7 +328,70 @@ impl Stats {
         items
     }
 
+    /// 清零用户计数。`inbound` 与 `user` 均为 `None` 时清空全部。
+    ///
+    /// 返回被清零的条目数。用于面板的「重置流量」动作——此前只有只读的
+    /// `GET /stats/users`，计数只能等进程重启才归零。
+    pub fn reset_users(&self, inbound: Option<&str>, user: Option<&str>) -> usize {
+        let users = self.users.read().unwrap_or_else(|error| error.into_inner());
+        let mut count = 0;
+        for ((entry_inbound, entry_user), counter) in users.iter() {
+            if inbound.is_some_and(|value| value != entry_inbound) {
+                continue;
+            }
+            if user.is_some_and(|value| value != entry_user) {
+                continue;
+            }
+            counter.reset();
+            count += 1;
+        }
+        count
+    }
+
+    /// 设置某个用户（或全部匹配项）的配额与到期时间。
+    pub fn set_user_limits(
+        &self,
+        inbound: Option<&str>,
+        user: Option<&str>,
+        quota_bytes: Option<u64>,
+        expires_at_ms: Option<u64>,
+    ) -> usize {
+        let users = self.users.read().unwrap_or_else(|error| error.into_inner());
+        let mut count = 0;
+        for ((entry_inbound, entry_user), counter) in users.iter() {
+            if inbound.is_some_and(|value| value != entry_inbound) {
+                continue;
+            }
+            if user.is_some_and(|value| value != entry_user) {
+                continue;
+            }
+            if let Some(quota) = quota_bytes {
+                counter.set_quota(quota);
+            }
+            if let Some(expires) = expires_at_ms {
+                counter.set_expires_at(expires);
+            }
+            count += 1;
+        }
+        count
+    }
+
     /// 包裹客户端流：读入算上行、写出算下行。`None` 表示该路径暂不归因。
+    /// 准入检查：该用户当前是否允许建立新连接。
+    ///
+    /// 只检查配额与到期，**不断开已建立的连接**。作为准入控制而不是强制中断，
+    /// 与 Xray/Sing-box 把「策略」留给面板的做法一致；区别是内核能直接拒绝，
+    /// 面板不必再拉一层。
+    pub fn admit_user(&self, inbound: &str, user: Option<&str>) -> bool {
+        let Some(user) = user else {
+            return true;
+        };
+        let users = self.users.read().unwrap_or_else(|error| error.into_inner());
+        users
+            .get(&(inbound.to_owned(), user.to_owned()))
+            .is_none_or(|counter| counter.admits_new_connection())
+    }
+
     pub fn count_user<S>(
         self: &Arc<Self>,
         inbound: &str,

@@ -48,6 +48,16 @@
 
 ### 修复
 
+- **管理 API 此前会丢弃任何带查询串的请求**：`src/admin.rs` 的 `parse()` 里有
+  `if path.contains('?') { return None }`，导致 `/stats/users/reset?inbound=x`
+  这类请求直接 400。现按「不含查询串的路径」路由，查询参数单独解析。
+- **Mux.Cool 子流现在按用户归因**：`mux::serve` / `serve_scoped` 增加 `user`
+  参数，子流业务字节计入 `/stats/users`。顺带修正 **mux 只计上行、完全不计
+  下行**的问题——此前 mux 流量的下行业务字节连全局计数都没进。
+- 新增 `POST /stats/users/reset`（可 `?inbound=` / `?user=` 缩小范围）与
+  `POST /stats/users/limits`（`?quota_bytes=` / `?expires_at_ms=`）。
+  **配额目前只记录不强制**：判定函数已就位，但统一拨号入口拿不到用户身份，
+  接上需要改 18 处调用点，见 `docs/usage.md` 的边界说明。
 - **半开连接内存降低 97%**：`accept_loop` 的每连接任务与 `handle` 分派都未装箱，
   JoinSet 按值携带整个协议状态机。实测 2000 条半开连接占用 201 MB
   （97 KB/连接），装箱后降到 12 MB（约 40 KB/连接）。稳态连接本就是 4.8 KB，

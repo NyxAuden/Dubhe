@@ -436,7 +436,7 @@ async fn bridge_once(ctx: Arc<Context>, tag: String, proxy: Arc<ProxyOutbound>) 
     let stream = ctx.dial_proxy_transport(&proxy, false).await?;
     let stream = crate::outbound::vless_reverse_connect(stream, &proxy).await?;
     // Portal 可通过同一隧道建立 Mux UDP 会话；Bridge 侧按本地路由拨出。
-    mux::serve(stream, ctx, tag, true).await
+    mux::serve(stream, ctx, tag, true, None).await
 }
 
 /// 处理 Bridge 下行帧；返回 `false` 表示隧道应终止。
@@ -727,6 +727,7 @@ mod tests {
             bridge,
             "bridge".into(),
             true,
+            None,
         ));
         registry.attach("portal", client_side, &ctx).unwrap();
 
@@ -862,6 +863,7 @@ mod runtime_tests {
             bridge_ctx,
             "bridge".into(),
             true,
+            None,
         ));
 
         // 通过 SOCKS5 入站的普通连接经 portal 的 mux 会话到达 echo。
