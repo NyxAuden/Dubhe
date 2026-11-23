@@ -107,11 +107,14 @@ fn config(geo: Value, rule: Value) -> Value {
     value
 }
 
-/// 发一个 SOCKS 请求，断言它**没有**被正常转发。
+/// 发一个 SOCKS 请求，断言**路由真的把它交给了 reject 出站**。
 ///
-/// 三种预期形态都算「被拒绝」：SOCKS 回复非 0、直接断开、连上但收不到回显。
-/// 不能复用 `common::socks`——它内部断言握手成功。
+/// 不能用「连接看起来失败」当证据：拨号失败、DNS 失败、超时都长得像拒绝。
+/// `reject` 出站会调用 `stats.reject()`（见 `src/forward.rs`），所以断言
+/// 这个计数增长才是确定性的——不受 CI 是否有外网、目标端口是否可连影响。
 async fn assert_rejected(server: &Running, target: &str, port: u16) {
+    let before = server.stats.snapshot().rejected;
+
     let mut stream = tokio::net::TcpStream::connect(server.address)
         .await
         .expect("连不上 SOCKS 入口");
@@ -135,18 +138,14 @@ async fn assert_rejected(server: &Running, target: &str, port: u16) {
     request.extend(port.to_be_bytes());
     stream.write_all(&request).await.unwrap();
 
-    // 统一走 common 的完整读取，避免「只读前缀、剩余地址被当成回显」。
-    let (code, _) = common::read_socks_reply(&mut stream).await;
-    if code != 0 {
-        return;
-    }
-    let mut buffer = [0u8; 8];
-    let read = tokio::time::timeout(Duration::from_millis(800), stream.read(&mut buffer)).await;
-    let detail = format!("target={target}:{port} read={read:?}");
-    assert!(
-        matches!(read, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
-        "reject 规则下不应收到回显；{detail}"
-    );
+    // 断言服务端确实记了一次拒绝，而不是「连接恰好失败」。
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while server.stats.snapshot().rejected <= before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("服务端没有记录拒绝，说明 {target}:{port} 未命中 reject 规则"));
 }
 
 /// 正常转发：断言回显一致。
@@ -179,6 +178,30 @@ async fn geosite_full_domain_matches_and_rejects() {
     assert_rejected(&server, "blocked.test", echo.address.port()).await;
     // 未命中：其它域名照常直连，证明规则不是无条件拒绝。
     assert_relayed(&server, echo.address, b"ok").await;
+    server.shutdown().await;
+}
+
+/// Xray 的 domain 数组内部是 OR：Full 与后缀项**不能互相要求同时成立**。
+///
+/// 这是真实数据暴露过的 bug：把 239 条 Full 与 839 条后缀分别塞进
+/// `domains` 与 `domain_suffix` 两个字段后，两个字段变成 AND，任何域名
+/// 都匹配不上。
+#[tokio::test]
+async fn geosite_mixed_full_and_suffix_are_or_combined() {
+    let directory = tempfile::tempdir().unwrap();
+    let site = encode_geosite(&[("mixed", &[("exact.test", 3), ("suffix.test", 2)])]);
+    let geosite = write(directory.path(), "geosite.dat", &site);
+
+    let server = Running::start(config(
+        json!({"geosite": geosite}),
+        json!({"domains": ["geosite:mixed"], "outbound": "reject"}),
+    ))
+    .await;
+
+    // Full 项命中。
+    assert_rejected(&server, "exact.test", 80).await;
+    // 后缀项命中（含子域）。
+    assert_rejected(&server, "sub.suffix.test", 80).await;
     server.shutdown().await;
 }
 

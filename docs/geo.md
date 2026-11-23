@@ -63,6 +63,23 @@ MaxMind 数据库的 API 是「输入 IP → 查国家码」，**无法反向列
 - `domains: ["example.org", "geosite:cn", "rule_set:ads"]`
 - `ip_cidrs: ["10.0.0.0/8", "geoip:cn", "mmdb:CN"]`
 
+## 匹配语义
+
+`geosite:` 展开出的项（Xray 的 `Full` / `Domain` / `Substr` / `Regex`）
+**内部是 OR**：任一命中即算该规则命中。这与 Xray 的 `domain` 数组语义一致。
+
+注意它们与手写字段之间仍是 AND：下面这条规则要求「命中 geosite:cn」**且**
+「目标是 443 端口」。
+
+```json
+{"domains": ["geosite:cn"], "ports": [{"start": 443, "end": 443}], "outbound": "direct"}
+```
+
+> 实现上展开项存在独立字段里，**不并入** `domains` / `domain_suffix`。
+> 曾经把它们按类型塞进对应字段，结果 239 条 Full 与 839 条后缀变成两个
+> 互斥的 AND 条件，任何域名都匹配不上——这个 bug 由真实数据用例发现，
+> 现在有专门的回归测试（`geosite_mixed_full_and_suffix_are_or_combined`）。
+
 ## 失败行为
 
 全部**失败关闭**，且在 `dubhe check` 阶段就能发现（不需要真正启动）：

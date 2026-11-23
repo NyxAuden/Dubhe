@@ -79,6 +79,13 @@ struct CompiledRule {
     domain_regex: Vec<regex::Regex>,
     ip_cidrs: Vec<IpNet>,
     ip_is_private: bool,
+    /// 地理数据集展开出的域名项。
+    ///
+    /// **必须独立于 `domains`/`domain_suffix` 等字段**：Xray 的 domain 数组
+    /// 内部是 OR（Full/Domain/Substr/Regex 任一命中即可），而那些字段之间是
+    /// AND。把展开结果混进去会让「239 条 Full + 839 条后缀」互相要求同时成立，
+    /// 导致任何域名都匹配不上。
+    geo_domains: Vec<crate::geo::DomainMatcher>,
     /// `mmdb:<code>`：只能运行期按 IP 查国家码，不能预先展开成 CIDR。
     mmdb_codes: Vec<String>,
     /// 运行期 mmdb 查询需要的数据集；没配 `geo` 时为 None。
@@ -409,23 +416,23 @@ impl Router {
                 let destination = resolve(&rule.outbound)?;
                 // `geosite:` / `geoip:` 在此展开成具体项；`mmdb:` 留到运行期。
                 let (geo_domains, geo_ips, mmdb_codes) = expand_geo(geo_data.as_deref(), rule)?;
-                let mut domains: Vec<String> = rule
+                let domains: Vec<String> = rule
                     .domains
                     .iter()
                     .filter(|value| crate::geo::code_of(value).is_none())
                     .map(|domain| normalize_domain(domain))
                     .collect();
-                let mut domain_suffix: Vec<String> = rule
+                let domain_suffix: Vec<String> = rule
                     .domain_suffix
                     .iter()
                     .map(|suffix| normalize_domain(suffix))
                     .collect();
-                let mut domain_keyword: Vec<String> = rule
+                let domain_keyword: Vec<String> = rule
                     .domain_keyword
                     .iter()
                     .map(|keyword| keyword.to_ascii_lowercase())
                     .collect();
-                let mut domain_regex: Vec<regex::Regex> = rule
+                let domain_regex: Vec<regex::Regex> = rule
                     .domain_regex
                     .iter()
                     .map(|pattern| {
@@ -434,17 +441,14 @@ impl Router {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                // 展开结果按类型并入对应集合。
-                for item in geo_domains {
-                    match item {
-                        crate::geo::DomainMatcher::Full(value) => domains.push(value),
-                        crate::geo::DomainMatcher::Suffix(value) => domain_suffix.push(value),
-                        crate::geo::DomainMatcher::Keyword(value) => domain_keyword.push(value),
-                        crate::geo::DomainMatcher::Regex(value) => {
-                            domain_regex.push(regex::Regex::new(&value).map_err(|error| {
-                                anyhow::anyhow!("geosite 数据里的正则 {value:?} 无效: {error}")
-                            })?);
-                        }
+                // 展开结果单独保存：与用户手写的字段之间是 AND，但展开项
+                // 内部是 OR（对齐 Xray 的 domain 数组语义）。
+                for item in &geo_domains {
+                    if let crate::geo::DomainMatcher::Regex(value) = item {
+                        // 正则在加载期就编译，坏数据要在 check 阶段暴露。
+                        regex::Regex::new(value).map_err(|error| {
+                            anyhow::anyhow!("geosite 数据里的正则 {value:?} 无效: {error}")
+                        })?;
                     }
                 }
                 let mut ip_cidrs: Vec<IpNet> = rule
@@ -467,6 +471,7 @@ impl Router {
                     domain_regex,
                     ip_cidrs,
                     ip_is_private: rule.ip_is_private,
+                    geo_domains,
                     mmdb_codes,
                     geo: geo_data.clone(),
                     ports: rule.ports.clone(),
@@ -1154,6 +1159,11 @@ impl CompiledRule {
                         .iter()
                         .any(|pattern| pattern.is_match(domain))
                 }))
+            // 地理展开项内部取 OR，与上面的字段之间是 AND。
+            && (self.geo_domains.is_empty()
+                || domain.is_some_and(|domain| {
+                    self.geo_domains.iter().any(|item| item.matches(domain))
+                }))
             && (self.ports.is_empty()
                 || self
                     .ports
@@ -1206,6 +1216,63 @@ pub(crate) fn matches_domain_suffix(domain: &str, suffix: &str) -> bool {
 #[cfg(test)]
 mod geo_expand_tests {
     use super::*;
+
+    /// 真实数据经过 Router 编译后，`google.com` 必须真的选中 reject 出站。
+    ///
+    /// 这条比「展开结果里有 Suffix」更强：它验证展开结果真的进了编译后的
+    /// 规则，并参与了选择。
+    #[test]
+    fn real_geosite_router_selects_reject_for_google() {
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".test-artifacts/geodata");
+        if !dir.join("geosite.dat").is_file() {
+            eprintln!("跳过：未下载真实数据集");
+            return;
+        }
+        let value = serde_json::json!({
+            "version": 1,
+            "geo": {"geosite": dir.join("geosite.dat")},
+            "inbounds": [{"type": "socks5", "tag": "s", "listen": "127.0.0.1:0"}],
+            "outbounds": [
+                {"type": "direct", "tag": "direct"},
+                {"type": "reject", "tag": "reject"}
+            ],
+            "route": {
+                "default": "direct",
+                "rules": [{"domains": ["geosite:google"], "outbound": "reject"}]
+            }
+        });
+        let config = crate::config::Config::from_json(&value.to_string()).unwrap();
+        eprintln!("config.geo.is_some() = {}", config.geo.is_some());
+        let router = Router::new(&config).unwrap();
+        eprintln!("编译后规则数 = {}", router.rules.len());
+        if let Some(rule) = router.rules.first() {
+            eprintln!(
+                "rule0: domains={} suffix={} keyword={} regex={} inbounds={:?} networks={:?}",
+                rule.domains.len(),
+                rule.domain_suffix.len(),
+                rule.domain_keyword.len(),
+                rule.domain_regex.len(),
+                rule.inbounds,
+                rule.networks
+            );
+            eprintln!(
+                "rule0 含 google.com 后缀: {}",
+                rule.domain_suffix.iter().any(|s| s == "google.com")
+            );
+            eprintln!("rule0 destination kind = {:?}", rule.destination);
+        }
+        let target = Target {
+            host: Host::Domain("google.com".into()),
+            port: 443,
+        };
+        let selected = router.select_outbound("s", Network::Tcp, &target);
+        assert_eq!(
+            selected.kind,
+            OutboundKind::Reject,
+            "google.com 应命中 geosite:google 规则"
+        );
+    }
 
     /// 真实数据展开后，规则里必须真的出现 `google.com` 的后缀项。
     #[test]

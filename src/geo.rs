@@ -36,11 +36,59 @@ pub enum DomainMatcher {
     Regex(String),
 }
 
+impl DomainMatcher {
+    /// 该域名是否命中本项。
+    ///
+    /// 语义对齐 Xray：`Full` 整域相等、`Suffix` 匹配自身及子域、
+    /// `Keyword` 子串、`Regex` 正则。调用方拿到的 `domain` 已归一化
+    /// （小写、去掉尾点），这里不再重复处理。
+    pub fn matches(&self, domain: &str) -> bool {
+        match self {
+            Self::Full(value) => domain == value,
+            Self::Suffix(value) => {
+                domain == value
+                    || domain
+                        .strip_suffix(value.as_str())
+                        .is_some_and(|prefix| prefix.ends_with('.'))
+            }
+            Self::Keyword(value) => domain.contains(value.as_str()),
+            Self::Regex(value) => regex::Regex::new(value).is_ok_and(|re| re.is_match(domain)),
+        }
+    }
+}
+
 /// 展开后的 IP 匹配项。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cidr {
     pub addr: IpAddr,
     pub prefix: u8,
+}
+
+impl Cidr {
+    /// 该地址是否落在本网段内（仅在地址族相同时比较）。
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        fn bits(ip: IpAddr) -> Option<u128> {
+            match ip {
+                IpAddr::V4(v4) => Some(u128::from(u32::from(v4))),
+                IpAddr::V6(v6) => Some(u128::from(v6)),
+            }
+        }
+        let (Some(network), Some(candidate)) = (bits(self.addr), bits(ip)) else {
+            return false;
+        };
+        let width: u32 = if self.addr.is_ipv4() { 32 } else { 128 };
+        if u32::from(self.prefix) > width {
+            return false;
+        }
+        if self.addr.is_ipv4() != ip.is_ipv4() {
+            return false;
+        }
+        let shift = width - u32::from(self.prefix);
+        if shift == 0 {
+            return network == candidate;
+        }
+        (network >> shift) == (candidate >> shift)
+    }
 }
 
 /// 一个地理数据集：已解析的域名与 CIDR。
@@ -613,6 +661,31 @@ mod tests {
             .filter(|item| matches!(item, DomainMatcher::Suffix(value) if value == "google.com"))
             .count();
         assert_eq!(suffix, 1, "google.com 应作为唯一的 Suffix 项存在");
+    }
+
+    /// 真实数据里 `geoip:cn` 必须包含集成用例依赖的地址。
+    ///
+    /// 这条断言把「测试假设」变成显式的：如果数据更新后不再包含
+    /// 223.5.5.5，这里先失败，而不是让集成用例以「连接失败」的假象通过。
+    #[test]
+    fn real_geoip_contains_the_cn_sample_address() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".test-artifacts/geodata/geoip.dat");
+        if !path.is_file() {
+            eprintln!("跳过：未下载真实数据集");
+            return;
+        }
+        let ips = parse_geoip(&path).unwrap();
+        let cn = ips.get("cn").expect("应有 cn 分类");
+        let sample: IpAddr = "223.5.5.5".parse().unwrap();
+        assert!(
+            cn.iter().any(|cidr| cidr.contains(sample)),
+            "geoip:cn 未包含 223.5.5.5，集成用例的样本已失效，需重新挑选"
+        );
+        assert!(
+            !cn.iter()
+                .any(|cidr| cidr.contains("8.8.8.8".parse().unwrap()))
+        );
     }
 
     #[test]
