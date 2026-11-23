@@ -1,15 +1,18 @@
 //! 外部地理数据集的解析与规则展开。
 //!
-//! 支持三种数据源（内核只读取用户提供的文件，不内置、不下载、不校验）：
+//! 四类数据源（内核只读取用户提供的文件，不内置、不下载、不校验）：
 //!
 //! - Xray / Mihomo 的 `geosite.dat` / `geoip.dat`（protobuf，见
 //!   `xray.common.geodata`）
 //! - MaxMind `mmdb`（Mihomo 的 IP 分流、sing-box 也支持）
 //! - sing-box rule-set **source JSON**（不是 `.srs` 二进制）
 //!
-//! 路由规则里的 `geosite:<code>`、`geoip:<code>`、`mmdb:<code>`、
-//! `rule_set:<tag>` 在**配置加载阶段**展开成具体域名/CIDR，之后走既有的
-//! 匹配逻辑，不改变运行期行为。
+//! 展开时机按数据形态区分：
+//!
+//! - `geosite:` / `geoip:` / `rule_set:` 在**配置加载阶段**展开成具体
+//!   域名与 CIDR，之后走既有匹配逻辑；
+//! - `mmdb:` **不展开**：`maxminddb` 虽然提供 `networks()` 遍历接口，
+//!   但全库展开在启动时更慢、占用更大；本项目选择运行期按 IP 查询。
 
 use std::{collections::HashMap, net::IpAddr, path::Path};
 
@@ -46,10 +49,12 @@ impl DomainMatcher {
         match self {
             Self::Full(value) => domain == value,
             Self::Suffix(value) => {
-                domain == value
-                    || domain
-                        .strip_suffix(value.as_str())
-                        .is_some_and(|prefix| prefix.ends_with('.'))
+                let core = value.trim_start_matches('.');
+                !core.is_empty()
+                    && (domain == core
+                        || domain
+                            .strip_suffix(core)
+                            .is_some_and(|prefix| prefix.ends_with('.')))
             }
             Self::Keyword(value) => domain.contains(value.as_str()),
             Self::Regex(value) => regex::Regex::new(value).is_ok_and(|re| re.is_match(domain)),
@@ -83,6 +88,11 @@ impl Cidr {
         if self.addr.is_ipv4() != ip.is_ipv4() {
             return false;
         }
+        // 地址族已确认一致，`/0` 覆盖该族全部地址；直接返回可避免
+        // `u128 >> 128` 的右移溢出（debug 构建会 panic）。
+        if self.prefix == 0 {
+            return true;
+        }
         let shift = width - u32::from(self.prefix);
         if shift == 0 {
             return network == candidate;
@@ -91,11 +101,21 @@ impl Cidr {
     }
 }
 
+/// 一个 sing-box rule-set source JSON 里我们支持的子集。
+#[derive(Debug, Default)]
+struct RuleSetData {
+    domains: Vec<DomainMatcher>,
+    ips: Vec<Cidr>,
+}
+
 /// 一个地理数据集：已解析的域名与 CIDR。
 #[derive(Default)]
 pub struct GeoData {
     sites: HashMap<String, Vec<DomainMatcher>>,
     ips: HashMap<String, Vec<Cidr>>,
+    /// rule-set 独立命名空间：不与 geosite/geoip 的 code 混用，避免
+    /// 「tag=cn 覆盖 geosite 的 cn」这类静默覆盖。
+    rule_sets: HashMap<String, RuleSetData>,
     /// MaxMind 数据库：只能「输入 IP → 查国家码」，无法反向列出某国的
     /// 全部网段。因此它走**运行期匹配**，不像 dat 那样在加载期展开。
     mmdb: Option<maxminddb::Reader<Vec<u8>>>,
@@ -173,65 +193,92 @@ pub fn load(config: &GeoConfig) -> Result<GeoData> {
         );
     }
     for source in &config.rule_sets {
-        let (sites, ips) = parse_rule_set(&source.path)?;
-        if !sites.is_empty() {
-            data.sites.insert(source.tag.to_ascii_lowercase(), sites);
-        }
-        if !ips.is_empty() {
-            data.ips.insert(source.tag.to_ascii_lowercase(), ips);
-        }
+        let tag = source.tag.trim();
+        ensure!(!tag.is_empty(), "geo.rule_sets[].tag 不能为空");
+        let key = tag.to_ascii_lowercase();
+        ensure!(
+            !data.rule_sets.contains_key(&key),
+            "geo.rule_sets 的 tag 重复（忽略大小写）: {tag}"
+        );
+        let parsed = parse_rule_set(&source.path)?;
+        data.rule_sets.insert(key, parsed);
     }
     Ok(data)
 }
 
-/// 展开一条路由规则里的 `geosite:` / `geoip:` / `mmdb:` / `rule_set:` 引用。
+/// 一条规则展开后的地理条件。
 ///
-/// 返回 `(额外的域名匹配项, 额外的 CIDR)`。
-pub fn expand(
-    data: &GeoData,
-    domains: &[String],
-    ips: &[String],
-) -> Result<(Vec<DomainMatcher>, Vec<Cidr>, Vec<String>)> {
-    let mut extra_domains = Vec::new();
+/// `domain_used` / `ip_used` 记录「配置里出现过该维度的地理引用」，
+/// 即使展开结果为 0 条也必须算作**有限制**——否则空分类会被当成
+/// 「没有条件」，从「什么域名都不匹配」变成「匹配一切」。
+#[derive(Default, Debug)]
+pub struct Expanded {
+    pub domains: Vec<DomainMatcher>,
+    pub ips: Vec<Cidr>,
+    pub mmdb_codes: Vec<String>,
+    pub domain_used: bool,
+    pub ip_used: bool,
+}
+
+/// 展开一条路由规则里的 `geosite:` / `geoip:` / `mmdb:` / `rule_set:` 引用。
+pub fn expand(data: &GeoData, domains: &[String], ips: &[String]) -> Result<Expanded> {
+    let mut out = Expanded::default();
     for value in domains {
-        let Some(code) = geo_code(value) else {
+        let Some((kind, code)) = geo_code(value) else {
             continue;
         };
-        let (kind, code) = code;
+        out.domain_used = true;
         match kind {
             GeoKind::Site => {
                 let items = data
                     .sites(code)
-                    .ok_or_else(|| anyhow::anyhow!("geosite:{code} 不在已加载的 geosite 数据里"))?;
-                extra_domains.extend_from_slice(items);
+                    .ok_or_else(|| anyhow::anyhow!("{value} 不在已加载的 geosite 数据里"))?;
+                out.domains.extend_from_slice(items);
+            }
+            GeoKind::RuleSet => {
+                let set = data
+                    .rule_sets
+                    .get(&code.to_ascii_lowercase())
+                    .ok_or_else(|| anyhow::anyhow!("{value} 不在已加载的 rule_sets 里"))?;
+                out.domains.extend_from_slice(&set.domains);
             }
             GeoKind::Ip | GeoKind::Mmdb => {
                 bail!("{value} 是 IP 数据集，不能出现在 domains 里；请改用 ip_cidrs")
             }
         }
     }
-    let mut extra_ips = Vec::new();
-    let mut mmdb_codes = Vec::new();
     for value in ips {
         let Some((kind, code)) = geo_code(value) else {
             continue;
         };
+        out.ip_used = true;
         match kind {
             GeoKind::Ip => {
                 let items = data
                     .ips(code)
                     .ok_or_else(|| anyhow::anyhow!("{value} 不在已加载的 GeoIP 数据里"))?;
-                extra_ips.extend_from_slice(items);
+                out.ips.extend_from_slice(items);
             }
-            // mmdb 不能反查：交给运行期按国家码匹配，这里只做可用性检查。
+            GeoKind::RuleSet => {
+                let set = data
+                    .rule_sets
+                    .get(&code.to_ascii_lowercase())
+                    .ok_or_else(|| anyhow::anyhow!("{value} 不在已加载的 rule_sets 里"))?;
+                ensure!(
+                    !set.ips.is_empty(),
+                    "{value} 不含 ip_cidr 项，不能用在 ip_cidrs 里"
+                );
+                out.ips.extend_from_slice(&set.ips);
+            }
+            // mmdb 不能反查：交给运行期按国家码匹配。
             GeoKind::Mmdb => {
                 ensure!(data.mmdb.is_some(), "{value} 需要配置 geo.mmdb 才能使用");
-                mmdb_codes.push(code.to_owned());
+                out.mmdb_codes.push(code.to_owned());
             }
             GeoKind::Site => bail!("{value} 是域名数据集，不能出现在 ip_cidrs 里；请改用 domains"),
         }
     }
-    Ok((extra_domains, extra_ips, mmdb_codes))
+    Ok(out)
 }
 
 #[derive(Clone, Copy)]
@@ -239,6 +286,7 @@ enum GeoKind {
     Site,
     Ip,
     Mmdb,
+    RuleSet,
 }
 
 /// 该值是否是地理数据引用（`geosite:` / `geoip:` / `mmdb:` / `rule_set:`）。
@@ -259,7 +307,7 @@ fn geo_code(value: &str) -> Option<(GeoKind, &str)> {
     let (kind, code) = if let Some(code) = value.strip_prefix("geosite:") {
         (GeoKind::Site, code)
     } else if let Some(code) = value.strip_prefix("rule_set:") {
-        (GeoKind::Site, code)
+        (GeoKind::RuleSet, code)
     } else if let Some(code) = value.strip_prefix("geoip:") {
         (GeoKind::Ip, code)
     } else if let Some(code) = value.strip_prefix("mmdb:") {
@@ -319,6 +367,10 @@ struct GeoIpEntry {
     code: String,
     #[prost(message, repeated, tag = "2")]
     cidr: Vec<GeoCidr>,
+    /// Xray `reverse_match`：语义是该集合取反。本项目不支持，必须显式拒绝，
+    /// 否则会把「反向集合」当成正向集合用，匹配结果完全相反。
+    #[prost(bool, tag = "3")]
+    reverse_match: bool,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -343,7 +395,9 @@ fn parse_geosite(path: &Path) -> Result<HashMap<String, Vec<DomainMatcher>>> {
             }
             let item = match domain.r#type {
                 DOMAIN_FULL => DomainMatcher::Full(value),
-                DOMAIN_DOMAIN | DOMAIN_PLAIN => DomainMatcher::Suffix(value),
+                DOMAIN_DOMAIN => DomainMatcher::Suffix(value),
+                // type 0 是 Substr（子串），不是后缀；早期错映射为 Suffix。
+                DOMAIN_PLAIN => DomainMatcher::Keyword(value),
                 DOMAIN_REGEX => DomainMatcher::Regex(domain.value),
                 other => bail!("geosite 数据里出现未知的域名类型 {other}"),
             };
@@ -363,6 +417,12 @@ fn parse_geoip(path: &Path) -> Result<HashMap<String, Vec<Cidr>>> {
         .with_context(|| format!("geoip 数据不是合法的 protobuf: {}", path.display()))?;
     let mut out = HashMap::new();
     for entry in list.entry {
+        ensure!(
+            !entry.reverse_match,
+            "geoip 分类 {} 使用 reverse_match（反向集合），本项目不支持；\
+             请在数据源侧换成显式网段",
+            entry.code
+        );
         let mut items = Vec::with_capacity(entry.cidr.len());
         for cidr in entry.cidr {
             items.push(cidr_from_bytes(&cidr.ip, cidr.prefix)?);
@@ -400,14 +460,27 @@ fn cidr_from_bytes(ip: &[u8], prefix: u32) -> Result<Cidr> {
 // sing-box rule-set source JSON
 // ---------------------------------------------------------------------------
 
-fn parse_rule_set(path: &Path) -> Result<(Vec<DomainMatcher>, Vec<Cidr>)> {
+/// 解析 sing-box rule-set 的 **source JSON 子集**。
+///
+/// 只接受纯域名/IP 列表；任何会改变语义的字段（`invert`、`type: logical`、
+/// `port`、`network`、`rule_set` 等）都**显式拒绝**，而不是解析后静默丢弃——
+/// 丢弃条件会让规则的匹配范围变大。
+fn parse_rule_set(path: &Path) -> Result<RuleSetData> {
+    const ALLOWED: &[&str] = &[
+        "domain",
+        "domain_suffix",
+        "domain_keyword",
+        "domain_regex",
+        "ip_cidr",
+    ];
     let bytes =
         std::fs::read(path).with_context(|| format!("读取 rule-set 失败: {}", path.display()))?;
     // `.srs` 是 sing-box 的编译产物（魔数 `SRS`）；本实现只吃 source JSON。
-    // 提前识别能给出可操作的提示，而不是笼统的「不是合法 JSON」。
     if bytes.starts_with(b"SRS") || path.extension().is_some_and(|ext| ext == "srs") {
         bail!(
-            "{} 是 sing-box 的二进制 rule-set（.srs），本实现只支持 source JSON；             请用 `sing-box rule-set compile --output <名字>.json` 反向导出，             或直接引用 .srs 对应的 source 文件",
+            "{} 是 sing-box 的二进制 rule-set（.srs），本实现只支持 source JSON；\
+             请用 `sing-box rule-set decompile <文件>.srs` 导出 source JSON，\
+             或直接引用 .srs 对应的 source 文件",
             path.display()
         );
     }
@@ -415,45 +488,104 @@ fn parse_rule_set(path: &Path) -> Result<(Vec<DomainMatcher>, Vec<Cidr>)> {
         .with_context(|| format!("rule-set 不是 UTF-8 文本: {}", path.display()))?;
     let value: serde_json::Value = serde_json::from_str(&raw)
         .with_context(|| format!("rule-set 不是合法 JSON: {}", path.display()))?;
+
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .context("rule-set 的 version 必须是整数（本实现只支持 source JSON）")?;
     ensure!(
-        value.get("version").is_some(),
-        "rule-set 缺少 version 字段（本实现只支持 source JSON，不支持 .srs 二进制）"
+        (1..=5).contains(&version),
+        "rule-set 的 version {version} 不在已知范围 1..=5"
     );
     let rules = value
         .get("rules")
         .and_then(serde_json::Value::as_array)
         .context("rule-set 缺少 rules 数组")?;
-    let mut domains = Vec::new();
-    let mut ips = Vec::new();
-    for rule in rules {
-        collect_strings(rule, "domain", &mut domains, DomainMatcher::Full);
-        collect_strings(rule, "domain_suffix", &mut domains, DomainMatcher::Suffix);
-        collect_strings(rule, "domain_keyword", &mut domains, DomainMatcher::Keyword);
-        collect_strings(rule, "domain_regex", &mut domains, DomainMatcher::Regex);
-        if let Some(list) = rule.get("ip_cidr").and_then(serde_json::Value::as_array) {
-            for item in list.iter().filter_map(serde_json::Value::as_str) {
-                ips.push(parse_cidr_text(item)?);
+
+    let mut data = RuleSetData::default();
+    for (index, rule) in rules.iter().enumerate() {
+        let object = rule
+            .as_object()
+            .with_context(|| format!("rule-set 的 rules[{index}] 必须是对象"))?;
+        // 拒绝任何我们不支持的字段：静默忽略会扩大匹配范围。
+        for key in object.keys() {
+            ensure!(
+                ALLOWED.contains(&key.as_str()),
+                "rule-set 的 rules[{index}] 含不支持的条件 {key:?}；本实现只接受纯域名/IP 列表（{ALLOWED:?}），\
+                 逻辑规则、invert、port、network 等请先在 sing-box 侧展开"
+            );
+        }
+        collect_domains(
+            object,
+            "domain",
+            &mut data.domains,
+            DomainMatcher::Full,
+            false,
+        )?;
+        collect_domains(
+            object,
+            "domain_suffix",
+            &mut data.domains,
+            DomainMatcher::Suffix,
+            false,
+        )?;
+        collect_domains(
+            object,
+            "domain_keyword",
+            &mut data.domains,
+            DomainMatcher::Keyword,
+            false,
+        )?;
+        // 正则保留原文大小写：`\D` 与 `\d` 是不同表达式，改写会改变语义。
+        collect_domains(
+            object,
+            "domain_regex",
+            &mut data.domains,
+            DomainMatcher::Regex,
+            true,
+        )?;
+        if let Some(list) = object.get("ip_cidr").and_then(serde_json::Value::as_array) {
+            for item in list {
+                let text = item
+                    .as_str()
+                    .with_context(|| format!("rule-set 的 rules[{index}].ip_cidr 必须是字符串"))?;
+                data.ips.push(parse_cidr_text(text)?);
             }
         }
     }
-    Ok((domains, ips))
+    ensure!(
+        !data.domains.is_empty() || !data.ips.is_empty(),
+        "rule-set 为空或没有可支持的条目: {}",
+        path.display()
+    );
+    Ok(data)
 }
 
-fn collect_strings(
-    rule: &serde_json::Value,
+fn collect_domains(
+    rule: &serde_json::Map<String, serde_json::Value>,
     key: &str,
     out: &mut Vec<DomainMatcher>,
     wrap: fn(String) -> DomainMatcher,
-) {
+    keep_case: bool,
+) -> Result<()> {
     let Some(list) = rule.get(key).and_then(serde_json::Value::as_array) else {
-        return;
+        return Ok(());
     };
-    for item in list.iter().filter_map(serde_json::Value::as_str) {
-        let value = item.trim().to_ascii_lowercase();
-        if !value.is_empty() {
-            out.push(wrap(value));
+    for item in list {
+        let text = item
+            .as_str()
+            .with_context(|| format!("rule-set 的 {key} 必须是字符串数组"))?;
+        let value = if keep_case {
+            text.trim().to_owned()
+        } else {
+            text.trim().to_ascii_lowercase()
+        };
+        if value.is_empty() {
+            bail!("rule-set 的 {key} 含空字符串");
         }
+        out.push(wrap(value));
     }
+    Ok(())
 }
 
 fn parse_cidr_text(value: &str) -> Result<Cidr> {
@@ -512,6 +644,7 @@ mod tests {
                             prefix: *prefix,
                         })
                         .collect(),
+                    reverse_match: false,
                 })
                 .collect(),
         };
@@ -540,9 +673,13 @@ mod tests {
         assert_eq!(
             items,
             &[
+                // type 3 = Full
                 DomainMatcher::Full("exact.example".into()),
+                // type 2 = Domain（后缀）
                 DomainMatcher::Suffix("suffix.example".into()),
-                DomainMatcher::Suffix("keyword".into()),
+                // type 0 = Substr（子串），早期错映射为 Suffix
+                DomainMatcher::Keyword("keyword".into()),
+                // type 1 = Regex；保留原文大小写
                 DomainMatcher::Regex("^regex\\.example$".into()),
             ]
         );
@@ -566,6 +703,26 @@ mod tests {
             }]
         );
         assert_eq!(ips.get("v6").unwrap()[0].prefix, 16);
+    }
+
+    /// `reverse_match`（Xray 的反向集合）必须显式拒绝，不能当正向集合用。
+    #[test]
+    fn rejects_reverse_match_geoip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip.dat");
+        let list = GeoIpList {
+            entry: vec![GeoIpEntry {
+                code: "rev".into(),
+                cidr: vec![GeoCidr {
+                    ip: vec![10, 0, 0, 0],
+                    prefix: 8,
+                }],
+                reverse_match: true,
+            }],
+        };
+        std::fs::write(&path, list.encode_to_vec()).unwrap();
+        let error = parse_geoip(&path).unwrap_err().to_string();
+        assert!(error.contains("reverse_match"), "{error}");
     }
 
     #[test]
@@ -596,16 +753,16 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let (domains, ips) = parse_rule_set(&path).unwrap();
+        let parsed = parse_rule_set(&path).unwrap();
         assert_eq!(
-            domains,
+            parsed.domains,
             vec![
                 DomainMatcher::Suffix("example.com".into()),
                 DomainMatcher::Keyword("ads".into())
             ]
         );
-        assert_eq!(ips.len(), 2);
-        assert_eq!(ips[0].prefix, 24);
+        assert_eq!(parsed.ips.len(), 2);
+        assert_eq!(parsed.ips[0].prefix, 24);
     }
 
     #[test]
@@ -688,15 +845,29 @@ mod tests {
         );
     }
 
+    /// IPv6 `/0` 必须匹配任意 IPv6 地址，且不能右移溢出。
+    #[test]
+    fn cidr_v6_zero_prefix_matches_any_v6() {
+        let any: Cidr = Cidr {
+            addr: "::".parse().unwrap(),
+            prefix: 0,
+        };
+        assert!(any.contains("2001:db8::1".parse().unwrap()));
+        assert!(!any.contains("127.0.0.1".parse().unwrap()));
+    }
+
     #[test]
     fn plain_values_are_left_alone() {
         let data = GeoData::default();
-        let (domains, ips, mmdb) = expand(
+        let expanded = expand(
             &data,
             &["example.org".into(), "domain:example.net".into()],
             &[],
         )
         .unwrap();
-        assert!(domains.is_empty() && ips.is_empty() && mmdb.is_empty());
+        assert!(expanded.domains.is_empty());
+        assert!(expanded.ips.is_empty());
+        assert!(expanded.mmdb_codes.is_empty());
+        assert!(!expanded.domain_used && !expanded.ip_used);
     }
 }

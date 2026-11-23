@@ -906,23 +906,19 @@ fn convert_routing(
             if let Some(domains) = item.get("domain").and_then(Value::as_array) {
                 let mut exact = Vec::new();
                 for domain in domains.iter().filter_map(Value::as_str) {
-                    if domain.starts_with("geosite:") || domain.starts_with("ext:") {
-                        // dubhe 支持 geosite:，但要求配置里给出 geo.geosite 数据文件；
-                        // 转换结果直接保留该引用，让用户在 dubhe 侧配数据路径即可。
-                        if domain.starts_with("geosite:") {
-                            rule.entry("domains")
-                                .or_insert_with(|| json!([]))
-                                .as_array_mut()
-                                .expect("刚刚插入的是数组")
-                                .push(json!(domain));
-                            report.note(format!(
-                                "routing.rules[{index}] 的 {domain} 已保留；在 dubhe 配置里设置 geo.geosite 指向 geosite.dat 才会生效"
-                            ));
-                        } else {
-                            report.note(format!(
-                                "routing.rules[{index}] 的 {domain} 需要外部规则集，已跳过；可用 geo.rule_sets 引用 sing-box source JSON"
-                            ));
-                        }
+                    if domain.starts_with("geosite:") {
+                        // dubhe 支持 geosite:，但要求配置里给出 geo.geosite
+                        // 数据文件。**必须并进 `exact`**：之前直接写进
+                        // `rule["domains"]`，随后 `rule.insert("domains", exact)`
+                        // 会把它覆盖掉。
+                        exact.push(json!(domain));
+                        report.note(format!(
+                            "routing.rules[{index}] 的 {domain} 已保留；在 dubhe 配置里设置 geo.geosite 指向 geosite.dat 才会生效"
+                        ));
+                    } else if domain.starts_with("ext:") {
+                        report.note(format!(
+                            "routing.rules[{index}] 的 {domain} 需要外部规则集，已跳过；可用 geo.rule_sets 引用 sing-box source JSON"
+                        ));
                     } else if let Some(suffix) = domain.strip_prefix("domain:") {
                         rule.entry("domain_suffix")
                             .or_insert_with(|| json!([]))
@@ -966,9 +962,16 @@ fn convert_routing(
                             "routing.rules[{index}] 的 geoip:private 近似映射为 ip_is_private，请复核地址集合差异"
                         ));
                         rule.insert("ip_is_private".into(), json!(true));
-                    } else if ip.starts_with("geoip:") || ip.starts_with("ext:") {
+                    } else if let Some(code) = ip.strip_prefix("geoip:") {
+                        // dubhe 的 ip_cidrs 支持 geoip:<code>，同样要求
+                        // geo.geoip 指向数据文件。
+                        cidrs.push(json!(format!("geoip:{code}")));
                         report.note(format!(
-                            "routing.rules[{index}] 的 {ip} 需要外部规则集，已跳过"
+                            "routing.rules[{index}] 的 {ip} 已保留；在 dubhe 配置里设置 geo.geoip 指向 geoip.dat 才会生效"
+                        ));
+                    } else if ip.starts_with("ext:") {
+                        report.note(format!(
+                            "routing.rules[{index}] 的 {ip} 需要外部规则集，已跳过；可用 geo.rule_sets 引用 sing-box source JSON"
                         ));
                     } else if ip.starts_with('!') {
                         // Xray 的 `!` 只否定 IP 条件，而 dubhe 的 invert 翻转整条规则；
@@ -1185,9 +1188,46 @@ mod tests {
         assert_eq!(rules[0]["outbound"], "direct");
         assert_eq!(rules[0]["domain_suffix"][0], "example.org");
         assert_eq!(rules[0]["domain_keyword"][0], "ads");
+        // geosite 引用必须保留在 domains 里（此前被后续 insert 覆盖）。
+        assert!(
+            rules[0]["domains"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item == "geosite:cn"),
+            "domains 应保留 geosite:cn：{:?}",
+            rules[0]["domains"]
+        );
         assert_eq!(rules[1]["ports"][0]["start"], 53);
         assert_eq!(rules[1]["ports"][1]["start"], 80);
         assert_eq!(rules[1]["ports"][1]["end"], 90);
+    }
+
+    /// `geoip:<code>` 必须保留到 `ip_cidrs`，而不是「提示后跳过」——
+    /// 跳过会让整条规则退化成无条件匹配。
+    #[test]
+    fn keeps_geoip_reference_in_ip_cidrs() {
+        let value = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [
+                {"type": "field", "ip": ["geoip:cn", "10.0.0.0/8"], "outboundTag": "direct"}
+            ]}
+        });
+        let converted = from_xray(&value.to_string(), None).expect("应可转换");
+        let rendered = serde_json::to_value(&converted.config).unwrap();
+        let cidrs = rendered["route"]["rules"][0]["ip_cidrs"]
+            .as_array()
+            .expect("ip_cidrs 应存在");
+        let values: Vec<&str> = cidrs.iter().filter_map(|item| item.as_str()).collect();
+        assert!(values.contains(&"geoip:cn"), "应保留 geoip:cn：{values:?}");
+        assert!(
+            converted
+                .report
+                .notes
+                .iter()
+                .any(|note| note.contains("geo.geoip"))
+        );
     }
 
     #[test]

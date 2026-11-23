@@ -25,14 +25,7 @@ pub struct Router {
 ///
 /// 没有配置 `geo` 段时，出现 `geosite:` 等引用会直接报错——静默跳过会让
 /// 用户以为规则生效了。
-fn expand_geo(
-    geo_data: Option<&crate::geo::GeoData>,
-    rule: &Rule,
-) -> Result<(
-    Vec<crate::geo::DomainMatcher>,
-    Vec<crate::geo::Cidr>,
-    Vec<String>,
-)> {
+fn expand_geo(geo_data: Option<&crate::geo::GeoData>, rule: &Rule) -> Result<crate::geo::Expanded> {
     let geo_ip_refs: Vec<String> = rule
         .ip_cidrs
         .iter()
@@ -46,7 +39,7 @@ fn expand_geo(
         .iter()
         .any(|value| crate::geo::code_of(value).is_some());
     if !has_domain_refs && geo_ip_refs.is_empty() {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
+        return Ok(crate::geo::Expanded::default());
     }
     let Some(data) = geo_data else {
         let sample = rule
@@ -68,6 +61,42 @@ fn ipnet_of(cidr: crate::geo::Cidr) -> Result<IpNet> {
         .with_context(|| format!("地理数据里的 CIDR 无效: {}/{}", cidr.addr, cidr.prefix))
 }
 
+/// 地理展开项的运行期形态：正则在此预编译。
+///
+/// 真实 geosite.dat 含正则条目；每次选路重新 `Regex::new` 会在热路径上
+/// 重复编译（实测 1000 次约 400 ms，预编译后约 30 μs）。
+#[derive(Clone, Debug)]
+enum CompiledGeoDomain {
+    Full(String),
+    Suffix(String),
+    Keyword(String),
+    Regex(regex::Regex),
+}
+
+impl CompiledGeoDomain {
+    fn compile(item: &crate::geo::DomainMatcher) -> Result<Self> {
+        Ok(match item {
+            crate::geo::DomainMatcher::Full(value) => Self::Full(value.clone()),
+            crate::geo::DomainMatcher::Suffix(value) => Self::Suffix(value.clone()),
+            crate::geo::DomainMatcher::Keyword(value) => Self::Keyword(value.clone()),
+            crate::geo::DomainMatcher::Regex(value) => Self::Regex(
+                regex::Regex::new(value)
+                    .map_err(|error| anyhow::anyhow!("地理数据里的正则 {value:?} 无效: {error}"))?,
+            ),
+        })
+    }
+
+    /// 语义与 `geo::DomainMatcher::matches` 一致。
+    fn matches(&self, domain: &str) -> bool {
+        match self {
+            Self::Full(value) => domain == value,
+            Self::Suffix(value) => matches_domain_suffix(domain, value),
+            Self::Keyword(value) => domain.contains(value.as_str()),
+            Self::Regex(pattern) => pattern.is_match(domain),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CompiledRule {
     inbounds: Vec<String>,
@@ -79,15 +108,19 @@ struct CompiledRule {
     domain_regex: Vec<regex::Regex>,
     ip_cidrs: Vec<IpNet>,
     ip_is_private: bool,
-    /// 地理数据集展开出的域名项。
+    /// 地理数据集展开出的域名项（正则已预编译）。
     ///
-    /// **必须独立于 `domains`/`domain_suffix` 等字段**：Xray 的 domain 数组
-    /// 内部是 OR（Full/Domain/Substr/Regex 任一命中即可），而那些字段之间是
-    /// AND。把展开结果混进去会让「239 条 Full + 839 条后缀」互相要求同时成立，
-    /// 导致任何域名都匹配不上。
-    geo_domains: Vec<crate::geo::DomainMatcher>,
+    /// 与 `domains` 组成**同一个 OR 组**：它们都来自配置的 `domains` 数组，
+    /// 而 Xray 的 domain 数组内部是并集。曾经把展开项独立成 AND 字段，
+    /// 导致「普通域名 + geosite」同写时两者互相要求成立、任何目标都不命中。
+    geo_domains: Vec<CompiledGeoDomain>,
+    /// 配置里是否出现过域名侧地理引用。即使展开结果为 0 条，也必须算作
+    /// 有限制，否则空分类会退化成「匹配一切」。
+    geo_domain_used: bool,
     /// `mmdb:<code>`：只能运行期按 IP 查国家码，不能预先展开成 CIDR。
     mmdb_codes: Vec<String>,
+    /// 配置里是否出现过 IP 侧地理引用（同上，处理空分类）。
+    geo_ip_used: bool,
     /// 运行期 mmdb 查询需要的数据集；没配 `geo` 时为 None。
     geo: Option<std::sync::Arc<crate::geo::GeoData>>,
     ports: Vec<PortRange>,
@@ -415,7 +448,7 @@ impl Router {
             .map(|rule| {
                 let destination = resolve(&rule.outbound)?;
                 // `geosite:` / `geoip:` 在此展开成具体项；`mmdb:` 留到运行期。
-                let (geo_domains, geo_ips, mmdb_codes) = expand_geo(geo_data.as_deref(), rule)?;
+                let expanded = expand_geo(geo_data.as_deref(), rule)?;
                 let domains: Vec<String> = rule
                     .domains
                     .iter()
@@ -441,16 +474,13 @@ impl Router {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                // 展开结果单独保存：与用户手写的字段之间是 AND，但展开项
-                // 内部是 OR（对齐 Xray 的 domain 数组语义）。
-                for item in &geo_domains {
-                    if let crate::geo::DomainMatcher::Regex(value) = item {
-                        // 正则在加载期就编译，坏数据要在 check 阶段暴露。
-                        regex::Regex::new(value).map_err(|error| {
-                            anyhow::anyhow!("geosite 数据里的正则 {value:?} 无效: {error}")
-                        })?;
-                    }
-                }
+                // 展开项的域名与 `domains` 属于同一个 OR 组（都来自配置的
+                // `domains` 数组）；正则在这里预编译一次。
+                let geo_domains = expanded
+                    .domains
+                    .iter()
+                    .map(CompiledGeoDomain::compile)
+                    .collect::<Result<Vec<_>>>()?;
                 let mut ip_cidrs: Vec<IpNet> = rule
                     .ip_cidrs
                     .iter()
@@ -459,7 +489,7 @@ impl Router {
                         crate::config::IpEntry::Geo(_) => None,
                     })
                     .collect();
-                for cidr in geo_ips {
+                for cidr in expanded.ips {
                     ip_cidrs.push(ipnet_of(cidr)?);
                 }
                 Ok(CompiledRule {
@@ -472,7 +502,9 @@ impl Router {
                     ip_cidrs,
                     ip_is_private: rule.ip_is_private,
                     geo_domains,
-                    mmdb_codes,
+                    geo_domain_used: expanded.domain_used,
+                    mmdb_codes: expanded.mmdb_codes,
+                    geo_ip_used: expanded.ip_used,
                     geo: geo_data.clone(),
                     ports: rule.ports.clone(),
                     invert: rule.invert,
@@ -561,7 +593,9 @@ impl Router {
             Host::Ip(_) => None,
         };
         self.rules.iter().any(|rule| {
-            !rule.ip_cidrs.is_empty()
+            // mmdb-only 规则也要触发 DNS 解析，否则 `ip_if_non_match` 下
+            // 它永远拿不到解析结果、永远不会命中。
+            (!rule.ip_cidrs.is_empty() || !rule.mmdb_codes.is_empty() || rule.geo_ip_used)
                 && rule.matches_base(inbound, network, target, domain.as_deref())
         })
     }
@@ -1083,39 +1117,39 @@ impl CompiledRule {
         resolved: Option<&[IpAddr]>,
     ) -> bool {
         let matched = self.matches_base(inbound, network, target, domain)
-            && (self.ip_cidrs.is_empty()
-                || match &target.host {
-                    Host::Ip(ip) => self.ip_cidrs.iter().any(|cidr| cidr.contains(ip)),
-                    Host::Domain(_) => resolved.is_some_and(|addresses| {
-                        addresses
-                            .iter()
-                            .any(|ip| self.ip_cidrs.iter().any(|cidr| cidr.contains(ip)))
-                    }),
-                })
             && (!self.ip_is_private || self.matches_private(target, resolved))
-            && (self.mmdb_codes.is_empty() || self.matches_mmdb(target, resolved));
+            && self.matches_ip(target, resolved);
         // invert 只翻转本条规则，不影响其它规则。
         if self.invert { !matched } else { matched }
     }
 
-    /// 目标 IP 是否落在 `mmdb:<code>` 指定的国家。
+    /// IP 条件：具体 CIDR 与 `mmdb:<code>` 属于**同一个 OR 组**。
     ///
-    /// 与 CIDR 一致：目标是域名且未解析时按未命中处理。
-    fn matches_mmdb(&self, target: &Target, resolved: Option<&[IpAddr]>) -> bool {
-        let Some(geo) = self.geo.as_deref() else {
-            return false;
-        };
-        let hit = |ip: IpAddr| {
-            self.mmdb_codes
-                .iter()
-                .any(|code| geo.mmdb_matches(code, ip) == Some(true))
-        };
+    /// 它们都来自配置的 `ip_cidrs` 数组（Xray 的 `ip` 数组语义是并集）。
+    /// 曾经分别要求两者成立，导致「CIDR + mmdb」同写时任何目标都不命中。
+    fn matches_ip(&self, target: &Target, resolved: Option<&[IpAddr]>) -> bool {
+        if self.ip_cidrs.is_empty() && self.mmdb_codes.is_empty() {
+            // 没有任何 IP 条件；即使配了空分类，也要把它当成「有限制」，
+            // 否则空分类会退化成匹配一切。
+            return !self.geo_ip_used;
+        }
+        let hit =
+            |ip: IpAddr| self.ip_cidrs.iter().any(|cidr| cidr.contains(&ip)) || self.mmdb_hit(ip);
         match &target.host {
             Host::Ip(ip) => hit(*ip),
             Host::Domain(_) => {
                 resolved.is_some_and(|addresses| addresses.iter().any(|ip| hit(*ip)))
             }
         }
+    }
+
+    fn mmdb_hit(&self, ip: IpAddr) -> bool {
+        let Some(geo) = self.geo.as_deref() else {
+            return false;
+        };
+        self.mmdb_codes
+            .iter()
+            .any(|code| geo.mmdb_matches(code, ip) == Some(true))
     }
 
     /// 目标是否落在私有/内网地址。域名未解析时按未命中处理，与 `ip_cidrs` 一致。
@@ -1139,8 +1173,18 @@ impl CompiledRule {
         // 空字段不限制；不同字段取交集，同字段的多个值取并集。
         (self.inbounds.is_empty() || self.inbounds.iter().any(|tag| tag == inbound))
             && (self.networks.is_empty() || self.networks.contains(&network))
-            && (self.domains.is_empty()
-                || domain.is_some_and(|domain| self.domains.iter().any(|item| item == domain)))
+            // `domains` 与地理展开项是同一个 OR 组：两者都来自配置的
+            // `domains` 数组，而 Xray 的 domain 数组内部是并集。
+            && if self.domains.is_empty() && self.geo_domains.is_empty() {
+                // 配了 geo 却展开为空（例如空分类）时，必须视为「永不匹配」，
+                // 不能退化成「没有条件」。
+                !self.geo_domain_used
+            } else {
+                domain.is_some_and(|domain| {
+                    self.domains.iter().any(|item| item == domain)
+                        || self.geo_domains.iter().any(|item| item.matches(domain))
+                })
+            }
             && (self.domain_suffix.is_empty()
                 || domain.is_some_and(|domain| {
                     self.domain_suffix
@@ -1158,11 +1202,6 @@ impl CompiledRule {
                     self.domain_regex
                         .iter()
                         .any(|pattern| pattern.is_match(domain))
-                }))
-            // 地理展开项内部取 OR，与上面的字段之间是 AND。
-            && (self.geo_domains.is_empty()
-                || domain.is_some_and(|domain| {
-                    self.geo_domains.iter().any(|item| item.matches(domain))
                 }))
             && (self.ports.is_empty()
                 || self
@@ -1274,6 +1313,49 @@ mod geo_expand_tests {
         );
     }
 
+    /// 空分类必须「永不匹配」，不能退化成「没有条件」。
+    #[test]
+    fn empty_geo_category_never_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        // 手写一个含空分类的 GeoSiteList：只写 code，不写 domain。
+        let mut site = Vec::new();
+        site.extend_from_slice(&[0x0a, 0x05]); // field 1 (code), len 5
+        site.extend_from_slice(b"empty");
+        let mut list = Vec::new();
+        list.extend_from_slice(&[0x0a, site.len() as u8]); // field 1 (entry)
+        list.extend_from_slice(&site);
+        let path = dir.path().join("geosite.dat");
+        std::fs::write(&path, &list).unwrap();
+
+        let value = serde_json::json!({
+            "version": 1,
+            "geo": {"geosite": path},
+            "inbounds": [{"type": "socks5", "tag": "s", "listen": "127.0.0.1:0"}],
+            "outbounds": [
+                {"type": "direct", "tag": "direct"},
+                {"type": "reject", "tag": "reject"}
+            ],
+            "route": {
+                "default": "direct",
+                "rules": [{"domains": ["geosite:empty"], "outbound": "reject"}]
+            }
+        });
+        let config = crate::config::Config::from_json(&value.to_string()).unwrap();
+        let router = Router::new(&config).unwrap();
+        for host in [
+            Host::Domain("anything.test".into()),
+            Host::Ip("127.0.0.1".parse().unwrap()),
+        ] {
+            let target = Target { host, port: 443 };
+            let selected = router.select_outbound("s", Network::Tcp, &target);
+            assert_eq!(
+                selected.kind,
+                OutboundKind::Direct,
+                "空分类不应匹配任何目标"
+            );
+        }
+    }
+
     /// 真实数据展开后，规则里必须真的出现 `google.com` 的后缀项。
     #[test]
     fn real_geosite_expands_into_rule() {
@@ -1293,16 +1375,16 @@ mod geo_expand_tests {
             "outbound": "direct"
         }))
         .unwrap();
-        let (expanded, _, _) = expand_geo(Some(&data), &rule).unwrap();
-        eprintln!("展开项数: {}", expanded.len());
+        let expanded = expand_geo(Some(&data), &rule).unwrap();
         let suffix = expanded
+            .domains
             .iter()
             .filter(
                 |item| matches!(item, crate::geo::DomainMatcher::Suffix(v) if v == "google.com"),
             )
             .count();
-        eprintln!("Suffix=google.com: {suffix}");
         assert!(suffix > 0, "google.com 应作为后缀项出现在展开结果里");
+        assert!(expanded.domain_used);
     }
 }
 

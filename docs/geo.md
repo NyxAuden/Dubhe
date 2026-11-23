@@ -24,9 +24,12 @@
 
 ### 为什么 mmdb 是运行期匹配
 
-MaxMind 数据库的 API 是「输入 IP → 查国家码」，**无法反向列出某个国家的全部
-网段**。所以 `mmdb:CN` 不能像 `geoip:cn` 那样预先展开成 CIDR 列表，只能在
-匹配时逐 IP 查询。这是数据格式决定的，不是实现取舍。
+`maxminddb` 0.33 **提供** `Reader::networks()` 可以遍历全部网段（实测存在于
+`maxminddb-0.33.0/src/reader.rs`）。本项目**选择**运行期按 IP 查询，而不是
+启动时全库遍历展开：后者要把整库读一遍再按国家筛选，启动更慢、内存更大，
+而单次查询本身很便宜。
+
+这是实现取舍，不是格式限制。
 
 ### 为什么不支持 `.srs` 二进制
 
@@ -65,24 +68,41 @@ MaxMind 数据库的 API 是「输入 IP → 查国家码」，**无法反向列
 
 ## 匹配语义
 
-`geosite:` 展开出的项（Xray 的 `Full` / `Domain` / `Substr` / `Regex`）
-**内部是 OR**：任一命中即算该规则命中。这与 Xray 的 `domain` 数组语义一致。
+### 域名组
 
-注意它们与手写字段之间仍是 AND：下面这条规则要求「命中 geosite:cn」**且**
-「目标是 443 端口」。
+`domains` 数组里的普通域名与地理引用（`geosite:` / `rule_set:`）属于
+**同一个 OR 组**：任一命中即算域名条件成立。展开出的 `Full` / `Domain` /
+`Substr` / `Regex` 也都在这个组里取并集——这与 Xray 的 `domain` 数组语义一致。
+
+`domain_suffix` / `domain_keyword` / `domain_regex` 是本项目自己的独立字段，
+与域名组之间仍然是 AND。
+
+### IP 组
+
+`ip_cidrs` 数组里的具体 CIDR、`geoip:<code>` 展开项、`mmdb:<code>`、以及
+`ip_is_private` 之外的 IP 条件同属 **一个 OR 组**；`ip_is_private` 是独立
+布尔字段，与该组 AND。
+
+### 与端口等条件
+
+域名组、IP 组、端口等不同维度之间是 AND：下面这条要求「命中 geosite:cn」
+**且**「目标是 443 端口」。
 
 ```json
 {"domains": ["geosite:cn"], "ports": [{"start": 443, "end": 443}], "outbound": "direct"}
 ```
 
-> 实现上展开项存在独立字段里，**不并入** `domains` / `domain_suffix`。
-> 曾经把它们按类型塞进对应字段，结果 239 条 Full 与 839 条后缀变成两个
-> 互斥的 AND 条件，任何域名都匹配不上——这个 bug 由真实数据用例发现，
-> 现在有专门的回归测试（`geosite_mixed_full_and_suffix_are_or_combined`）。
+> 曾经把展开项按类型塞进 `domains` / `domain_suffix` 等独立字段，而这些
+> 字段之间是 AND。以 `geosite:google` 为例（239 条 Full + 839 条后缀），
+> 一条规则就要求目标同时满足两个集合，绝大多数域名都匹配不上——但这不是
+> 「逻辑上永不可能」：`Full(www.example.com)` 与 `Suffix(example.com)`
+> 可以同时成立。现在展开项与 `domains` 合成一个 OR 组，并有回归测试
+> `geosite_mixed_full_and_suffix_are_or_combined` 与
+> `domains_array_is_union_of_plain_and_geo`。
 
 ## 失败行为
 
-全部**失败关闭**，且在 `dubhe check` 阶段就能发现（不需要真正启动）：
+配置层面的错误**失败关闭**，且在 `dubhe check` 阶段就能发现（不需要真正启动）：
 
 | 情况 | 行为 |
 |---|---|
@@ -92,6 +112,14 @@ MaxMind 数据库的 API 是「输入 IP → 查国家码」，**无法反向列
 | 数据文件不是合法 protobuf / 为空 | 报错，含文件路径 |
 | `rule_sets` 指向 `.srs` 二进制 | 报错，提示改用 source JSON |
 | `ip_cidrs` 里的字符串不是已知前缀 | 报错，不回显原文（避免泄露敏感输入） |
+| 空分类（`geosite:x` / `geoip:x` 存在但无条目） | 视为「永不匹配」，不会退化成匹配一切 |
+| rule-set 含 `invert` / `type: logical` / `port` / `network` 等条件 | 报错并点名该字段，不静默丢弃 |
+| rule-set 的 `version` 缺失或不在 1..=5 | 报错 |
+| `geo.rule_sets` 标签重复（忽略大小写） | 报错 |
+
+**不保证失败关闭的一处**：mmdb 查询或解码出错时按「未命中」处理（`Ok(None)`
+与「库损坏」不区分）。如果规则用途是阻断，这可能导致回落直连。数据文件损坏
+属于本地运维问题，内核不做额外校验。
 
 ## 与 Xray / Mihomo 的写法差异
 
@@ -101,8 +129,9 @@ MaxMind 数据库的 API 是「输入 IP → 查国家码」，**无法反向列
 | `"ip": ["geoip:cn"]` | `"ip_cidrs": ["geoip:cn"]` |
 | `geoip:private` | 用 `ip_is_private: true`（不需要数据文件） |
 
-`dubhe convert` 会把 `geosite:` 引用原样保留并提示需要配置 `geo.geosite`；
-`geoip:` 与 `geoip:private` 会做对应映射。
+`dubhe convert` 会把 `geosite:` 保留到 `domains`、`geoip:` 保留到 `ip_cidrs`，
+并提示需要配置对应的 `geo` 数据文件；`geoip:private` 映射为 `ip_is_private`。
+`ext:`（第三方 dat）仍以提示方式跳过。
 
 ## 测试
 
@@ -118,8 +147,14 @@ MaxMind 数据库的 API 是「输入 IP → 查国家码」，**无法反向列
 
 ### 真实数据集用例
 
-`tests/geo_routing.rs` 里另有 3 项用**真实数据集**验证归属判断
-（`geosite:google` 的 Full 与后缀语义、`geoip:cn`、`mmdb:CN`）。
+`tests/geo_routing.rs` 里另有 4 项用**真实数据集**验证归属判断
+（`geosite:google` 的后缀语义、`geoip:cn`、`mmdb:CN`，以及
+`ip_cidrs` 里 CIDR 与 mmdb 的并集）。
+
+其余语义断言走 **Router 选路结果**（`Router::select_outbound`），不走网络：
+`stats.rejected` 对 SOCKS 入口而言任何 handler 错误都会加一，无法区分
+「规则拒绝」与「拨号失败」。只有 2 项端到端用例用**可达的本机 echo**
+证明规则确实接进了转发路径。
 
 获取数据：
 
@@ -128,8 +163,12 @@ MaxMind 数据库的 API 是「输入 IP → 查国家码」，**无法反向列
 ```
 
 脚本里的版本是**钉死**的（`V2RAY_RULES_TAG` / `MAXMIND_GEOIP_TAG`），
-不用 `latest`——数据每周在变，`latest` 会让结果无法复现。要更新数据时
-改这两个变量，并同步 CI 的缓存 key，然后重跑全部用例。
+不用 `latest`——数据每周在变，`latest` 会让结果无法复现。
+
+注意两点：脚本对**已存在的非空文件直接跳过**（不会校验内容），且允许用环境
+变量覆盖版本。所以「钉死」保证的是 CI 首次下载的资产固定，不是本地目录里
+实际文件的哈希——本项目不为第三方数据的完整性背书。要更新数据时改这两个
+变量、同步 CI 缓存 key，并重跑全部用例。
 
 没有数据时这 3 项会打印「跳过：未下载真实数据集」并返回——**不静默通过**。
 

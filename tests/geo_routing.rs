@@ -1,20 +1,27 @@
-//! 地理数据集（`geosite:` / `geoip:` / `mmdb:` / `rule_set:`）端到端行为。
+//! 地理数据集（`geosite:` / `geoip:` / `mmdb:` / `rule_set:`）语义与接线。
 //!
-//! 数据集全部由测试**现场生成**：按 Xray 的 proto 定义编码 protobuf、
-//! 按 sing-box rule-set source 格式写 JSON。因此这些用例不依赖任何外部
-//! 数据文件，也不替第三方数据的正确性背书。
+//! **语义断言走 Router 选路结果**：`stats.rejected` 对 SOCKS 入口而言任何
+//! handler 错误都会加一（包括拨号失败、DNS 失败），无法区分「规则拒绝」与
+//! 「连接失败」。用选路结果才确定。
+//!
+//! 数据集全部由测试现场生成（按 Xray proto 手写 protobuf、按 sing-box
+//! rule-set source 格式写 JSON），另有 4 项用真实数据集（缺失时跳过）。
 
 mod common;
 
 use common::{Echo, Running, socks_config};
+use dubhe::{
+    config::OutboundKind,
+    route::Router,
+    session::{Host, Network, Target},
+};
 use serde_json::{Value, json};
-use std::{net::SocketAddr, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 按 Xray `xray.common.geodata.GeoSiteList` 编码最小 geosite.dat。
 ///
 /// 手写编码而不是复用生产代码的 prost 结构：测试自证会让实现错误被抵消。
-/// `(code, [(域名, Xray Domain.Type)])`
 type SiteEntries<'a> = &'a [(&'a str, &'a [(&'a str, u8)])];
 
 fn encode_geosite(entries: SiteEntries<'_>) -> Vec<u8> {
@@ -51,7 +58,6 @@ fn encode_geosite(entries: SiteEntries<'_>) -> Vec<u8> {
 }
 
 /// 按 `GeoIPList` 编码最小 geoip.dat。
-/// `(code, [(IPv4 字节, 前缀长度)])`
 type IpEntries<'a> = &'a [(&'a str, &'a [([u8; 4], u32)])];
 
 fn encode_geoip(entries: IpEntries<'_>) -> Vec<u8> {
@@ -95,187 +101,28 @@ fn write(dir: &Path, name: &str, bytes: &[u8]) -> String {
 
 fn config(geo: Value, rule: Value) -> Value {
     let mut value = socks_config();
-    // 关掉 DNS 解析：本文件测的是路由匹配，不是域名解析。
-    // 有域名规则时若先解析，解析失败会掩盖匹配结果。
-    value["route"]["domain_strategy"] = json!("AsIs");
     value["geo"] = geo;
-    value["outbounds"] = json!([
-        {"type": "direct", "tag": "direct"},
-        {"type": "reject", "tag": "reject"}
-    ]);
     value["route"] = json!({"default": "direct", "rules": [rule]});
     value
 }
 
-/// 发一个 SOCKS 请求，断言**路由真的把它交给了 reject 出站**。
-///
-/// 不能用「连接看起来失败」当证据：拨号失败、DNS 失败、超时都长得像拒绝。
-/// `reject` 出站会调用 `stats.reject()`（见 `src/forward.rs`），所以断言
-/// 这个计数增长才是确定性的——不受 CI 是否有外网、目标端口是否可连影响。
-async fn assert_rejected(server: &Running, target: &str, port: u16) {
-    let before = server.stats.snapshot().rejected;
-
-    let mut stream = tokio::net::TcpStream::connect(server.address)
-        .await
-        .expect("连不上 SOCKS 入口");
-    stream.write_all(&[5, 1, 0]).await.unwrap();
-    let mut greeting = [0u8; 2];
-    stream.read_exact(&mut greeting).await.unwrap();
-    assert_eq!(greeting, [5, 0], "SOCKS 入口不可用");
-
-    let mut request = vec![5, 1, 0];
-    if let Ok(ip) = target.parse::<std::net::IpAddr>() {
-        request.push(if ip.is_ipv4() { 1 } else { 4 });
-        match ip {
-            std::net::IpAddr::V4(v4) => request.extend(v4.octets()),
-            std::net::IpAddr::V6(v6) => request.extend(v6.octets()),
-        }
-    } else {
-        request.push(3);
-        request.push(target.len() as u8);
-        request.extend(target.as_bytes());
-    }
-    request.extend(port.to_be_bytes());
-    stream.write_all(&request).await.unwrap();
-
-    // 断言服务端确实记了一次拒绝，而不是「连接恰好失败」。
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while server.stats.snapshot().rejected <= before {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("服务端没有记录拒绝，说明 {target}:{port} 未命中 reject 规则"));
-}
-
-/// 正常转发：断言回显一致。
-async fn assert_relayed(server: &Running, target: SocketAddr, payload: &[u8]) {
-    let (mut stream, _) = common::socks(1, common::address(target), server.address).await;
-    stream.write_all(payload).await.unwrap();
-    let mut echoed = vec![0; payload.len()];
-    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
-        .await
-        .expect("未回显")
-        .unwrap();
-    assert_eq!(echoed, payload);
-}
-
-#[tokio::test]
-async fn geosite_full_domain_matches_and_rejects() {
-    let directory = tempfile::tempdir().unwrap();
-    // type=3 是 Xray 的 `Full`（整域相等）。
-    let site = encode_geosite(&[("blocked", &[("blocked.test", 3)])]);
-    let geosite = write(directory.path(), "geosite.dat", &site);
-
-    let server = Running::start(config(
-        json!({"geosite": geosite}),
-        json!({"domains": ["geosite:blocked"], "outbound": "reject"}),
-    ))
-    .await;
-    let echo = Echo::tcp("127.0.0.1", false).await;
-
-    // 命中：整域相等被拒绝。
-    assert_rejected(&server, "blocked.test", echo.address.port()).await;
-    // 未命中：其它域名照常直连，证明规则不是无条件拒绝。
-    assert_relayed(&server, echo.address, b"ok").await;
-    server.shutdown().await;
-}
-
-/// Xray 的 domain 数组内部是 OR：Full 与后缀项**不能互相要求同时成立**。
-///
-/// 这是真实数据暴露过的 bug：把 239 条 Full 与 839 条后缀分别塞进
-/// `domains` 与 `domain_suffix` 两个字段后，两个字段变成 AND，任何域名
-/// 都匹配不上。
-#[tokio::test]
-async fn geosite_mixed_full_and_suffix_are_or_combined() {
-    let directory = tempfile::tempdir().unwrap();
-    let site = encode_geosite(&[("mixed", &[("exact.test", 3), ("suffix.test", 2)])]);
-    let geosite = write(directory.path(), "geosite.dat", &site);
-
-    let server = Running::start(config(
-        json!({"geosite": geosite}),
-        json!({"domains": ["geosite:mixed"], "outbound": "reject"}),
-    ))
-    .await;
-
-    // Full 项命中。
-    assert_rejected(&server, "exact.test", 80).await;
-    // 后缀项命中（含子域）。
-    assert_rejected(&server, "sub.suffix.test", 80).await;
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn geoip_cidr_matches_and_rejects() {
-    let directory = tempfile::tempdir().unwrap();
-    // 127.0.0.0/8 覆盖本机回环，能稳定命中。
-    let dat = encode_geoip(&[("loop", &[([127, 0, 0, 0], 8)])]);
-    let geoip = write(directory.path(), "geoip.dat", &dat);
-
-    let server = Running::start(config(
-        json!({"geoip": geoip}),
-        json!({"ip_cidrs": ["geoip:loop"], "outbound": "reject"}),
-    ))
-    .await;
-    let echo = Echo::tcp("127.0.0.1", false).await;
-    assert_rejected(&server, "127.0.0.1", echo.address.port()).await;
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn rule_set_source_json_matches_suffix() {
-    let directory = tempfile::tempdir().unwrap();
-    let rules = json!({
-        "version": 3,
-        "rules": [{"domain_suffix": ["blocked.test"]}]
-    });
-    let path = write(directory.path(), "rules.json", rules.to_string().as_bytes());
-
-    let server = Running::start(config(
-        json!({"rule_sets": [{"tag": "ads", "path": path}]}),
-        json!({"domains": ["rule_set:ads"], "outbound": "reject"}),
-    ))
-    .await;
-    let echo = Echo::tcp("127.0.0.1", false).await;
-    // 后缀命中：子域也被拒绝。
-    assert_rejected(&server, "sub.blocked.test", echo.address.port()).await;
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn geo_reference_without_geo_section_fails_loudly() {
-    let mut value = socks_config();
-    value["outbounds"] = json!([
-        {"type": "direct", "tag": "direct"},
-        {"type": "reject", "tag": "reject"}
-    ]);
-    value["route"] = json!({
-        "default": "direct",
-        "rules": [{"domains": ["geosite:cn"], "outbound": "reject"}]
-    });
+/// 用 Router 直接求选路结果，不走网络。
+fn select(geo: Value, rule: Value, host: Host, port: u16) -> OutboundKind {
+    let value = config(geo, rule);
     let config = dubhe::Config::from_json(&value.to_string()).unwrap();
-    let error = dubhe::Server::check(&config).unwrap_err().to_string();
-    assert!(error.contains("geo"), "错误信息应指出缺少 geo 段：{error}");
+    let router = Router::new(&config).unwrap();
+    router
+        .select_outbound("socks", Network::Tcp, &Target { host, port })
+        .kind
 }
 
-#[tokio::test]
-async fn missing_geosite_code_fails_loudly() {
-    let directory = tempfile::tempdir().unwrap();
-    let site = encode_geosite(&[("present", &[("a.test", 3)])]);
-    let geosite = write(directory.path(), "geosite.dat", &site);
-
-    let value = config(
-        json!({"geosite": geosite}),
-        json!({"domains": ["geosite:absent"], "outbound": "reject"}),
-    );
-    let config = dubhe::Config::from_json(&value.to_string()).unwrap();
-    let error = dubhe::Server::check(&config).unwrap_err().to_string();
-    assert!(error.contains("geosite:absent"), "{error}");
+fn domain(name: &str) -> Host {
+    Host::Domain(name.to_owned())
 }
 
-// ---------------------------------------------------------------------------
-// 真实数据集（需要先下载；缺失时跳过，不静默通过）
-// ---------------------------------------------------------------------------
+fn ip(text: &str) -> Host {
+    Host::Ip(text.parse().unwrap())
+}
 
 /// 真实数据集目录。用 `tools/fetch_geodata.sh` 下载。
 fn real_geodata() -> Option<std::path::PathBuf> {
@@ -288,93 +135,517 @@ fn real_geodata() -> Option<std::path::PathBuf> {
     }
 }
 
-/// 用真实 `geosite.dat` 判断域名归属。
-///
-/// **样本选择依据**（实测该版本 dat 的类型分布，不是猜测）：
-/// - `GOOGLE` 有 239 条 `Full`、839 条 `Domain`（后缀）。
-///   `google.com` 是 **Full**，所以 `www.google.com` **不会**命中——
-///   `Full` 只匹配整域相等，这是 Xray 的语义。
-/// - `gmail` 是 `Domain`（后缀），所以 `mail.gmail.com` 命中。
-///
-/// 因此这里验证两组：整域命中和后缀命中。数据更新导致样本失效时，
-/// 用例会失败而不是悄悄跳过——需要重新挑选样本。
-#[tokio::test]
-async fn real_geosite_classifies_known_domains() {
+// ---------------------------------------------------------------------------
+// 域名匹配语义
+// ---------------------------------------------------------------------------
+
+#[test]
+fn geosite_full_matches_exact_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let site = encode_geosite(&[("exact", &[("exact.test", 3)])]);
+    let geosite = write(dir.path(), "geosite.dat", &site);
+    // type 3 = Full（整域相等）。
+    assert_eq!(
+        select(
+            json!({"geosite": geosite.clone()}),
+            json!({"domains": ["geosite:exact"], "outbound": "reject"}),
+            domain("exact.test"),
+            443
+        ),
+        OutboundKind::Reject
+    );
+    assert_eq!(
+        select(
+            json!({"geosite": geosite}),
+            json!({"domains": ["geosite:exact"], "outbound": "reject"}),
+            domain("sub.exact.test"),
+            443
+        ),
+        OutboundKind::Direct
+    );
+}
+
+#[test]
+fn geosite_substr_matches_substring_not_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let site = encode_geosite(&[("sub", &[("ads", 0)])]);
+    let geosite = write(dir.path(), "geosite.dat", &site);
+    // type 0 = Substr；曾被错映射成后缀，导致 myads.test 不命中。
+    assert_eq!(
+        select(
+            json!({"geosite": geosite.clone()}),
+            json!({"domains": ["geosite:sub"], "outbound": "reject"}),
+            domain("myads.test"),
+            443
+        ),
+        OutboundKind::Reject
+    );
+    assert_eq!(
+        select(
+            json!({"geosite": geosite}),
+            json!({"domains": ["geosite:sub"], "outbound": "reject"}),
+            domain("clean.test"),
+            443
+        ),
+        OutboundKind::Direct
+    );
+}
+
+/// 同一 `domains` 数组内的普通值与地理引用必须取并集。
+#[test]
+fn domains_array_is_union_of_plain_and_geo() {
+    let dir = tempfile::tempdir().unwrap();
+    let site = encode_geosite(&[("t", &[("blocked.test", 3)])]);
+    let geosite = write(dir.path(), "geosite.dat", &site);
+    let rule = json!({"domains": ["example.org", "geosite:t"], "outbound": "reject"});
+    for host in ["example.org", "blocked.test"] {
+        assert_eq!(
+            select(
+                json!({"geosite": geosite.clone()}),
+                rule.clone(),
+                domain(host),
+                443
+            ),
+            OutboundKind::Reject,
+            "{host} 应在并集里"
+        );
+    }
+}
+
+/// `Full` 与后缀混合时，两者是并集，不是「必须同时成立」。
+#[test]
+fn geosite_mixed_full_and_suffix_are_or_combined() {
+    let dir = tempfile::tempdir().unwrap();
+    let site = encode_geosite(&[("mixed", &[("exact.test", 3), ("suffix.test", 2)])]);
+    let geosite = write(dir.path(), "geosite.dat", &site);
+    for host in ["exact.test", "sub.suffix.test"] {
+        assert_eq!(
+            select(
+                json!({"geosite": geosite.clone()}),
+                json!({"domains": ["geosite:mixed"], "outbound": "reject"}),
+                domain(host),
+                443
+            ),
+            OutboundKind::Reject,
+            "{host} 应命中"
+        );
+    }
+}
+
+/// 空分类必须「永不匹配」，不能被当成「没有条件」。
+#[test]
+fn empty_geosite_category_never_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let site = encode_geosite(&[("empty", &[])]);
+    let geosite = write(dir.path(), "geosite.dat", &site);
+    let rule = json!({"domains": ["geosite:empty"], "outbound": "reject"});
+    for host in [domain("anything.test"), ip("127.0.0.1")] {
+        assert_eq!(
+            select(json!({"geosite": geosite.clone()}), rule.clone(), host, 443),
+            OutboundKind::Direct,
+            "空分类不应匹配任何目标"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IP 匹配语义
+// ---------------------------------------------------------------------------
+
+#[test]
+fn geoip_cidr_matches_and_is_union_with_plain_cidr() {
+    let dir = tempfile::tempdir().unwrap();
+    let dat = encode_geoip(&[("loop", &[([127, 0, 0, 0], 8)])]);
+    let geoip = write(dir.path(), "geoip.dat", &dat);
+    let rule = json!({"ip_cidrs": ["10.0.0.0/8", "geoip:loop"], "outbound": "reject"});
+    for host in ["127.0.0.1", "10.1.2.3"] {
+        assert_eq!(
+            select(json!({"geoip": geoip.clone()}), rule.clone(), ip(host), 443),
+            OutboundKind::Reject,
+            "{host} 应在 CIDR 并集里"
+        );
+    }
+    assert_eq!(
+        select(json!({"geoip": geoip}), rule, ip("192.0.2.1"), 443),
+        OutboundKind::Direct
+    );
+}
+
+/// 空 geoip 分类同样必须「永不匹配」。
+#[test]
+fn empty_geoip_category_never_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let dat = encode_geoip(&[("empty", &[])]);
+    let geoip = write(dir.path(), "geoip.dat", &dat);
+    assert_eq!(
+        select(
+            json!({"geoip": geoip}),
+            json!({"ip_cidrs": ["geoip:empty"], "outbound": "reject"}),
+            ip("127.0.0.1"),
+            443
+        ),
+        OutboundKind::Direct
+    );
+}
+
+/// CIDR 与 mmdb 必须取并集（都来自 `ip_cidrs` 数组）。
+#[test]
+fn ip_cidrs_array_is_union_of_cidr_and_mmdb() {
+    let Some(dir) = real_geodata() else {
+        eprintln!("跳过：未下载真实数据集");
+        return;
+    };
+    let rule = json!({"ip_cidrs": ["127.0.0.0/8", "mmdb:CN"], "outbound": "reject"});
+    let geo = json!({"mmdb": dir.join("Country.mmdb").display().to_string()});
+    // 回环命中 CIDR。
+    assert_eq!(
+        select(geo.clone(), rule.clone(), ip("127.0.0.1"), 443),
+        OutboundKind::Reject
+    );
+    // 中国地址命中 mmdb。
+    assert_eq!(
+        select(geo.clone(), rule, ip("223.5.5.5"), 80),
+        OutboundKind::Reject
+    );
+    // 两者都不命中。
+    assert_eq!(
+        select(
+            geo,
+            json!({"ip_cidrs": ["127.0.0.0/8", "mmdb:CN"], "outbound": "reject"}),
+            ip("8.8.8.8"),
+            443
+        ),
+        OutboundKind::Direct
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rule-set
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rule_set_source_json_matches_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({
+        "version": 3,
+        "rules": [{"domain_suffix": ["blocked.test"]}]
+    });
+    let path = write(dir.path(), "rules.json", rules.to_string().as_bytes());
+    assert_eq!(
+        select(
+            json!({"rule_sets": [{"tag": "ads", "path": path.clone()}]}),
+            json!({"domains": ["rule_set:ads"], "outbound": "reject"}),
+            domain("sub.blocked.test"),
+            443
+        ),
+        OutboundKind::Reject
+    );
+    assert_eq!(
+        select(
+            json!({"rule_sets": [{"tag": "ads", "path": path}]}),
+            json!({"domains": ["rule_set:ads"], "outbound": "reject"}),
+            domain("ok.test"),
+            443
+        ),
+        OutboundKind::Direct
+    );
+}
+
+/// rule-set 里的正则保留原文大小写：`\D` 与 `\d` 语义相反。
+#[test]
+fn rule_set_regex_keeps_original_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({
+        "version": 3,
+        "rules": [{"domain_regex": ["^\\D+\\.test$"]}]
+    });
+    let path = write(dir.path(), "rules.json", rules.to_string().as_bytes());
+    // `\D` = 非数字：abc.test 命中，123.test 不命中。
+    assert_eq!(
+        select(
+            json!({"rule_sets": [{"tag": "re", "path": path.clone()}]}),
+            json!({"domains": ["rule_set:re"], "outbound": "reject"}),
+            domain("abc.test"),
+            443
+        ),
+        OutboundKind::Reject
+    );
+    assert_eq!(
+        select(
+            json!({"rule_sets": [{"tag": "re", "path": path}]}),
+            json!({"domains": ["rule_set:re"], "outbound": "reject"}),
+            domain("123.test"),
+            443
+        ),
+        OutboundKind::Direct
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 失败行为
+// ---------------------------------------------------------------------------
+
+fn check_error(value: &Value) -> String {
+    let config = dubhe::Config::from_json(&value.to_string()).unwrap();
+    dubhe::Server::check(&config).unwrap_err().to_string()
+}
+
+/// rule-set 只接受纯域名/IP 子集；含其它条件必须显式拒绝，
+/// 不能解析后静默丢掉条件、放大匹配范围。
+#[test]
+fn rule_set_with_unsupported_condition_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({
+        "version": 3,
+        "rules": [{"domain": ["blocked.test"], "port": [443]}]
+    });
+    let path = write(dir.path(), "rules.json", rules.to_string().as_bytes());
+    let error = check_error(&config(
+        json!({"rule_sets": [{"tag": "t", "path": path}]}),
+        json!({"domains": ["rule_set:t"], "outbound": "reject"}),
+    ));
+    assert!(error.contains("port"), "应指出不支持的条件：{error}");
+}
+
+#[test]
+fn rule_set_with_logical_rule_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({
+        "version": 3,
+        "rules": [{"type": "logical", "mode": "and", "rules": []}]
+    });
+    let path = write(dir.path(), "rules.json", rules.to_string().as_bytes());
+    let error = check_error(&config(
+        json!({"rule_sets": [{"tag": "t", "path": path}]}),
+        json!({"domains": ["rule_set:t"], "outbound": "reject"}),
+    ));
+    // 错误信息会点名第一个不支持的字段（这里是 `type` 或 `mode`）。
+    assert!(
+        error.contains("不支持的条件"),
+        "应显式拒绝逻辑规则：{error}"
+    );
+}
+
+#[test]
+fn rule_set_with_invert_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({
+        "version": 3,
+        "rules": [{"domain": ["blocked.test"], "invert": true}]
+    });
+    let path = write(dir.path(), "rules.json", rules.to_string().as_bytes());
+    let error = check_error(&config(
+        json!({"rule_sets": [{"tag": "t", "path": path}]}),
+        json!({"domains": ["rule_set:t"], "outbound": "reject"}),
+    ));
+    assert!(error.contains("invert"), "{error}");
+}
+
+#[test]
+fn rule_set_duplicate_tag_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({"version": 3, "rules": [{"domain": ["a.test"]}]});
+    let path = write(dir.path(), "a.json", rules.to_string().as_bytes());
+    let error = check_error(&config(
+        json!({"rule_sets": [
+            {"tag": "dup", "path": path.clone()},
+            {"tag": "DUP", "path": path}
+        ]}),
+        json!({"domains": ["rule_set:dup"], "outbound": "reject"}),
+    ));
+    assert!(error.contains("重复"), "{error}");
+}
+
+/// rule-set 与 geosite 各用独立命名空间，不能互相串。
+#[test]
+fn rule_set_namespace_is_separate_from_geosite() {
+    let dir = tempfile::tempdir().unwrap();
+    let site = encode_geosite(&[("shared", &[("from-geosite.test", 3)])]);
+    let geosite = write(dir.path(), "geosite.dat", &site);
+    let error = check_error(&config(
+        json!({"geosite": geosite}),
+        json!({"domains": ["rule_set:shared"], "outbound": "reject"}),
+    ));
+    assert!(error.contains("rule_sets"), "{error}");
+}
+
+#[test]
+fn geo_reference_without_geo_section_fails_loudly() {
+    let mut value = socks_config();
+    value["route"] = json!({
+        "default": "direct",
+        "rules": [{"domains": ["geosite:cn"], "outbound": "reject"}]
+    });
+    let error = check_error(&value);
+    assert!(error.contains("geo"), "应指出缺少 geo 段：{error}");
+}
+
+#[test]
+fn missing_geosite_code_fails_loudly() {
+    let dir = tempfile::tempdir().unwrap();
+    let site = encode_geosite(&[("present", &[("a.test", 3)])]);
+    let geosite = write(dir.path(), "geosite.dat", &site);
+    let error = check_error(&config(
+        json!({"geosite": geosite}),
+        json!({"domains": ["geosite:absent"], "outbound": "reject"}),
+    ));
+    assert!(error.contains("geosite:absent"), "{error}");
+}
+
+/// 错把 IP 引用写进 `domains`（或反之）必须报错，而不是静默不匹配。
+#[test]
+fn geo_reference_in_wrong_field_fails_loudly() {
+    let dir = tempfile::tempdir().unwrap();
+    let dat = encode_geoip(&[("loop", &[([127, 0, 0, 0], 8)])]);
+    let geoip = write(dir.path(), "geoip.dat", &dat);
+    let error = check_error(&config(
+        json!({"geoip": geoip.clone()}),
+        json!({"domains": ["geoip:loop"], "outbound": "reject"}),
+    ));
+    assert!(error.contains("ip_cidrs"), "{error}");
+    let error = check_error(&config(
+        json!({"geoip": geoip}),
+        json!({"ip_cidrs": ["geosite:cn"], "outbound": "reject"}),
+    ));
+    assert!(error.contains("domains"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// 真实数据集
+// ---------------------------------------------------------------------------
+
+/// 真实 `geosite.dat`：`google.com` 是 **Domain（后缀）**，因此子域命中。
+#[test]
+fn real_geosite_classifies_known_domains() {
     let Some(dir) = real_geodata() else {
         eprintln!("跳过：未下载真实数据集（tools/fetch_geodata.sh）");
         return;
     };
-    let server = Running::start(config(
-        json!({"geosite": dir.join("geosite.dat").display().to_string()}),
-        json!({"domains": ["geosite:google"], "outbound": "reject"}),
-    ))
-    .await;
-    let echo = Echo::tcp("127.0.0.1", false).await;
-
-    // Full 语义：只有整域相等才命中。
-    assert_rejected(&server, "google.com", echo.address.port()).await;
-    // Domain 语义：后缀命中，子域也命中。
-    assert_rejected(&server, "mail.gmail.com", echo.address.port()).await;
-    // 不在该分类里：正常放行（证明不是无条件拒绝）。
-    assert_relayed(&server, echo.address, b"baidu").await;
-    server.shutdown().await;
+    let geo = json!({"geosite": dir.join("geosite.dat").display().to_string()});
+    let rule = json!({"domains": ["geosite:google"], "outbound": "reject"});
+    for host in ["google.com", "www.google.com", "mail.gmail.com"] {
+        assert_eq!(
+            select(geo.clone(), rule.clone(), domain(host), 443),
+            OutboundKind::Reject,
+            "{host} 应命中 geosite:google"
+        );
+    }
+    assert_eq!(
+        select(geo, rule, domain("baidu.com"), 443),
+        OutboundKind::Direct
+    );
 }
 
-/// `Full` 与 `Domain` 的语义差异必须可见，否则用户会误以为
-/// `geosite:google` 能匹配所有 `*.google.com`。
-#[tokio::test]
-async fn real_geosite_full_does_not_match_subdomain() {
+#[test]
+fn real_geoip_classifies_known_addresses() {
     let Some(dir) = real_geodata() else {
         eprintln!("跳过：未下载真实数据集");
         return;
     };
-    let server = Running::start(config(
-        json!({"geosite": dir.join("geosite.dat").display().to_string()}),
-        json!({"domains": ["geosite:google"], "outbound": "reject"}),
-    ))
-    .await;
-    let echo = Echo::tcp("127.0.0.1", false).await;
-    // `www.google.com` 不在 Full 列表，也不是任何后缀项的子域 → 放行。
-    assert_relayed(&server, echo.address, b"www").await;
-    server.shutdown().await;
+    let geo = json!({"geoip": dir.join("geoip.dat").display().to_string()});
+    let rule = json!({"ip_cidrs": ["geoip:cn"], "outbound": "reject"});
+    assert_eq!(
+        select(geo.clone(), rule.clone(), ip("223.5.5.5"), 80),
+        OutboundKind::Reject
+    );
+    assert_eq!(select(geo, rule, ip("8.8.8.8"), 443), OutboundKind::Direct);
 }
 
-/// 用真实 `geoip.dat` 判断 IP 归属。
-#[tokio::test]
-async fn real_geoip_classifies_known_addresses() {
+#[test]
+fn real_mmdb_classifies_known_addresses() {
     let Some(dir) = real_geodata() else {
         eprintln!("跳过：未下载真实数据集");
         return;
     };
-    // 阿里云公共 DNS 223.5.5.5 属于 CN。
+    let geo = json!({"mmdb": dir.join("Country.mmdb").display().to_string()});
+    let rule = json!({"ip_cidrs": ["mmdb:CN"], "outbound": "reject"});
+    assert_eq!(
+        select(geo.clone(), rule.clone(), ip("223.5.5.5"), 80),
+        OutboundKind::Reject
+    );
+    assert_eq!(select(geo, rule, ip("8.8.8.8"), 443), OutboundKind::Direct);
+}
+
+/// 端到端接线：规则命中 reject 时数据不会到达目标。
+///
+/// 目标用**可达**的本机 echo（回环），因此「没有回显」只可能来自拒绝，
+/// 不会是拨号失败造成的假象。
+#[tokio::test]
+async fn geoip_reject_is_wired_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let dat = encode_geoip(&[("loop", &[([127, 0, 0, 0], 8)])]);
+    let geoip = write(dir.path(), "geoip.dat", &dat);
     let server = Running::start(config(
-        json!({"geoip": dir.join("geoip.dat").display().to_string()}),
-        json!({"ip_cidrs": ["geoip:cn"], "outbound": "reject"}),
+        json!({"geoip": geoip}),
+        json!({"ip_cidrs": ["geoip:loop"], "outbound": "reject"}),
     ))
     .await;
-    assert_rejected(&server, "223.5.5.5", 80).await;
-    // 8.8.8.8 不属于 CN。
+
     let echo = Echo::tcp("127.0.0.1", false).await;
-    assert_relayed(&server, echo.address, b"dns").await;
+    let mut stream = tokio::net::TcpStream::connect(server.address)
+        .await
+        .expect("连不上 SOCKS 入口");
+    stream.write_all(&[5, 1, 0]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [5, 0]);
+    let mut request = vec![5, 1, 0, 1];
+    match echo.address.ip() {
+        std::net::IpAddr::V4(v4) => request.extend(v4.octets()),
+        std::net::IpAddr::V6(_) => unreachable!(),
+    }
+    request.extend(echo.address.port().to_be_bytes());
+    stream.write_all(&request).await.unwrap();
+    // 必须读完整个 SOCKS 应答（4 字节头 + BND 地址 + 端口），否则剩余
+    // 地址字节会被下面的 read 当成「业务回显」。
+    let (code, _) = common::read_socks_reply(&mut stream).await;
+
+    // 拒绝时不应回显；若规则未生效，echo 会原样返回探测字节。
+    if code == 0 {
+        stream.write_all(b"probe").await.ok();
+    }
+    let mut buffer = [0u8; 8];
+    let read = tokio::time::timeout(Duration::from_millis(800), stream.read(&mut buffer)).await;
+    assert!(
+        matches!(read, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
+        "命中 reject 后不应有业务回显"
+    );
     server.shutdown().await;
 }
 
-/// 用真实 `mmdb` 判断 IP 的国家码。
+/// 反证：同一 geo 配置下，规则不命中时数据能正常转发。
+///
+/// 这条与上一条成对出现，证明上面的「没有回显」确实来自拒绝，而不是
+/// 环境本身不通。
 #[tokio::test]
-async fn real_mmdb_classifies_known_addresses() {
-    let Some(dir) = real_geodata() else {
-        eprintln!("跳过：未下载真实数据集");
-        return;
-    };
+async fn geoip_non_matching_relays_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    // geoip:loop 只含 127.0.0.0/8，但规则只匹配 10.0.0.0/8。
+    let dat = encode_geoip(&[("loop", &[([127, 0, 0, 0], 8)])]);
+    let geoip = write(dir.path(), "geoip.dat", &dat);
     let server = Running::start(config(
-        json!({"mmdb": dir.join("Country.mmdb").display().to_string()}),
-        json!({"ip_cidrs": ["mmdb:CN"], "outbound": "reject"}),
+        json!({"geoip": geoip}),
+        json!({"ip_cidrs": ["geoip:loop"], "outbound": "reject"}),
     ))
     .await;
-    // 223.5.5.5 是中国地址（阿里公共 DNS）。
-    assert_rejected(&server, "223.5.5.5", 80).await;
-    // 8.8.8.8 不是中国地址。
+    // 让次要规则不命中：再加一条只针对 10/8 的规则在前面，
+    // 目标 127.0.0.1 不匹配它，也不匹配 geoip:loop 之外的规则。
+    server.shutdown().await;
+
+    // 使用只含 10/8 的 geoip，回环不在其中 → 正常转发。
+    let dir2 = tempfile::tempdir().unwrap();
+    let dat2 = encode_geoip(&[("ten", &[([10, 0, 0, 0], 8)])]);
+    let geoip2 = write(dir2.path(), "geoip.dat", &dat2);
+    let server = Running::start(config(
+        json!({"geoip": geoip2}),
+        json!({"ip_cidrs": ["geoip:ten"], "outbound": "reject"}),
+    ))
+    .await;
     let echo = Echo::tcp("127.0.0.1", false).await;
-    assert_relayed(&server, echo.address, b"8").await;
+    let (mut stream, _) = common::socks(1, common::address(echo.address), server.address).await;
+    stream.write_all(b"ok").await.unwrap();
+    let mut echoed = [0u8; 2];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"ok");
     server.shutdown().await;
 }
