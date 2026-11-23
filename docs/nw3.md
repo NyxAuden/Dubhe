@@ -74,12 +74,23 @@ Egress 与 Portal 一样是独立子系统：**不经过本内核 route/outbound
 > 不做逐次 `ctx.stats.reject()` 打点，因此 `/metrics` 的
 > `dubhe_rejected_total` **不包含 NW3 的认证失败**。
 >
-> 这不是缺陷：NW3 Portal 是独立子系统（自行绑定、自行出站），本内核
-> 只负责把它跑起来。认证失败由 Nowhere 自身的 `SilentRejections`
-> 聚合后经 `nowhere::Logger` 输出日志，可用日志检索，不在指标里。
+> **2026-11-24 变更**：`out` 为 `direct`（默认）时，内核会注入一个
+> **仅供本进程使用**的 loopback SOCKS5 入口（tag `__nw3_internal`），并把
+> Portal 的 `out` 指向它。因此 NW3 的业务流量现在会经过本内核的
+> `route` / `limits` / 统计——`route.rules` 对 NW3 生效，业务字节计入
+> `/stats` 与 `/stats/users`。
 >
-> 要接入主 Stats 需要修改 `vendor/nowhere` 的 `Portal::run` 接口，
-> 会破坏与官方 Nowhere 的同步基础，因此不做。
+> 为什么走 loopback 而不是改 vendor：`Outlet` / `OutboundDialer` 都是
+> `pub(crate)`，注入 dialer 要长期维护 GPL 分叉；而 `out=` 指向任意 SOCKS5
+> 端点是 Nowhere 的公开契约。代价是多一次回环往返（实测 SOCKS5 转发
+> 延迟 +0.235ms）。
+>
+> 边界：
+> - 用户显式配置了 `out`（`egress` 或 `HOST:PORT`）时不注入，尊重原行为。
+> - 内部入口不写入配置、不参与 `dubhe export`、不计入热重载指纹。
+> - NW3 自己的 `rate` / `etar` 仍由 Portal 执行，不并入本内核的 `limits`。
+> - **认证失败仍不计入 `dubhe_rejected_total`**：认证在 `vendor/nowhere`
+>   内部完成，本内核看不到。日志里可用 Nowhere 的 `SilentRejections` 排查。
 （这与 Nowhere 自身的 Egress 角色一致）；日志同样走 `nowhere::Logger`。本地 IPC 遥测按 Nowhere 的 `InstanceRole::Egress` 注册。
 
 ## Portal 的出口选择（`out`）

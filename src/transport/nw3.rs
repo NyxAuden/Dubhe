@@ -88,7 +88,15 @@ fn push_query(query: &mut String, name: &str, value: &str) {
 }
 
 /// 由入站配置构造 Portal；失败说明密钥、证书或端点不满足 Nowhere 的要求。
-pub(crate) fn prepare(inbound: &Inbound) -> io::Result<nowhere::Portal> {
+///
+/// `out_override` 用于「`out` 为 `direct` 时改为指向本进程的 loopback SOCKS5
+/// 入口」：
+/// Nowhere 的 `out=` 是它的公开契约，指向任意 SOCKS5 端点即可让 NW3 流量
+/// 进入本内核的 route/limits/stats，而不必改 vendored 的 GPL 代码。
+pub(crate) fn prepare_with_out(
+    inbound: &Inbound,
+    out_override: Option<&str>,
+) -> io::Result<nowhere::Portal> {
     let Inbound::Nw3 {
         tag,
         listen,
@@ -107,11 +115,20 @@ pub(crate) fn prepare(inbound: &Inbound) -> io::Result<nowhere::Portal> {
     else {
         return Err(io::Error::other("非 NW3 入站不能构造 Portal"));
     };
+    // 覆盖时用一个局部的 `Nw3Out` 承接，避免再往配置结构里塞可变状态。
+    let overridden;
+    let effective_out = match out_override {
+        Some(value) => {
+            overridden = crate::config::Nw3Out::Socks(value.to_owned());
+            &overridden
+        }
+        None => out,
+    };
     let url = portal_url(
         *listen,
         key,
         *morph,
-        out,
+        effective_out,
         dial.as_deref(),
         dial4.as_deref(),
         dial6.as_deref(),

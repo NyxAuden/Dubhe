@@ -48,6 +48,12 @@
 
 ### 修复
 
+- **NW3 Portal 的流量现在受内核控制面约束**：`out` 为 `direct`（默认）时，
+  内核注入一个仅供本进程使用的 loopback SOCKS5 入口（tag `__nw3_internal`），
+  并把 Portal 的 `out` 指向它。因此 `route.rules` 对 NW3 生效，业务字节计入
+  `/stats` 与 `/stats/users`——此前 Portal 自己绑定、自己直连，路由、限额、
+  统计对 NW3 全部无效。代价是一次回环往返（实测 +0.235ms）。
+  显式配置 `out` 时不注入；Portal 自己的 `rate`/`etar` 仍由 Nowhere 执行。
 - **管理 API 此前会丢弃任何带查询串的请求**：`src/admin.rs` 的 `parse()` 里有
   `if path.contains('?') { return None }`，导致 `/stats/users/reset?inbound=x`
   这类请求直接 400。现按「不含查询串的路径」路由，查询参数单独解析。

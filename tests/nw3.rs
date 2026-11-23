@@ -484,3 +484,102 @@ async fn nw3_portal_relays_tcp_with_vendored_vector_client() {
     drop(stream);
     server.shutdown().await;
 }
+
+/// NW3 的 `out` 为 `direct` 时，Portal 的出站应经过本内核的 loopback SOCKS5，
+/// 因此 `route.rules` 对 NW3 流量生效。
+///
+/// 修复前 Portal 自己直连，`route`/`limits`/`stats` 对 NW3 全部无效。
+///
+/// 关键设计：用 `dns.hosts` 把 `blocked.example` 指到回显服务。这样**绕过
+/// 内核直连也会成功**——只有真正经过内核才会被规则拒绝，测试不会因「域名
+/// 本来解析不了」而假通过。
+#[tokio::test]
+async fn nw3_portal_out_direct_respects_kernel_routes() {
+    let cert = Certificate::new();
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let blocked_ip = echo.address.ip().to_string();
+    let port = free_port();
+    let server = Running::start(json!({
+        "version": 1,
+        "inbounds": [{
+            "type": "nw3",
+            "tag": "nw3-in",
+            "listen": format!("127.0.0.1:{port}"),
+            "key": KEY,
+            "morph": false,
+            "out": "direct",
+            "certificate": cert.dir.path().join("cert.pem"),
+            "private_key": cert.dir.path().join("key.pem")
+        }],
+        "outbounds": [
+            {"type": "direct", "tag": "direct"},
+            {"type": "reject", "tag": "reject"}
+        ],
+        "dns": {"hosts": {"blocked.example": [blocked_ip]}},
+        "route": {
+            "default": "direct",
+            "rules": [{"domains": ["blocked.example"], "outbound": "reject"}]
+        },
+        "limits": {"shutdown_timeout_ms": 500, "handshake_timeout_ms": 3000}
+    }))
+    .await;
+    let url = format!(
+        "vector://{KEY}@127.0.0.1:{port}?morph=0&sni=localhost&pin={}&in=127.0.0.1:1",
+        pin(&cert)
+    );
+    let client = nowhere::VectorClient::new(url.parse().unwrap(), nowhere::Logger).unwrap();
+
+    // 控制组：目标 IP 不在拒绝规则里，回显正常。
+    let mut allowed = timeout(Duration::from_secs(5), async {
+        loop {
+            match client.connect_tcp("127.0.0.1", echo.address.port()).await {
+                Ok(stream) => break stream,
+                Err(_) => sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("NW3 Portal 未在期限内就绪");
+    allowed.write_all(b"ok").await.unwrap();
+    allowed.flush().await.unwrap();
+    let mut echoed = [0u8; 2];
+    timeout(Duration::from_secs(3), allowed.read_exact(&mut echoed))
+        .await
+        .expect("NW3 回显超时")
+        .unwrap();
+    assert_eq!(&echoed, b"ok");
+    drop(allowed);
+    // 直接证据：NW3 的业务字节现在会计入内核的全局统计。
+    // 修复前 Portal 自己出站，`uplink`/`downlink` 对 NW3 恒为 0。
+    let snapshot = server.stats.snapshot();
+    assert!(
+        snapshot.uplink >= 2 && snapshot.downlink >= 2,
+        "NW3 流量应计入内核统计，实际 uplink={} downlink={}",
+        snapshot.uplink,
+        snapshot.downlink
+    );
+
+    // 命中 reject：`blocked.example` 能解析到回显服务，若 Portal 绕过内核
+    // 就会直连成功；只有走内核才会被拒绝。
+    let denied = timeout(Duration::from_secs(5), async {
+        match client
+            .connect_tcp("blocked.example", echo.address.port())
+            .await
+        {
+            Ok(mut stream) => {
+                let mut byte = [0u8; 1];
+                let _ = stream.write_all(b"x").await;
+                match timeout(Duration::from_millis(500), stream.read(&mut byte)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => true,
+                    Ok(Ok(_)) => false,
+                }
+            }
+            Err(_) => true,
+        }
+    })
+    .await
+    .expect("NW3 拒绝路径超时");
+    assert!(denied, "命中 reject 的域名不应建立可用连接");
+
+    server.shutdown().await;
+}

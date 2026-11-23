@@ -25,6 +25,9 @@ use crate::{
 
 mod accept;
 
+/// 为 NW3 注入的内部入口 tag。它不会出现在配置、导出或热重载指纹里。
+const NW3_INTERNAL_TAG: &str = "__nw3_internal";
+
 /// 握手期的两个名额（全局并发 + 单 IP 在途）。协议实现只需按原样持有并在
 /// 握手完成时 `drop`，两者的释放时机因此自动对齐。
 pub(crate) use accept::HandshakePermits;
@@ -241,7 +244,36 @@ impl Server {
         let mut portals = Vec::new();
         let mut addresses = HashMap::new();
         // 所有监听准备成功后才会进入 run；失败时局部对象析构关闭套接字。
-        for (index, inbound) in config.inbounds.iter().enumerate() {
+        // NW3 的 `out` 为 `direct`（默认）时，注入一个**仅供本进程使用**的
+        // loopback SOCKS5 入口，并把 Portal 的 `out` 指向它。这样 NW3 流量
+        // 走本内核的 route/limits/stats，而不是让 vendored Portal 自己直连。
+        //
+        // 不用「改 vendor 注入 dialer」的理由：`Outlet`/`OutboundDialer` 都是
+        // `pub(crate)`，注入要在 GPL 代码里维护分叉；而 `out=` 是 Nowhere 的
+        // 公开契约。代价是多一次回环往返（实测 SOCKS5 转发延迟 +0.235ms）。
+        let mut inbounds = config.inbounds.clone();
+        let needs_nw3_relay = inbounds.iter().any(|inbound| {
+            matches!(
+                inbound,
+                Inbound::Nw3 {
+                    out: crate::config::Nw3Out::Direct,
+                    ..
+                }
+            )
+        });
+        if needs_nw3_relay {
+            // 放在最前：NW3 分支要能查到它实际绑定的端口（listen 端口为 0）。
+            inbounds.insert(
+                0,
+                Inbound::Socks5 {
+                    tag: NW3_INTERNAL_TAG.to_owned(),
+                    listen: "127.0.0.1:0".parse().expect("静态回环地址"),
+                    users: Vec::new(),
+                    allow_insecure: false,
+                },
+            );
+        }
+        for (index, inbound) in inbounds.iter().enumerate() {
             // WireGuard 只监听 UDP，握手与会话由 boringtun 驱动；隧道内 TCP/UDP
             // 经 route/direct 拨号，不创建 TUN。
             if let Inbound::Wireguard {
@@ -446,7 +478,10 @@ impl Server {
             }
             // NW3 由 Nowhere Portal 在 run 阶段自行绑定同端口的 TCP（TLS 1.3）与 QUIC。
             if let Inbound::Nw3 { tag, listen, .. } = inbound {
-                let portal = transport::nw3::prepare(inbound)?;
+                let relay = addresses
+                    .get(NW3_INTERNAL_TAG)
+                    .map(|address| address.to_string());
+                let portal = transport::nw3::prepare_with_out(inbound, relay.as_deref())?;
                 addresses.insert(tag.clone(), *listen);
                 portals.push((tag.clone(), portal));
                 continue;
