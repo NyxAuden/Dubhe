@@ -884,7 +884,14 @@ async fn handle_bi_stream(
             return;
         }
     };
-    let upstream = match shared.ctx.connect(&shared.tag, &target).await {
+    // 首包嗅探：TUIC 客户端通常紧接 Connect 头就发首包，因此这里有机会
+    // 读到 TLS SNI / HTTP Host。未配置 `sniffing` 时直接返回空前缀。
+    // 用 `sniff_route_parts` 而不是包装流：失败分支还要调用
+    // `recv.stop()`，包装成 `Prefixed` 后就拿不到底层句柄了。
+    let (prefix, route, dial) =
+        crate::transport::sniff::sniff_route_parts(&shared.ctx, &shared.tag, &mut recv, &target)
+            .await;
+    let upstream = match shared.ctx.connect_routed(&shared.tag, &route, &dial).await {
         Ok(upstream) => upstream,
         Err(_) => {
             let _ = recv.stop(VarInt::from_u32(0));
@@ -892,6 +899,7 @@ async fn handle_bi_stream(
             return;
         }
     };
+    let recv = crate::transport::sniff::Prefixed::new(prefix, recv);
     let user = match &*auth.borrow() {
         AuthState::Authenticated(index) => shared
             .options
@@ -1618,12 +1626,12 @@ fn timed_out() -> io::Error {
 }
 
 /// 把 quinn 的分离读写流组合成 `AsyncRead + AsyncWrite`，供 `forward::relay` 使用。
-struct QuicStream {
+struct QuicStream<R = RecvStream> {
     send: SendStream,
-    recv: RecvStream,
+    recv: R,
 }
 
-impl AsyncRead for QuicStream {
+impl<R: AsyncRead + Unpin> AsyncRead for QuicStream<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         context: &mut TaskContext<'_>,
@@ -1633,7 +1641,7 @@ impl AsyncRead for QuicStream {
     }
 }
 
-impl AsyncWrite for QuicStream {
+impl<R: Unpin> AsyncWrite for QuicStream<R> {
     fn poll_write(
         self: Pin<&mut Self>,
         context: &mut TaskContext<'_>,

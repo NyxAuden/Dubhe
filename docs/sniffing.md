@@ -48,11 +48,44 @@ UDP 关联没有可回放的流：对每个 QUIC Initial 数据报按 RFC 9001 �
   目标仍为该帧声明的地址。
 - UDP 关联（SOCKS5、Trojan、VLESS/VMess UoT 与 XUDP、Shadowsocks）的 QUIC Initial 选路；共享 `Association` 的协议都生效
 
+## 支持范围（2026-11-24 核实）
+
+| 入站 | TCP 首包嗅探 | 依据 |
+|---|---|---|
+| VLESS / Vision / VMess / Trojan（各 TCP 承载） | ✅ | `src/runtime/serve.rs` |
+| Shadowsocks | ✅ | `src/protocol/shadowsocks/mod.rs` |
+| SOCKS5 CONNECT / Mux.Cool / dokodemo-door | ✅ | 各自入口 |
+| **Hysteria2** | ✅（2026-11-24 新增） | `src/transport/hysteria2/mod.rs`，客户端通常随 TCPRequest 一起发首包 |
+| **TUIC** | ✅（2026-11-24 新增） | `src/transport/tuic.rs`，同上 |
+| AnyTLS / Snell / Naive H1/H2/H3 | ❌ **协议上做不到** | 见下 |
+
+### 为什么 AnyTLS / Snell / Naive 不能嗅探
+
+这三者的客户端都要**先收到服务端的成功应答**才发送业务数据：
+
+| 协议 | 客户端等待的应答 | 代码位置 |
+|---|---|---|
+| AnyTLS | `SYNACK`（命令 7） | `src/transport/anytls.rs` 发 SYNACK 后才 `start_bridge` |
+| Snell | `REPLY_TUNNEL`（0x00） | `src/protocol/snell.rs` `write_record(&[REPLY_TUNNEL])` 后才 `relay_tcp` |
+| Naive | `200 Connection Established` | `src/transport/naive.rs`、`naive/h1.rs` 回 200 后才转发 |
+
+服务端在连接上游之前**一个业务字节都读不到**，所以「先嗅探再选路」在这三个协议上
+不成立。要在它们上面实现按域名分流，只有两条路，都不该选：
+
+1. 先回成功应答、再嗅探、再选路——这样失败时无法再回 `502`/失败码，会把
+   「目标不可达」变成「已连接后静默关闭」，改变对外语义。
+2. 用 CONNECT 里的目标（本来就是域名）——那就已经有域名了，不需要嗅探。
+
+因此这三项**不是未实现，是不该实现**。客户端在 CONNECT/请求里本来就带域名，
+`domains`/`domain_suffix` 规则对它们直接生效；只有「客户端把域名解析成 IP 再发」
+这一种情况嗅探才有价值，而那需要客户端配合，做不到。
+
 ## 未覆盖
 
 - UoT 初始化请求帧与 Mux.Cool 控制帧本身没有业务首包；其后的 UDP 数据报
   仍按 QUIC Initial 选路。
-- TUIC、Hysteria2 等自带 QUIC 状态的 UDP 承载：由协议层直接处理，不经过共享 `Association` 嗅探。
+- TUIC、Hysteria2 的 **UDP** 数据报仍由协议层直接处理，不经过共享 `Association`
+  嗅探；只有它们的 TCP 流在 2026-11-24 补上了首包嗅探。
 - QUIC 0-RTT 与非 Initial 包：只解密 Initial；合并数据报会按 Length 依次跳过非 Initial 包，最多检查 8 个。
 - HTTP 代理入站的请求头本身已含目标，不再重复嗅探。
 - `dokodemo-door` 有自己的 `sniffing` 字段，只影响该入口的固定目标。

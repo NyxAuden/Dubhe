@@ -1077,3 +1077,80 @@ async fn masquerade_file_serves_directory_content() {
     assert_eq!(status, 404);
     running.shutdown().await;
 }
+
+/// Hysteria2 的首包嗅探：客户端把 ClientHello 与 TCPRequest 一起发出时，
+/// 服务端应能读到 SNI 并据此选路。
+///
+/// 这是 2026-11-24 补的嗅探覆盖之一。选 Hysteria2 而不是 AnyTLS/Snell/Naive，
+/// 是因为后三者的客户端要**先收到成功应答**才发数据（AnyTLS 等 SYNACK、
+/// Snell 等 REPLY_TUNNEL、Naive 等 200），服务端在连接前根本无字节可读。
+#[tokio::test]
+async fn sniffed_sni_routes_the_stream_before_dialing() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let cert = common::Certificate::new();
+    let mut value = config(&cert);
+    // 只为 hy2 入口开启嗅探，并把 blocked.example 拒绝。
+    value["sniffing"] = json!({"enabled": true, "dest_override": ["tls"]});
+    value["outbounds"] = json!([
+        {"type": "direct", "tag": "direct"},
+        {"type": "reject", "tag": "reject"}
+    ]);
+    value["route"]["rules"] = json!([
+        {"domains": ["blocked.example"], "outbound": "reject"}
+    ]);
+    let running = Running::start(value).await;
+    let (endpoint, connection) = authenticated(&running, &cert).await;
+
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    // 构造带 SNI 的 ClientHello，并与请求一起发出。
+    let hello = tls_client_hello("blocked.example");
+    send.write_all(&tcp_request(&echo.address.to_string(), &hello))
+        .await
+        .unwrap();
+
+    // 规则命中 reject：服务端应回失败状态，且不向目标转发任何字节。
+    let status = timeout(Duration::from_secs(5), recv.read_u8())
+        .await
+        .expect("等待 TCP 响应超时")
+        .unwrap();
+    assert_eq!(status, 1, "命中 reject 时应回失败状态");
+    drop(connection);
+    drop(endpoint);
+    let _ = echo;
+}
+
+/// 来自 `src/transport/sniff.rs` 测试的最小 ClientHello（含 server_name）。
+fn tls_client_hello(server_name: &str) -> Vec<u8> {
+    let mut entry = Vec::new();
+    entry.push(0x00);
+    entry.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
+    entry.extend_from_slice(server_name.as_bytes());
+    let mut data = Vec::new();
+    data.extend_from_slice(&(entry.len() as u16).to_be_bytes());
+    data.extend_from_slice(&entry);
+    let mut extensions = Vec::new();
+    extensions.extend_from_slice(&[0x00, 0x00]);
+    extensions.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&data);
+
+    let mut hello = Vec::new();
+    hello.extend_from_slice(&[0x03, 0x03]);
+    hello.extend_from_slice(&[0x11; 32]);
+    hello.push(0);
+    hello.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+    hello.extend_from_slice(&[0x01, 0x00]);
+    hello.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    hello.extend_from_slice(&extensions);
+
+    let mut handshake = Vec::new();
+    handshake.push(0x01);
+    handshake.extend_from_slice(&(hello.len() as u32).to_be_bytes()[1..]);
+    handshake.extend_from_slice(&hello);
+
+    let mut record = Vec::new();
+    record.push(0x16);
+    record.extend_from_slice(&[0x03, 0x03]);
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}

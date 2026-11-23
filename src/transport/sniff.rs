@@ -258,18 +258,46 @@ pub(crate) async fn sniff_route<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Some(policy) = ctx.sniff_policy(inbound) else {
-        return (
-            Prefixed::new(Vec::new(), stream),
-            target.clone(),
-            target.clone(),
-        );
-    };
+    sniff_route_read(ctx, inbound, stream, target).await
+}
+
+/// 与 [`sniff_route`] 相同，但**只要求读能力**。
+///
+/// 供「读写已分离」的协议使用（Hysteria2/TUIC 的 QUIC 流：读和写是两个
+/// 独立的 handle，写侧还需要在失败分支调用 `finish()`，不能与读侧合并成
+/// 一个对象）。调用方拿到 `Prefixed` 的读侧后自行与写侧 `join`。
+pub(crate) async fn sniff_route_read<S>(
+    ctx: &Context,
+    inbound: &str,
+    stream: S,
+    target: &Target,
+) -> (Prefixed<S>, Target, Target)
+where
+    S: AsyncRead + Unpin,
+{
     let mut stream = stream;
-    let (sniffed, prefix) = read_payload(&mut stream, policy.timeout()).await;
-    let stream = Prefixed::new(prefix, stream);
+    let (prefix, route, dial) = sniff_route_parts(ctx, inbound, &mut stream, target).await;
+    (Prefixed::new(prefix, stream), route, dial)
+}
+
+/// 只做嗅探并返回已消费的前缀，由调用方决定怎么回放。
+///
+/// 供需要保留底层句柄能力（例如 quinn 的 `RecvStream::stop()`）的协议使用。
+pub(crate) async fn sniff_route_parts<S>(
+    ctx: &Context,
+    inbound: &str,
+    stream: &mut S,
+    target: &Target,
+) -> (Vec<u8>, Target, Target)
+where
+    S: AsyncRead + Unpin,
+{
+    let Some(policy) = ctx.sniff_policy(inbound) else {
+        return (Vec::new(), target.clone(), target.clone());
+    };
+    let (sniffed, prefix) = read_payload(stream, policy.timeout()).await;
     let Some((kind, domain)) = sniffed else {
-        return (stream, target.clone(), target.clone());
+        return (prefix, target.clone(), target.clone());
     };
     let route = Target {
         host: Host::Domain(domain),
@@ -280,7 +308,7 @@ where
     } else {
         target.clone()
     };
-    (stream, route, dial)
+    (prefix, route, dial)
 }
 
 /// UDP 首包的 QUIC Initial SNI 只用于选路。

@@ -781,13 +781,20 @@ async fn handle_stream(
         }
     };
 
-    match ctx.connect(tag, &target).await {
+    // 首包嗅探：Hysteria2 的客户端通常把首包与 TCPRequest 一起发出，所以
+    // 这里有机会读到 TLS SNI / HTTP Host。未为该入口配置 `sniffing` 时
+    // `sniff_route_read` 直接返回原样，零开销。
+    //
+    // 只用读侧：写侧还要在失败分支 `finish()`，不能与读侧合成一个对象。
+    let (recv, route, dial) =
+        crate::transport::sniff::sniff_route_read(ctx, tag, recv, &target).await;
+    match ctx.connect_routed(tag, &route, &dial).await {
         Ok(upstream) => {
             let response = wire::encode_tcp_response(true, "", &[])?;
             timeout(handshake, send.write_all(&response))
                 .await
                 .map_err(|_| timed_out())??;
-            // 后续字节直接双向中继；剩余首包数据仍在 recv 缓冲区中。
+            // 后续字节直接双向中继；已读首包由 `Prefixed` 原样回放。
             let stream = ctx.stats.count_user(tag, user, tokio::io::join(recv, send));
             forward::relay(stream, upstream, ctx.stats.clone()).await?;
         }
