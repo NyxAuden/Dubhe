@@ -112,9 +112,13 @@
   - `users[].reverse: {tag}`：VLESS **命令 4**（`RequestCommandRvs = 0x04`），
     由官方文档《VLESS Reverse Proxy Examples》推荐，配置上把 `reverse.tag`
     分别呈现为出站（公网侧）与入站（内网侧）。
-  本项目已实现命令 4 的 Portal 与 Bridge（见 `docs/reverse.md`），
-  配置格式采用自有顶层 `reverse_bridges`，尚未接受 Xray 的
-  `users[].reverse` 写法。
+  本项目已实现命令 4 的 Portal 与 Bridge（见 `docs/reverse.md`）：
+  - Portal 侧现在**同时接受** Xray 的 `users[].reverse.tag` 写法与既有的
+    顶层 `reverse_bridges`；前者在配置解析阶段校验 tag 必须指向 `reverse` 出站。
+  - 2026-11-23 用官方 Xray v26.10.31 作为 Bridge 主动拨入本内核 Portal，
+    三次连续请求均双向回显通过（`tests/reverse_official_bridge.rs`）。
+    该用例的 Portal 配置**故意不配 `v1.rvs.cool` 路由规则、默认路由指向
+    `direct`**，因此只有真正读取了 `reverse.tag` 才能建立隧道。
 - **Nowhere Portal/Egress**：源码 S；服务端角色包含主动回连，不需要开发终端用户 Vector 客户端
 - **热更新、证书管理、管理接口**：**证书轮换已实现待集中验收**：SIGHUP 在配置内容不变时只原子替换 TCP/TLS 入口证书，不重启监听、已建立连接保持原证书。**零停机配置热重载已实现待集中验收**：入口/limits/API/NW3 Egress 未变化且无 UDP 监听器时原子替换路由、DNS、嗅探与出站配置，既有连接保持旧快照；监听器/limits 变化、反向 portal 或 UDP 入口仍完整重启。QUIC/mKCP/REALITY/ShadowTLS 证书不在此范围。管理/统计 API 提供 `/healthz`、`/stats`、`GET /connections` 与 `DELETE /connections/{id}`/`DELETE /connections`（活动 TCP 连接，含目标元数据与关闭句柄）；面板 API 的完整兼容仍属后续设计，内部原生能力不等于兼容所有面板 API
 - **Linux x86_64/ARM64**：当前Shadowsocks构建两平台各209项普通测试及vendor25项通过，见[本批验收](shadowsocks-acceptance.md)；此前VLESS/XUDP两平台各117项是独立历史，见vless-acceptance.md。x86_64使用QEMU及编译器局部环境修正；平台普通测试不扩大为外部客户端互通矩阵或原生性能证明

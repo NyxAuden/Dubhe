@@ -20,8 +20,27 @@
 Bridge 使用顶层 `reverse_bridges` 引用一个标准 `vless` 出站，连接断开后按
 `reconnect_ms` 重连。
 
-> 配置格式差异：Xray 把反向声明写在 `users[].reverse: {tag}` 里，本项目用顶层
-> `reverse_bridges`。两者语义相同但写法不同，Xray 配置不能直接拿来用。
+配置格式：项目**同时支持两种写法**。
+
+Portal 侧（接收 Bridge 拨入）推荐 Xray 写法，可以直接照搬：
+
+```json
+{
+  "inbounds": [{
+    "type": "vless",
+    "users": [{"uuid": "…", "reverse": {"tag": "portal"}}]
+  }],
+  "outbounds": [
+    {"type": "reverse", "tag": "portal", "domain": "v1.rvs.cool"}
+  ]
+}
+```
+
+`users[].reverse.tag` 在**配置解析阶段**校验：tag 格式必须有效、必须指向存在的
+出站、且该出站的 kind 必须是 `reverse`。写错会立即报错，不会拖到运行期。
+
+Bridge 侧仍用顶层 `reverse_bridges`（Xray 的对应写法是给 `vless` 出站加
+`settings.reverse.tag`）。
 
 ## 配置
 
