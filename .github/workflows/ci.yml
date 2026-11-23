@@ -43,7 +43,20 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
-        run: cargo test --locked --all-targets
+        # 保留完整测试输出：失败时下载 artifact 能看到具体用例与错误，
+        # 不必只凭「Test 步骤失败」去猜。
+        # pipefail：否则管道退出码取 tee 的，测试失败会被吞掉。
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --all-targets --no-fail-fast 2>&1 | tee test-output.log
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ matrix.os }}
+          path: test-output.log
+          retention-days: 7
       - name: Release build
         run: cargo build --locked --release --bin dubhe
 
