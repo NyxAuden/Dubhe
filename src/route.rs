@@ -25,7 +25,12 @@ pub struct Router {
 ///
 /// 没有配置 `geo` 段时，出现 `geosite:` 等引用会直接报错——静默跳过会让
 /// 用户以为规则生效了。
-fn expand_geo(geo_data: Option<&crate::geo::GeoData>, rule: &Rule) -> Result<crate::geo::Expanded> {
+fn expand_geo(
+    geo_data: Option<&crate::geo::GeoData>,
+    rule: &Rule,
+    rule_index: usize,
+    budget: &mut crate::geo::ExpansionBudget,
+) -> Result<crate::geo::Expanded> {
     let geo_ip_refs: Vec<String> = rule
         .ip_cidrs
         .iter()
@@ -53,7 +58,7 @@ fn expand_geo(geo_data: Option<&crate::geo::GeoData>, rule: &Rule) -> Result<cra
             "规则引用了 {sample}，但配置里没有 geo 段；请设置 geo.geosite / geo.geoip / geo.mmdb，或改成具体值"
         );
     };
-    crate::geo::expand(data, &rule.domains, &geo_ip_refs)
+    crate::geo::expand(data, &rule.domains, &geo_ip_refs, rule_index, budget)
 }
 
 fn ipnet_of(cidr: crate::geo::Cidr) -> Result<IpNet> {
@@ -482,14 +487,16 @@ impl Router {
             Some(geo) => Some(std::sync::Arc::new(crate::geo::load(geo)?)),
             None => None,
         };
+        let mut expansion = crate::geo::ExpansionBudget::default();
         let rules = config
             .route
             .rules
             .iter()
-            .map(|rule| {
+            .enumerate()
+            .map(|(rule_index, rule)| {
                 let destination = resolve(&rule.outbound)?;
                 // `geosite:` / `geoip:` 在此展开成具体项；`mmdb:` 留到运行期。
-                let expanded = expand_geo(geo_data.as_deref(), rule)?;
+                let expanded = expand_geo(geo_data.as_deref(), rule, rule_index, &mut expansion)?;
                 let domains: Vec<String> = rule
                     .domains
                     .iter()
@@ -1583,7 +1590,13 @@ mod geo_expand_tests {
             "outbound": "direct"
         }))
         .unwrap();
-        let expanded = expand_geo(Some(&data), &rule).unwrap();
+        let expanded = expand_geo(
+            Some(&data),
+            &rule,
+            0,
+            &mut crate::geo::ExpansionBudget::default(),
+        )
+        .unwrap();
         let suffix = expanded
             .domains
             .iter()

@@ -73,6 +73,47 @@ async fn hot_reload_swaps_routing_without_dropping_existing_connections() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
 }
 
+/// 新配置无法构建路由时（这里是地理数据文件读不到，加载预算超限走同一
+/// 错误路径），重载返回错误，旧路由继续生效。
+#[tokio::test]
+async fn failed_reload_keeps_old_routing() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let rule_set = dir.path().join("rules.json");
+    std::fs::write(
+        &rule_set,
+        json!({"version": 3, "rules": [{"domain": ["blocked.test"]}]}).to_string(),
+    )
+    .unwrap();
+
+    let mut start = config("direct");
+    start["geo"] = json!({"rule_sets": [{"tag": "geo", "path": rule_set}]});
+    start["route"]["rules"] = json!([
+        {"domains": ["rule_set:geo"], "outbound": "reject"}
+    ]);
+    let server = dubhe::Server::bind(parse(&start)).await.unwrap();
+    let address = server.local_addr("socks").unwrap();
+    let hot = server.hot_reload_handle();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(server.run(stop.clone()));
+
+    assert_eq!(connect_status(address, echo.address).await, 0);
+
+    let broken = dir.path().join("missing.json");
+    let mut next = start.clone();
+    next["geo"] = json!({"rule_sets": [{"tag": "geo", "path": broken}]});
+    assert!(
+        hot.reload(&parse(&next)).is_err(),
+        "数据文件读不到时重载应失败"
+    );
+
+    // 旧路由仍然生效。
+    assert_eq!(connect_status(address, echo.address).await, 0);
+
+    stop.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+}
+
 #[tokio::test]
 async fn hot_reload_rejects_listener_affecting_changes() {
     let server = dubhe::Server::bind(parse(&config("direct"))).await.unwrap();

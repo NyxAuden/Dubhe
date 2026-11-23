@@ -18,6 +18,8 @@
 
 ### 新增
 
+- 地理数据集：`geosite.dat` / `geoip.dat` / MaxMind mmdb / sing-box rule-set
+  source JSON，见 `docs/geo.md`。读取与展开有固定预算，超限失败而不是截断。
 - 首次公开：服务端代理内核，Rust 实现，单进程多协议。
 - 入站 40 个变体：VLESS / VMess / Trojan 各承载（RAW、REALITY、Vision、
   WS、gRPC、XHTTP、HTTPUpgrade、mKCP、QUIC、HTTP）、Shadowsocks

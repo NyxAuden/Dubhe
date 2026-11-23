@@ -183,22 +183,130 @@ impl GeoData {
     }
 }
 
+/// 数据文件的读取与展开预算。
+///
+/// 目的是给启动/热重载的内存一个明确上界，**超限直接失败，不截断**：
+/// 截断会改变规则集合，反向规则的含义随之改变。
+struct Budget {
+    remaining_bytes: usize,
+    remaining_entries: usize,
+}
+
+/// 单个数据文件的读取上限。
+const MAX_FILE_BYTES: usize = 128 * 1024 * 1024;
+/// 一次加载里所有数据文件的累计读取上限。
+const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+/// 解码后的条目总数上限（分类 + 域名/CIDR 项）。
+const MAX_ENTRIES: usize = 3_000_000;
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            remaining_bytes: MAX_TOTAL_BYTES,
+            remaining_entries: MAX_ENTRIES,
+        }
+    }
+}
+
+impl Budget {
+    /// 按剩余额度读取文件；超出即报错，不返回被截断的内容。
+    fn read(&mut self, path: &Path) -> Result<Vec<u8>> {
+        use std::io::Read as _;
+        let limit = MAX_FILE_BYTES.min(self.remaining_bytes);
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("打开数据文件失败: {}", path.display()))?;
+        let mut buffer = Vec::new();
+        // `take` 保证不会因为文件变大而读超：最多读 limit + 1 字节，
+        // 多出 1 字节就说明超限。
+        file.take(limit as u64 + 1)
+            .read_to_end(&mut buffer)
+            .with_context(|| format!("读取数据文件失败: {}", path.display()))?;
+        if buffer.len() > limit {
+            bail!(
+                "数据文件超出预算: {}（上限 {} 字节，累计剩余 {} 字节）",
+                path.display(),
+                limit,
+                self.remaining_bytes
+            );
+        }
+        self.remaining_bytes -= buffer.len();
+        Ok(buffer)
+    }
+
+    fn take_entries(&mut self, count: usize, source: &Path) -> Result<()> {
+        if count > self.remaining_entries {
+            bail!(
+                "数据条目超出预算: {}（本次 {count} 项，剩余 {} 项）",
+                source.display(),
+                self.remaining_entries
+            );
+        }
+        self.remaining_entries -= count;
+        Ok(())
+    }
+}
+
+/// 规则展开的预算：跨所有规则累计，不按规则重置。
+pub struct ExpansionBudget {
+    remaining_items: usize,
+    remaining_bytes: usize,
+}
+
+/// 展开项总数上限。
+const MAX_EXPANDED_ITEMS: usize = 2_000_000;
+/// 展开出的文本累计上限。
+const MAX_EXPANDED_BYTES: usize = 128 * 1024 * 1024;
+
+impl Default for ExpansionBudget {
+    fn default() -> Self {
+        Self {
+            remaining_items: MAX_EXPANDED_ITEMS,
+            remaining_bytes: MAX_EXPANDED_BYTES,
+        }
+    }
+}
+
+impl ExpansionBudget {
+    /// 在真正复制之前扣减额度。
+    fn reserve(&mut self, items: usize, bytes: usize, rule: usize) -> Result<()> {
+        if items > self.remaining_items {
+            bail!(
+                "route.rules[{rule}] 的地理展开超出预算（本次 {items} 项，剩余 {} 项）；\
+                 请减少引用或调高上限",
+                self.remaining_items
+            );
+        }
+        if bytes > self.remaining_bytes {
+            bail!(
+                "route.rules[{rule}] 的地理展开文本超出预算（本次 {bytes} 字节，剩余 {} 字节）",
+                self.remaining_bytes
+            );
+        }
+        self.remaining_items -= items;
+        self.remaining_bytes -= bytes;
+        Ok(())
+    }
+}
+
 /// 加载一个配置对应的数据集。
 ///
 /// **不做全局缓存**：热重载换了数据文件时必须生效，全局单例会让新配置
 /// 沿用旧数据；并发测试也会互相污染。
 pub fn load(config: &GeoConfig) -> Result<GeoData> {
     let mut data = GeoData::default();
+    let mut budget = Budget::default();
     if let Some(path) = &config.geosite {
-        data.sites.extend(parse_geosite(path)?);
+        data.sites.extend(parse_geosite(path, &mut budget)?);
     }
     if let Some(path) = &config.geoip {
-        data.ips.extend(parse_geoip(path)?);
+        data.ips.extend(parse_geoip(path, &mut budget)?);
     }
     if let Some(path) = &config.mmdb {
+        // 用同一份字节构造，避免 `open_readfile` 再读一遍。
+        let bytes = budget.read(path)?;
         data.mmdb = Some(
-            maxminddb::Reader::open_readfile(path)
-                .with_context(|| format!("打开 mmdb 失败: {}", path.display()))?,
+            maxminddb::Reader::from_source(bytes)
+                .with_context(|| format!("解析 mmdb 失败: {}", path.display()))?,
         );
     }
     for source in &config.rule_sets {
@@ -209,7 +317,7 @@ pub fn load(config: &GeoConfig) -> Result<GeoData> {
             !data.rule_sets.contains_key(&key),
             "geo.rule_sets 的 tag 重复（忽略大小写）: {tag}"
         );
-        let parsed = parse_rule_set(&source.path)?;
+        let parsed = parse_rule_set(&source.path, &mut budget)?;
         data.rule_sets.insert(key, parsed);
     }
     Ok(data)
@@ -230,7 +338,13 @@ pub struct Expanded {
 }
 
 /// 展开一条路由规则里的 `geosite:` / `geoip:` / `mmdb:` / `rule_set:` 引用。
-pub fn expand(data: &GeoData, domains: &[String], ips: &[String]) -> Result<Expanded> {
+pub fn expand(
+    data: &GeoData,
+    domains: &[String],
+    ips: &[String],
+    rule: usize,
+    budget: &mut ExpansionBudget,
+) -> Result<Expanded> {
     let mut out = Expanded::default();
     for value in domains {
         let Some((kind, code)) = geo_code(value) else {
@@ -242,6 +356,7 @@ pub fn expand(data: &GeoData, domains: &[String], ips: &[String]) -> Result<Expa
                 let items = data
                     .sites(code)
                     .ok_or_else(|| anyhow::anyhow!("{value} 不在已加载的 geosite 数据里"))?;
+                budget.reserve(items.len(), domain_bytes(items), rule)?;
                 out.domains.extend_from_slice(items);
             }
             GeoKind::RuleSet => {
@@ -255,6 +370,7 @@ pub fn expand(data: &GeoData, domains: &[String], ips: &[String]) -> Result<Expa
                     !set.domains.is_empty(),
                     "{value} 不含域名项，不能用在 domains 里"
                 );
+                budget.reserve(set.domains.len(), domain_bytes(&set.domains), rule)?;
                 out.domains.extend_from_slice(&set.domains);
             }
             GeoKind::Ip | GeoKind::Mmdb => {
@@ -272,6 +388,7 @@ pub fn expand(data: &GeoData, domains: &[String], ips: &[String]) -> Result<Expa
                 let items = data
                     .ips(code)
                     .ok_or_else(|| anyhow::anyhow!("{value} 不在已加载的 GeoIP 数据里"))?;
+                budget.reserve(items.len(), 0, rule)?;
                 out.ips.extend_from_slice(items);
             }
             GeoKind::RuleSet => {
@@ -283,6 +400,7 @@ pub fn expand(data: &GeoData, domains: &[String], ips: &[String]) -> Result<Expa
                     !set.ips.is_empty(),
                     "{value} 不含 ip_cidr 项，不能用在 ip_cidrs 里"
                 );
+                budget.reserve(set.ips.len(), 0, rule)?;
                 out.ips.extend_from_slice(&set.ips);
             }
             // mmdb 不展开：交给运行期按国家码匹配（实现取舍，不是格式限制）。
@@ -394,13 +512,14 @@ struct GeoIpList {
     entry: Vec<GeoIpEntry>,
 }
 
-fn parse_geosite(path: &Path) -> Result<HashMap<String, Vec<DomainMatcher>>> {
+fn parse_geosite(path: &Path, budget: &mut Budget) -> Result<HashMap<String, Vec<DomainMatcher>>> {
     use prost::Message as _;
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("读取 geosite 数据失败: {}", path.display()))?;
+    let bytes = budget.read(path)?;
     let list = GeoSiteList::decode(bytes.as_slice())
         .with_context(|| format!("geosite 数据不是合法的 protobuf: {}", path.display()))?;
     let mut out = HashMap::new();
+    let total: usize = list.entry.iter().map(|entry| 1 + entry.domain.len()).sum();
+    budget.take_entries(total, path)?;
     for entry in list.entry {
         let mut items = Vec::with_capacity(entry.domain.len());
         for domain in entry.domain {
@@ -424,13 +543,14 @@ fn parse_geosite(path: &Path) -> Result<HashMap<String, Vec<DomainMatcher>>> {
     Ok(out)
 }
 
-fn parse_geoip(path: &Path) -> Result<HashMap<String, Vec<Cidr>>> {
+fn parse_geoip(path: &Path, budget: &mut Budget) -> Result<HashMap<String, Vec<Cidr>>> {
     use prost::Message as _;
-    let bytes =
-        std::fs::read(path).with_context(|| format!("读取 geoip 数据失败: {}", path.display()))?;
+    let bytes = budget.read(path)?;
     let list = GeoIpList::decode(bytes.as_slice())
         .with_context(|| format!("geoip 数据不是合法的 protobuf: {}", path.display()))?;
     let mut out = HashMap::new();
+    let total: usize = list.entry.iter().map(|entry| 1 + entry.cidr.len()).sum();
+    budget.take_entries(total, path)?;
     for entry in list.entry {
         ensure!(
             !entry.reverse_match,
@@ -480,7 +600,7 @@ fn cidr_from_bytes(ip: &[u8], prefix: u32) -> Result<Cidr> {
 /// 只接受纯域名/IP 列表；任何会改变语义的字段（`invert`、`type: logical`、
 /// `port`、`network`、`rule_set` 等）都**显式拒绝**，而不是解析后静默丢弃——
 /// 丢弃条件会让规则的匹配范围变大。
-fn parse_rule_set(path: &Path) -> Result<RuleSetData> {
+fn parse_rule_set(path: &Path, budget: &mut Budget) -> Result<RuleSetData> {
     const ALLOWED: &[&str] = &[
         "domain",
         "domain_suffix",
@@ -488,8 +608,7 @@ fn parse_rule_set(path: &Path) -> Result<RuleSetData> {
         "domain_regex",
         "ip_cidr",
     ];
-    let bytes =
-        std::fs::read(path).with_context(|| format!("读取 rule-set 失败: {}", path.display()))?;
+    let bytes = budget.read(path)?;
     // `.srs` 是 sing-box 的编译产物（魔数 `SRS`）；本实现只吃 source JSON。
     if bytes.starts_with(b"SRS") || path.extension().is_some_and(|ext| ext == "srs") {
         bail!(
@@ -565,6 +684,7 @@ fn parse_rule_set(path: &Path) -> Result<RuleSetData> {
         "rule-set 为空或没有可支持的条目: {}",
         path.display()
     );
+    budget.take_entries(data.domains.len() + data.ips.len(), path)?;
     Ok(data)
 }
 
@@ -614,6 +734,20 @@ fn collect_domains(
         out.push(item);
     }
     Ok(())
+}
+
+/// 域名匹配项的文本字节数估算（用于展开预算）。
+fn domain_bytes(items: &[DomainMatcher]) -> usize {
+    items
+        .iter()
+        .map(|item| match item {
+            DomainMatcher::Full(value)
+            | DomainMatcher::Suffix(value)
+            | DomainMatcher::Subdomain(value)
+            | DomainMatcher::Keyword(value)
+            | DomainMatcher::Regex(value) => value.len(),
+        })
+        .sum()
 }
 
 fn parse_cidr_text(value: &str) -> Result<Cidr> {
@@ -685,6 +819,80 @@ mod tests {
         list.encode_to_vec()
     }
 
+    /// 读取上限是**包含**的：恰好等于上限通过，多一字节失败。
+    #[test]
+    fn geo_read_limit_is_inclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"12345").unwrap();
+        let mut exact = Budget {
+            remaining_bytes: 5,
+            remaining_entries: 10,
+        };
+        assert_eq!(exact.read(&path).unwrap(), b"12345");
+        let mut over = Budget {
+            remaining_bytes: 4,
+            remaining_entries: 10,
+        };
+        let error = over.read(&path).unwrap_err().to_string();
+        assert!(error.contains("数据文件超出预算"), "{error}");
+    }
+
+    /// 累计读取预算跨文件生效：两份各自合法的文件合计仍可能超限。
+    #[test]
+    fn geo_total_budget_spans_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.bin");
+        let b = dir.path().join("b.bin");
+        std::fs::write(&a, b"0123456789").unwrap();
+        std::fs::write(&b, b"0123456789").unwrap();
+        let mut budget = Budget {
+            remaining_bytes: 15,
+            remaining_entries: 10,
+        };
+        assert!(budget.read(&a).is_ok());
+        let error = budget.read(&b).unwrap_err().to_string();
+        assert!(error.contains("数据文件超出预算"), "{error}");
+    }
+
+    /// 展开预算跨引用累计；超限要报出规则序号。
+    #[test]
+    fn expansion_budget_spans_references() {
+        let mut budget = ExpansionBudget {
+            remaining_items: 5,
+            remaining_bytes: 100,
+        };
+        budget.reserve(3, 10, 0).unwrap();
+        let error = budget.reserve(3, 10, 1).unwrap_err().to_string();
+        assert!(error.contains("route.rules[1]"), "{error}");
+        // 扣减后不会因为失败而被部分消耗：3 + 2 仍可放行。
+        budget.reserve(2, 10, 1).unwrap();
+        assert_eq!(budget.remaining_items, 0);
+    }
+
+    /// `expand` 使用调用方传入的同一份预算，不是每次调用重置。
+    #[test]
+    fn expansion_budget_is_shared_across_expand_calls() {
+        let mut sites = std::collections::HashMap::new();
+        sites.insert(
+            "test".to_owned(),
+            vec![DomainMatcher::Full("a.test".into())],
+        );
+        let data = GeoData {
+            sites,
+            ..GeoData::default()
+        };
+        let mut budget = ExpansionBudget {
+            remaining_items: 1,
+            remaining_bytes: 1000,
+        };
+        expand(&data, &["geosite:test".into()], &[], 0, &mut budget).unwrap();
+        let error = expand(&data, &["geosite:test".into()], &[], 1, &mut budget)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("route.rules[1]"), "{error}");
+    }
+
     #[test]
     fn parses_xray_geosite_types() {
         let dir = tempfile::tempdir().unwrap();
@@ -702,7 +910,7 @@ mod tests {
             )]),
         )
         .unwrap();
-        let sites = parse_geosite(&path).unwrap();
+        let sites = parse_geosite(&path, &mut Budget::default()).unwrap();
         let items = sites.get("test").expect("code 应统一小写");
         assert_eq!(
             items,
@@ -728,7 +936,7 @@ mod tests {
             encode_geoip(&[("CN", &[(&[10, 0, 0, 0], 8)]), ("V6", &[(&[0u8; 16], 16)])]),
         )
         .unwrap();
-        let ips = parse_geoip(&path).unwrap();
+        let ips = parse_geoip(&path, &mut Budget::default()).unwrap();
         assert_eq!(
             ips.get("cn").unwrap(),
             &[Cidr {
@@ -755,7 +963,9 @@ mod tests {
             }],
         };
         std::fs::write(&path, list.encode_to_vec()).unwrap();
-        let error = parse_geoip(&path).unwrap_err().to_string();
+        let error = parse_geoip(&path, &mut Budget::default())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("reverse_match"), "{error}");
     }
 
@@ -764,10 +974,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bad = dir.path().join("bad.dat");
         std::fs::write(&bad, b"not protobuf at all").unwrap();
-        assert!(parse_geosite(&bad).is_err());
+        assert!(parse_geosite(&bad, &mut Budget::default()).is_err());
         let empty = dir.path().join("empty.dat");
         std::fs::write(&empty, GeoSiteList { entry: vec![] }.encode_to_vec()).unwrap();
-        assert!(parse_geosite(&empty).is_err());
+        assert!(parse_geosite(&empty, &mut Budget::default()).is_err());
     }
 
     #[test]
@@ -787,7 +997,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let parsed = parse_rule_set(&path).unwrap();
+        let parsed = parse_rule_set(&path, &mut Budget::default()).unwrap();
         assert_eq!(
             parsed.domains,
             vec![
@@ -804,29 +1014,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rules.srs");
         std::fs::write(&path, b"SRS\x01\x00\x00\x00").unwrap();
-        let error = parse_rule_set(&path).unwrap_err().to_string();
+        let error = parse_rule_set(&path, &mut Budget::default())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("source JSON"), "{error}");
     }
 
     #[test]
     fn geo_code_rejects_wrong_field_placement() {
         let data = GeoData::default();
-        let error = expand(&data, &["geoip:cn".into()], &[])
-            .unwrap_err()
-            .to_string();
+        let error = expand(
+            &data,
+            &["geoip:cn".into()],
+            &[],
+            0,
+            &mut ExpansionBudget::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("ip_cidrs"), "{error}");
-        let error = expand(&data, &[], &["geosite:cn".into()])
-            .unwrap_err()
-            .to_string();
+        let error = expand(
+            &data,
+            &[],
+            &["geosite:cn".into()],
+            0,
+            &mut ExpansionBudget::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("domains"), "{error}");
     }
 
     #[test]
     fn missing_code_is_reported_not_ignored() {
         let data = GeoData::default();
-        let error = expand(&data, &["geosite:absent".into()], &[])
-            .unwrap_err()
-            .to_string();
+        let error = expand(
+            &data,
+            &["geosite:absent".into()],
+            &[],
+            0,
+            &mut ExpansionBudget::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("geosite:absent"), "{error}");
     }
 
@@ -841,7 +1071,7 @@ mod tests {
             eprintln!("跳过：未下载真实数据集");
             return;
         }
-        let sites = parse_geosite(&path).unwrap();
+        let sites = parse_geosite(&path, &mut Budget::default()).unwrap();
         let google = sites.get("google").expect("应有 GOOGLE 分类");
         // 实测该版本：GOOGLE 共 1080 项，`google.com` 是 Domain（后缀）而非 Full。
         // 这个事实决定 `www.google.com` 会命中而 `google.com` 的整域匹配来自
@@ -866,7 +1096,7 @@ mod tests {
             eprintln!("跳过：未下载真实数据集");
             return;
         }
-        let ips = parse_geoip(&path).unwrap();
+        let ips = parse_geoip(&path, &mut Budget::default()).unwrap();
         let cn = ips.get("cn").expect("应有 cn 分类");
         let sample: IpAddr = "223.5.5.5".parse().unwrap();
         assert!(
@@ -897,6 +1127,8 @@ mod tests {
             &data,
             &["example.org".into(), "domain:example.net".into()],
             &[],
+            0,
+            &mut ExpansionBudget::default(),
         )
         .unwrap();
         assert!(expanded.domains.is_empty());
