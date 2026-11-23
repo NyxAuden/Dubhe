@@ -48,6 +48,14 @@
 
 ### 修复
 
+- **`accept()` 遇 FD 耗尽不再让整个进程退出**：原实现把 `EMFILE`/`ENFILE`
+  当作致命错误，直接跳出 accept 循环并停掉整个 Server。实测 `ulimit -n 128`
+  下 118 条半开连接即可触发——**单个 IP 就能让所有协议同时掉线**。
+  现在 `EMFILE`/`ENFILE`/`EINTR`/`ECONNABORTED`/`WouldBlock` 计一次 `rejected`
+  后退避 20ms 重试；200 条半开连接进程仍存活，释放后立即恢复。Xray
+  同条件下也存活，现在行为一致。
+- 停机日志不再用 `"停止监听任务失败"` 覆盖真正的首个错误（例如 `EMFILE`），
+  改为保留首个错误，便于定位根因。
 - `check` 现在拒绝两个入口抢占同一 `(地址, 端口, TCP/UDP)`。此前 `check`
   通过，`run` 才在绑定阶段报 `AddrInUse` 并整体退出。TCP 与 UDP 同端口
   仍然允许（例如 `socks5` + `hysteria2`）。

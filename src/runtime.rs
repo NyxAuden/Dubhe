@@ -1204,7 +1204,9 @@ impl Server {
             async {
                 while let Some(result) = tasks.join_next().await {
                     if !matches!(result, Ok(Ok(()))) {
-                        failure = Some(anyhow::anyhow!("停止监听任务失败"));
+                        // 只在没有更早的错误时记录：否则真正的根因（例如
+                        // `accept()` 的 EMFILE）会被这条笼统信息覆盖掉。
+                        failure.get_or_insert_with(|| anyhow::anyhow!("停止监听任务失败"));
                     }
                 }
             },
@@ -1220,7 +1222,7 @@ impl Server {
         probe_token.cancel();
         while let Some(result) = tasks.join_next().await {
             if !matches!(result, Ok(Ok(()))) {
-                failure = Some(anyhow::anyhow!("停止监听任务失败"));
+                failure.get_or_insert_with(|| anyhow::anyhow!("停止监听任务失败"));
             }
         }
         // GlobalID 宽限期关联属于本实例，停机时必须主动释放，否则其映射

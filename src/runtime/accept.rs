@@ -2,6 +2,25 @@
 
 use super::*;
 
+/// `accept()` 返回这些错误时进程应当继续服务：
+///
+/// - `EMFILE` / `ENFILE`：FD 耗尽。这是**最常见**的一种，一次连接风暴即可触发；
+/// - `ECONNABORTED`：对端在 accept 前关闭；
+/// - `EINTR`：被信号打断；
+/// - `EAGAIN` / `EWOULDBLOCK`：监听 socket 被设为非阻塞时的正常空转。
+fn recoverable_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+    ) || matches!(error.raw_os_error(), Some(libc_emfile) if libc_emfile == 24 || libc_emfile == 23)
+}
+
+/// FD 耗尽后等待多久再重试。
+///
+/// 退避是必要的：立刻重试会在 FD 仍然耗尽时形成忙循环，把 CPU 打满。
+/// 取 20ms：既能在一批连接释放后很快恢复，又不会在持续压力下空转。
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+
 pub(super) async fn accept_loop(
     listener: Listener,
     shared: Arc<crate::forward::SharedContext>,
@@ -43,7 +62,23 @@ pub(super) async fn accept_loop(
             biased;
             _ = stop.cancelled() => break,
             accepted = socket.accept() => {
-                let (stream, _) = match accepted { Ok(value) => value, Err(error) => { failure = Some(error); break; } };
+                let (stream, _) = match accepted {
+                    Ok(value) => value,
+                    // 可恢复错误不能让整个进程退出：一次连接风暴把 FD 吃光
+                    // （EMFILE/ENFILE）就会让**所有**入站同时掉线，实测 118 条
+                    // 半开连接即可触发，而 Xray 在同样条件下继续服务。
+                    // 退避后重试；只有真正的致命错误才向上报。
+                    Err(error) if recoverable_accept_error(&error) => {
+                        // 计入 rejected：否则运维只会看到「连接莫名失败」而没有
+                        // 任何计数线索。拿不到 Context 时（启动早期）跳过计数。
+                        if let Some(ctx) = shared.current() {
+                            ctx.stats.reject();
+                        }
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
+                    Err(error) => { failure = Some(error); break; }
+                };
                 let Some(ctx) = shared.current() else { failure = Some(io::Error::other("共享 Context 未初始化")); break; };
                 let Ok(connection_permit) = slots.clone().try_acquire_owned() else { ctx.stats.reject(); continue; };
                 let Ok(handshake_permit) = handshakes.clone().try_acquire_owned() else { ctx.stats.reject(); continue; };
@@ -544,6 +579,53 @@ pub(super) async fn handle(
         Inbound::Shadowsocks { tag, .. } => {
             let prepared = prepared.ok_or_else(|| io::Error::other("Shadowsocks未准备"))?;
             shadowsocks::serve_tcp(stream, prepared, ctx, tag, handshake).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::*;
+
+    fn os_error(code: i32) -> io::Error {
+        io::Error::from_raw_os_error(code)
+    }
+
+    /// FD 耗尽（EMFILE=24 / ENFILE=23）必须被视为可恢复：重试而不是退出。
+    /// 此前一次连接风暴就能让整个进程以 EXIT=1 结束——实测 118 条半开连接
+    /// 即触发，而 Xray 在同样条件下继续服务。
+    #[test]
+    fn fd_exhaustion_is_recoverable() {
+        assert!(recoverable_accept_error(&os_error(24)), "EMFILE 应可恢复");
+        assert!(recoverable_accept_error(&os_error(23)), "ENFILE 应可恢复");
+    }
+
+    #[test]
+    fn transient_accept_errors_are_recoverable() {
+        for kind in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(
+                recoverable_accept_error(&io::Error::from(kind)),
+                "{kind:?} 应可恢复"
+            );
+        }
+    }
+
+    /// 真正的致命错误仍然要向上报，不能无限重试掩盖问题。
+    #[test]
+    fn fatal_accept_errors_are_not_swallowed() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(
+                !recoverable_accept_error(&io::Error::from(kind)),
+                "{kind:?} 不应被视为可恢复"
+            );
         }
     }
 }
