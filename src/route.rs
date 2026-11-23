@@ -103,6 +103,41 @@ impl CompiledGeoDomain {
     }
 }
 
+/// 一条规则的求值结果。
+///
+/// `NeedIp` 表示「目标域名尚未解析，IP 条件无法判定」。它**不参与取反**：
+/// 否则 `invert` 会把「还不知道」当成「不命中」，凭空命中一条 IP 规则。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuleMatch {
+    Hit,
+    Miss,
+    NeedIp,
+}
+
+impl RuleMatch {
+    /// `invert` 只交换命中与不命中；`NeedIp` 保持未知。
+    fn negate(self) -> Self {
+        match self {
+            Self::Hit => Self::Miss,
+            Self::Miss => Self::Hit,
+            Self::NeedIp => Self::NeedIp,
+        }
+    }
+}
+
+/// IP 维度的判定结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IpOutcome {
+    /// 没有任何 IP 条件。
+    Always,
+    /// 有 IP 条件，但集合为空（例如空分类），永远不成立。
+    Never,
+    /// 需要目标地址才能判定。
+    NeedIp,
+    /// 已判定。
+    Value(bool),
+}
+
 #[derive(Clone, Debug)]
 struct CompiledRule {
     inbounds: Vec<String>,
@@ -569,11 +604,10 @@ impl Router {
             Host::Domain(domain) => Some(normalize_domain(domain)),
             Host::Ip(_) => None,
         };
-        match self
-            .rules
-            .iter()
-            .find(|rule| rule.matches(inbound, network, target, domain.as_deref(), resolved))
-        {
+        // 跳过 `NeedIp`：宁可继续看后面的规则，也不在缺证据时做决定。
+        match self.rules.iter().find(|rule| {
+            rule.evaluate(inbound, network, target, domain.as_deref(), resolved) == RuleMatch::Hit
+        }) {
             Some(rule) => resolved_select(&rule.destination, true),
             None => resolved_select(&self.default, false),
         }
@@ -598,13 +632,9 @@ impl Router {
             Host::Domain(domain) => Some(normalize_domain(domain)),
             Host::Ip(_) => None,
         };
+        // 复用同一求值函数：只有真的因为缺地址而无法判定的规则才值得解析。
         self.rules.iter().any(|rule| {
-            // 只有「确实可能存在 IP 条件」才值得解析：
-            // - 具体 CIDR / mmdb / 私网谓词；
-            // - **不要**用 `geo_ip_used`：空分类永远不可能命中，
-            //   用它会让 `ip_if_non_match` 白白发起一次 DNS。
-            (!rule.ip_cidrs.is_empty() || !rule.mmdb_codes.is_empty() || rule.ip_is_private)
-                && rule.matches_base(inbound, network, target, domain.as_deref())
+            rule.evaluate(inbound, network, target, domain.as_deref(), None) == RuleMatch::NeedIp
         })
     }
 
@@ -1116,38 +1146,68 @@ fn proxy_from_outbound(
 }
 
 impl CompiledRule {
-    fn matches(
+    fn evaluate(
         &self,
         inbound: &str,
         network: Network,
         target: &Target,
         domain: Option<&str>,
         resolved: Option<&[IpAddr]>,
-    ) -> bool {
-        let matched = self.matches_base(inbound, network, target, domain)
-            && (!self.ip_is_private || self.matches_private(target, resolved))
-            && self.matches_ip(target, resolved);
-        // invert 只翻转本条规则，不影响其它规则。
-        if self.invert { !matched } else { matched }
+    ) -> RuleMatch {
+        // 基础条件不成立时，**取反仍然要生效**：端口不符已经足以确定
+        // 「这条规则不匹配」，取反后就应当是命中，且不需要地址证据。
+        let result = if self.matches_base(inbound, network, target, domain) {
+            match self.ip_outcome(target, resolved) {
+                IpOutcome::Always => RuleMatch::Hit,
+                IpOutcome::Never => RuleMatch::Miss,
+                IpOutcome::NeedIp => RuleMatch::NeedIp,
+                IpOutcome::Value(true) => RuleMatch::Hit,
+                IpOutcome::Value(false) => RuleMatch::Miss,
+            }
+        } else {
+            RuleMatch::Miss
+        };
+        // invert 只翻转本条规则，不影响其它规则；未知保持未知。
+        if self.invert { result.negate() } else { result }
     }
 
-    /// IP 条件：具体 CIDR 与 `mmdb:<code>` 属于**同一个 OR 组**。
+    /// 判定 IP 维度。
     ///
-    /// 它们都来自配置的 `ip_cidrs` 数组（Xray 的 `ip` 数组语义是并集）。
-    /// 曾经分别要求两者成立，导致「CIDR + mmdb」同写时任何目标都不命中。
-    fn matches_ip(&self, target: &Target, resolved: Option<&[IpAddr]>) -> bool {
-        if self.ip_cidrs.is_empty() && self.mmdb_codes.is_empty() {
-            // 没有任何 IP 条件；即使配了空分类，也要把它当成「有限制」，
-            // 否则空分类会退化成匹配一切。
-            return !self.geo_ip_used;
+    /// 设计要点：
+    /// - **同一个候选 IP** 必须同时满足 `ip_is_private` 与 CIDR/mmdb 组，
+    ///   不能两个条件各自由不同地址满足（否则「命中」没有可指认的依据）。
+    /// - 域名未解析时返回 `NeedIp`，交由调用方决定是否解析；
+    ///   它不会在 `invert` 下变成命中。
+    fn ip_outcome(&self, target: &Target, resolved: Option<&[IpAddr]>) -> IpOutcome {
+        let has_group = !self.ip_cidrs.is_empty() || !self.mmdb_codes.is_empty();
+        if !self.ip_is_private && !has_group {
+            // 完全没有 IP 条件；但如果引用过地理集合且展开为空，
+            // 那是「有条件且永远不成立」，不能当成「没有条件」。
+            return if self.geo_ip_used {
+                IpOutcome::Never
+            } else {
+                IpOutcome::Always
+            };
         }
-        let hit =
-            |ip: IpAddr| self.ip_cidrs.iter().any(|cidr| cidr.contains(&ip)) || self.mmdb_hit(ip);
+        if self.geo_ip_used && !has_group {
+            return IpOutcome::Never;
+        }
+        let hit = |ip: IpAddr| {
+            (!self.ip_is_private || is_private_ip(&ip))
+                && (!has_group
+                    || self.ip_cidrs.iter().any(|cidr| cidr.contains(&ip))
+                    || self.mmdb_hit(ip))
+        };
         match &target.host {
-            Host::Ip(ip) => hit(*ip),
-            Host::Domain(_) => {
-                resolved.is_some_and(|addresses| addresses.iter().any(|ip| hit(*ip)))
-            }
+            Host::Ip(ip) => IpOutcome::Value(hit(*ip)),
+            Host::Domain(_) => match resolved {
+                // 空解析结果视为「仍未知」：DNS 没给出地址不等于
+                // 「已证明不属于该集合」，不能被 invert 翻成命中。
+                Some(addresses) if !addresses.is_empty() => {
+                    IpOutcome::Value(addresses.iter().any(|ip| hit(*ip)))
+                }
+                _ => IpOutcome::NeedIp,
+            },
         }
     }
 
@@ -1158,16 +1218,6 @@ impl CompiledRule {
         self.mmdb_codes
             .iter()
             .any(|code| geo.mmdb_matches(code, ip) == Some(true))
-    }
-
-    /// 目标是否落在私有/内网地址。域名未解析时按未命中处理，与 `ip_cidrs` 一致。
-    fn matches_private(&self, target: &Target, resolved: Option<&[IpAddr]>) -> bool {
-        match &target.host {
-            Host::Ip(ip) => is_private_ip(ip),
-            Host::Domain(_) => {
-                resolved.is_some_and(|addresses| addresses.iter().any(is_private_ip))
-            }
-        }
     }
 
     /// 除 `ip_cidrs` 外的全部条件。
@@ -1258,6 +1308,156 @@ pub(crate) fn matches_domain_suffix(domain: &str, suffix: &str) -> bool {
             || domain
                 .strip_suffix(core)
                 .is_some_and(|prefix| prefix.ends_with('.')))
+}
+
+#[cfg(test)]
+mod invert_ip_tests {
+    use super::*;
+
+    fn router(rules: serde_json::Value) -> Router {
+        let value = serde_json::json!({
+            "version": 1,
+            "inbounds": [{"type": "socks5", "tag": "s", "listen": "127.0.0.1:0"}],
+            "outbounds": [
+                {"type": "direct", "tag": "direct"},
+                {"type": "reject", "tag": "reject"},
+                {"type": "direct", "tag": "proxy"}
+            ],
+            "route": {"default": "direct", "rules": rules}
+        });
+        let config = crate::config::Config::from_json(&value.to_string()).unwrap();
+        Router::new(&config).unwrap()
+    }
+
+    fn domain(name: &str) -> Target {
+        Target {
+            host: Host::Domain(name.to_owned()),
+            port: 443,
+        }
+    }
+
+    /// 反向 IP 规则在域名未解析时不得命中；解析到集合内则仍不命中，
+    /// 解析到集合外才命中。
+    #[test]
+    fn inverted_ip_rule_waits_for_address() {
+        let router = router(serde_json::json!([
+            {"ip_cidrs": ["10.0.0.0/8"], "invert": true, "outbound": "reject"}
+        ]));
+        let target = domain("a.test");
+        // 首轮（未解析）：跳过，回落默认。
+        assert_eq!(
+            router.select_outbound("s", Network::Tcp, &target).kind,
+            OutboundKind::Direct
+        );
+        // 解析到集合内 → 反向规则不命中。
+        let inside = ["10.1.2.3".parse::<IpAddr>().unwrap()];
+        assert_eq!(
+            router
+                .select_with("s", Network::Tcp, &target, Some(&inside))
+                .kind,
+            OutboundKind::Direct
+        );
+        // 解析到集合外 → 命中。
+        let outside = ["192.0.2.1".parse::<IpAddr>().unwrap()];
+        assert_eq!(
+            router
+                .select_with("s", Network::Tcp, &target, Some(&outside))
+                .kind,
+            OutboundKind::Reject
+        );
+    }
+
+    /// 反向 IP 规则不能遮蔽后面的明确域名规则。
+    #[test]
+    fn deferred_ip_does_not_shadow_domain_rule() {
+        let router = router(serde_json::json!([
+            {"ip_cidrs": ["10.0.0.0/8"], "invert": true, "outbound": "reject"},
+            {"domains": ["a.test"], "outbound": "reject"}
+        ]));
+        let target = domain("a.test");
+        assert_eq!(
+            router.select_outbound("s", Network::Tcp, &target).kind,
+            OutboundKind::Reject
+        );
+        // 第二条是明确域名规则命中；`matched` 为真意味着不会再解析。
+        assert!(router.select_outbound("s", Network::Tcp, &target).matched);
+    }
+
+    /// 端口已不符时取反已确定为真，不需要解析。
+    #[test]
+    fn inverted_base_miss_is_decisive() {
+        let router = router(serde_json::json!([
+            {"ports": [{"start": 443, "end": 443}], "ip_cidrs": ["10.0.0.0/8"],
+             "invert": true, "outbound": "reject"}
+        ]));
+        let target = Target {
+            host: Host::Domain("a.test".into()),
+            port: 80,
+        };
+        // base（端口）不成立 → 取反后直接命中，无需地址。
+        assert_eq!(
+            router.select_outbound("s", Network::Tcp, &target).kind,
+            OutboundKind::Reject
+        );
+        assert!(!router.has_ip_candidates("s", Network::Tcp, &target));
+    }
+
+    /// 「尚不知道」不能当成「不属于集合」。
+    #[test]
+    fn unknown_is_not_non_member() {
+        let router = router(serde_json::json!([
+            {"ip_cidrs": ["10.0.0.0/8"], "invert": true, "outbound": "reject"}
+        ]));
+        let target = domain("a.test");
+        // as-is：不解析，直接回落默认。
+        assert_eq!(
+            router.select_outbound("s", Network::Tcp, &target).kind,
+            OutboundKind::Direct
+        );
+        // 空解析结果同样视为未知。
+        assert_eq!(
+            router
+                .select_with("s", Network::Tcp, &target, Some(&[]))
+                .kind,
+            OutboundKind::Direct
+        );
+    }
+
+    /// 同一候选地址必须同时满足私网与 CIDR，不能各自由不同地址满足。
+    #[test]
+    fn resolved_ip_conditions_require_same_address() {
+        let mismatched = router(serde_json::json!([
+            {"ip_is_private": true, "ip_cidrs": ["192.0.2.0/24"], "outbound": "reject"}
+        ]));
+        let target = domain("a.test");
+        let private = "127.0.0.1".parse::<IpAddr>().unwrap();
+        let in_cidr = "192.0.2.5".parse::<IpAddr>().unwrap();
+        // 两个地址分别满足一个条件 → 不命中。
+        assert_eq!(
+            mismatched
+                .select_with("s", Network::Tcp, &target, Some(&[private, in_cidr]))
+                .kind,
+            OutboundKind::Direct
+        );
+        // 单个地址同时满足 → 命中。
+        assert_eq!(
+            mismatched
+                .select_with("s", Network::Tcp, &target, Some(&[private]))
+                .kind,
+            OutboundKind::Direct,
+            "私网但不落在 CIDR 内"
+        );
+        let matched = router(serde_json::json!([
+            {"ip_is_private": true, "ip_cidrs": ["127.0.0.0/8"], "outbound": "reject"}
+        ]));
+        let both = "127.0.0.1".parse::<IpAddr>().unwrap();
+        assert_eq!(
+            matched
+                .select_with("s", Network::Tcp, &target, Some(&[both]))
+                .kind,
+            OutboundKind::Reject
+        );
+    }
 }
 
 #[cfg(test)]
