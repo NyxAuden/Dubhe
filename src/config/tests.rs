@@ -61,6 +61,37 @@ fn ipv6_wildcard_conflicts_with_ipv4() {
     assert!(error.contains("在端口 8080 上冲突"), "{error}");
 }
 
+/// NW3 Portal 同端口绑 TCP 与 UDP 两个 socket，必须与 Hysteria2 冲突。
+/// 此前把它当成只占 TCP，导致 `check` 通过、`run` 报 `监听任务失败: Other`。
+#[test]
+fn nw3_occupies_both_tcp_and_udp() {
+    let mut value = valid_value();
+    value["inbounds"] = json!([
+        {"type": "nw3", "tag": "portal", "listen": "127.0.0.1:8443",
+         "key": "0123456789abcdef0123456789abcdef", "morph": true, "out": "direct"},
+        {"type": "hysteria2", "tag": "hy2", "listen": "127.0.0.1:8443", "udp": true,
+         "users": [{"name": "u", "password": "test-secret-password"}],
+         "certificate": "test-cert.pem", "private_key": "test-key.pem"}
+    ]);
+    let error = parse_value(&value).unwrap_err().to_string();
+    assert!(error.contains("UDP 冲突"), "{error}");
+}
+
+/// XHTTP/3 只绑 UDP（runtime 走 continue，不起 TCP），因此与 TCP 入口同端口
+/// 不冲突。此前声明成 TCP+UDP，会误拒这个合法组合。
+#[test]
+fn xhttp_h3_occupies_udp_only() {
+    let mut value = valid_value();
+    value["inbounds"] = json!([
+        {"type": "vless-xhttp", "tag": "h3", "listen": "127.0.0.1:8443",
+         "xhttp": {"path": "/x", "h3": true},
+         "users": [{"name": "u", "uuid": "11111111-1111-1111-1111-111111111111"}],
+         "certificate": "test-cert.pem", "private_key": "test-key.pem"},
+        {"type": "socks5", "tag": "sk", "listen": "127.0.0.1:8443"}
+    ]);
+    parse_value(&value).expect("XHTTP/3 与 TCP 入口可共用端口号");
+}
+
 /// 相同端口、不同具体地址不算冲突（Linux 与 macOS 都能正常绑定）。
 #[test]
 fn distinct_specific_addresses_on_same_port_are_allowed() {

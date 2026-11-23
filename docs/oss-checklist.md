@@ -38,11 +38,13 @@ mihomo、v2ray-core、tuic）的公开实践。
 
 - [x] 版本控制与线性提交历史
 - [x] Linux x86_64 / Linux ARM64 由 CI 实跑：fmt + clippy + 全量测试 + release 构建
-- [ ] **macOS（`macos-14`）CI job 从未真正执行**：该 job 在分配 runner 阶段
-      就被取消，`steps` 为空、`started_at` 与 `completed_at` 同秒（2026-11-22
-      核对了全部历史 run，无一次例外）。因此 macOS ARM64 的证据来自**本地
-      实跑**（fmt、clippy `-D warnings`、全量 1476 项），不是 CI。
-      修好它需要可用的 macOS runner；在拿到之前不宣称「CI 三平台」。
+- [x] **`macos-14` 已换为 `macos-15`**（2026-11-23）。`macos-14` 不在 GitHub
+      当前的 GitHub-hosted runner 列表里（public/private 两张表都没有该标签），
+      因此 job 在分配阶段即被取消：`started_at` 恒为 null、`steps` 为空。
+      此前把原因归为「runner 不可用」是对的，但没查到根因是**标签已退役**。
+      现固定为 `macos-15`（ARM64），发布工作流同步修改——否则
+      `publish` 会因 `needs: build` 永久等待一个永不启动的 job。
+      **尚未验证**：改标签后首次 CI 是否真的跑起来（要等下一次 push）。
 - [x] `cargo deny` 作为独立 job；`deny.toml` 现有 1 条带理由的 ignore
       （RUSTSEC-2026-0542 humantime，实测该版本零依赖，公告前提不成立），
       其余许可证/来源/重复项均为强制门禁

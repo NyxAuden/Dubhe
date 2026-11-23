@@ -391,7 +391,10 @@ async fn five_second_local_tcp_udp_churn_recovers_slots_and_counts_payload_only(
     let started = Instant::now();
     let mut cycles = 0u64;
     let mut expected_bytes = 0u64;
-    while started.elapsed() < Duration::from_millis(5200) {
+    // 断言的是「连接与 UDP 关联能被反复创建/回收」，不是吞吐量。
+    // 原来用固定的 5.2 秒墙钟窗口，负载高时单轮超过 2.6 秒就会失败；
+    // 改为「跑够 3 轮或超时」，超时值只作为防止永久挂起的上限。
+    while cycles < 3 && started.elapsed() < Duration::from_secs(60) {
         let payload = format!("controlled-cycle-{cycles:05}");
         let (mut stream, _) = socks(1, address(tcp.address), server.address).await;
         exchange(&mut stream, payload.as_bytes()).await;
@@ -424,7 +427,7 @@ async fn five_second_local_tcp_udp_churn_recovers_slots_and_counts_payload_only(
         cycles += 1;
         sleep(Duration::from_millis(10)).await;
     }
-    assert!(cycles >= 2, "必须完成多轮连接和关联创建/回收");
+    assert_eq!(cycles, 3, "必须完成多轮连接和关联创建/回收");
     eprintln!(
         "本地循环转发：{cycles} 轮，耗时 {:?}，单向业务字节 {expected_bytes}",
         started.elapsed()

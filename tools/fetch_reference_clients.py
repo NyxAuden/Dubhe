@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch pinned official darwin-arm64 clients; execute only version commands.
+"""Fetch pinned official clients for this platform; execute only version commands.
 
 Run with python3 -I tools/fetch_reference_clients.py from the project directory.
 Archives and extraction destinations each get a separate new, empty directory.
@@ -29,11 +29,36 @@ API = "https://api.github.com"
 MAX_ARCHIVE = 256 * 1024 * 1024
 MAX_EXTRACTED = 512 * 1024 * 1024
 # Mihomo was resolved from /releases/latest on 2026-11-04, then pinned here.
+# 资源文件名按平台展开：`{platform}` 由 detect_platform() 给出。
 CLIENTS = (
-    ("mihomo", "MetaCubeX/mihomo", "v1.19.33", "mihomo-darwin-arm64-v1.19.33.gz", "mihomo", "-v"),
-    ("sing-box", "SagerNet/sing-box", "v1.14.4", "sing-box-1.14.4-darwin-arm64.tar.gz", "sing-box", "version"),
-    ("xray", "XTLS/Xray-core", "v26.10.31", "Xray-macos-arm64-v8a.zip", "xray", "version"),
+    ("mihomo", "MetaCubeX/mihomo", "v1.19.33", "mihomo-{platform}-v1.19.33.gz", "mihomo", "-v"),
+    ("sing-box", "SagerNet/sing-box", "v1.14.4", "sing-box-1.14.4-{platform}.tar.gz", "sing-box", "version"),
+    ("xray", "XTLS/Xray-core", "v26.10.31", "Xray-{xray_platform}.zip", "xray", "version"),
 )
+
+# 上游对同一平台的命名不一致：sing-box 用 linux-amd64，Xray 用 linux-64。
+PLATFORM_NAMES = {
+    ("Darwin", "arm64"): ("darwin-arm64", "macos-arm64-v8a"),
+    ("Darwin", "x86_64"): ("darwin-amd64", "macos-64"),
+    ("Linux", "x86_64"): ("linux-amd64", "linux-64"),
+    ("Linux", "aarch64"): ("linux-arm64", "linux-arm64-v8a"),
+}
+
+
+def detect_platform():
+    """返回 `(平台标识, {占位符: 值})`，不认识时明确失败。"""
+    key = (platform.system(), platform.machine())
+    try:
+        sing_box_name, xray_name = PLATFORM_NAMES[key]
+    except KeyError:
+        supported = ", ".join(f"{system}/{machine}" for system, machine in PLATFORM_NAMES)
+        raise SystemExit(
+            f"不支持的平台 {key[0]}/{key[1]}；已钉住的上游资源只覆盖: {supported}"
+        )
+    return f"{key[0].lower()}-{key[1]}", {
+        "platform": sing_box_name,
+        "xray_platform": xray_name,
+    }
 
 
 def api_json(url):
@@ -171,15 +196,46 @@ def extract_binary(archive, executable, run_dir):
     if len(candidates) != 1:
         raise ValueError("Expected exactly one client executable")
     binary = candidates[0]
-    # Require a little-endian 64-bit Mach-O ARM64 executable before running anything.
-    with binary.open("rb") as stream:
-        header = stream.read(16)
-    if len(header) != 16 or struct.unpack("<IIII", header)[:2] != (0xFEEDFACF, 0x0100000C):
-        raise ValueError("Binary is not a darwin-arm64 Mach-O executable")
-    if struct.unpack("<IIII", header)[3] != 2:
-        raise ValueError("Mach-O is not an executable")
+    # 在执行任何东西之前校验格式与本机架构匹配，避免把一个错误平台的二进制
+    # 跑起来（历史上只有 Mach-O 校验，Linux 上会直接失败）。
+    verify_executable(binary)
     binary.chmod(0o700)
     return binary
+
+
+def verify_executable(binary):
+    """确认是当前平台的本地可执行文件；不认识就失败，不猜。"""
+    with binary.open("rb") as stream:
+        header = stream.read(20)
+    machine = platform.machine()
+    if platform.system() == "Darwin":
+        # little-endian 64-bit Mach-O：magic, cputype, cpusubtype, filetype
+        if len(header) < 16:
+            raise ValueError("Binary is too short to be a Mach-O executable")
+        magic, cpu_type, _, file_type = struct.unpack("<IIII", header[:16])
+        if magic != 0xFEEDFACF:
+            raise ValueError("Binary is not a 64-bit little-endian Mach-O executable")
+        if file_type != 2:
+            raise ValueError("Mach-O is not an executable")
+        expected = {"arm64": 0x0100000C, "x86_64": 0x01000007}
+        if cpu_type != expected[machine]:
+            raise ValueError(f"Mach-O architecture does not match {machine}")
+        return
+    if platform.system() == "Linux":
+        # ELF64: 7f 45 4c 46, class 2, data 1 (little-endian)
+        if len(header) < 20 or header[:4] != b"\x7fELF" or header[4] != 2 or header[5] != 1:
+            raise ValueError("Binary is not a 64-bit little-endian ELF executable")
+        # e_type 在偏移 16（2 字节）应为 ET_EXEC(2) 或 ET_DYN(3，PIE)。
+        e_type = struct.unpack("<H", header[16:18])[0]
+        if e_type not in (2, 3):
+            raise ValueError("ELF is not an executable")
+        # e_machine 在偏移 18：x86_64=62, aarch64=183
+        e_machine = struct.unpack("<H", header[18:20])[0]
+        expected = {"x86_64": 62, "aarch64": 183}
+        if e_machine != expected[machine]:
+            raise ValueError(f"ELF architecture does not match {machine}")
+        return
+    raise ValueError(f"Unsupported platform for executable verification: {platform.system()}")
 
 
 def tag_commit(repo, tag):
@@ -196,8 +252,9 @@ def tag_commit(repo, tag):
     raise ValueError("Tag did not resolve to a commit")
 
 
-def prepare_client(spec, run_dir):
+def prepare_client(spec, run_dir, platform_names):
     name, repo, version, asset_name, executable, version_arg = spec
+    asset_name = asset_name.format(**platform_names)
     print(f"{name}: querying official release {version}", flush=True)
     release_url = f"{API}/repos/{repo}/releases/tags/{version}"
     release = api_json(release_url)
@@ -235,7 +292,8 @@ def prepare_client(spec, run_dir):
     print(f"{name}: verified {output.splitlines()[0]}", flush=True)
     return {
         "name": name, "path": str(binary), "version": version,
-        "platform": "darwin-arm64", "source": asset["browser_download_url"],
+        "platform": f"{platform.system().lower()}-{platform.machine()}",
+        "source": asset["browser_download_url"],
         "release_url": release["html_url"], "release_api_url": release_url,
         "release_published_at": release["published_at"],
         "tag_commit": commit, "tag_ref_api_url": ref_url,
@@ -255,8 +313,7 @@ def prepare_client(spec, run_dir):
 def main():
     if not sys.flags.isolated:
         raise SystemExit("Run this script with python3 -I")
-    if platform.system() != "Darwin" or platform.machine() != "arm64":
-        raise SystemExit("This pinned client set requires darwin-arm64")
+    platform_label, platform_names = detect_platform()
     ARTIFACTS.mkdir(exist_ok=True)
     storage = ARTIFACTS / "reference-clients"
     storage.mkdir(exist_ok=True)
@@ -264,14 +321,14 @@ def main():
     manifest = {
         "schema_version": 1,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "platform": "darwin-arm64", "run_directory": str(run_dir),
+        "platform": platform_label, "run_directory": str(run_dir),
         "execution_scope": "version commands only; no proxy listener, service installation, or system proxy changes",
         "mihomo_selection": "v1.19.33 was latest stable on 2026-11-04; pinned for this run",
         "clients": [],
     }
     for spec in CLIENTS:
         try:
-            manifest["clients"].append(prepare_client(spec, run_dir))
+            manifest["clients"].append(prepare_client(spec, run_dir, platform_names))
         except Exception as error:
             manifest["clients"].append({
                 "name": spec[0], "version": spec[2], "path": None,

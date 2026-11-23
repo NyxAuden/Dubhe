@@ -26,6 +26,14 @@ use tokio::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(5);
+/// 负向认证用例的等待上限。
+///
+/// 认证失败后，部分协议（REALITY、VLESS fallback）会把连接伪装回落到一个
+/// 真实目标站点，回落本身要建立外部 TCP 甚至 TLS。用 5 秒的通用上限会把
+/// 「回落慢」误判成「没有明确关闭」，实测 `xray_vless_reality_authentication`
+/// 因此间歇失败（同一命令连跑两次，一次 FAILED 一次 ok）。
+/// 这里的等待只是「多久之内必须看到明确结论」，不是性能断言。
+const NEGATIVE_DEADLINE: Duration = Duration::from_secs(20);
 const WRONG_PASSWORD: &str = "deliberately-wrong-reference-test-password";
 const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 /// Snell v4 的 psk。Mihomo 支持 v1–v5 但拒绝 v6；
@@ -1475,7 +1483,7 @@ async fn tcp_denied(proxy: SocketAddr, target: SocketAddr) -> Result<()> {
     // 某些 SOCKS 实现在完成上游协议握手前先返回乐观成功应答。
     request.extend(b"negative-auth-probe");
     stream.write_all(&request).await?;
-    timeout(DEADLINE, async {
+    timeout(NEGATIVE_DEADLINE, async {
         let mut header = [0; 4];
         match stream.read_exact(&mut header).await {
             Err(error)
@@ -1524,7 +1532,7 @@ async fn tcp_denied(proxy: SocketAddr, target: SocketAddr) -> Result<()> {
 }
 
 async fn wait_rejected(server: &Running, before: u64) -> Result<()> {
-    timeout(DEADLINE, async {
+    timeout(NEGATIVE_DEADLINE, async {
         while server.stats.snapshot().rejected <= before {
             sleep(Duration::from_millis(10)).await;
         }

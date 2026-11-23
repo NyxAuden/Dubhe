@@ -31,6 +31,11 @@ pub async fn rebind_udp(addr: SocketAddr) -> UdpSocket {
     .expect("UDP 端口未在期限内释放")
 }
 
+/// 多数测试共用的基线配置。
+///
+/// `handshake_timeout_ms` 保持 300：多个用例依赖它来验证「非法握手在有限
+/// 时间内关闭」（例如 `tests/vless.rs` 的截断首部用例只等 2 秒）。放宽它会
+/// 让这些断言失败，且没有证据表明它是 CI 抖动的根因。
 pub fn socks_config() -> Value {
     json!({"version":1,"inbounds":[{"type":"socks5","tag":"socks","listen":"127.0.0.1:0"}],"outbounds":[{"type":"direct","tag":"direct"},{"type":"reject","tag":"reject"}],"route":{"default":"direct"},"limits":{"shutdown_timeout_ms":100,"handshake_timeout_ms":300,"udp_idle_timeout_ms":500}})
 }
@@ -301,8 +306,14 @@ pub async fn read_address<R: AsyncRead + Unpin>(r: &mut R) -> SocketAddr {
     let port = r.read_u16().await.unwrap();
     SocketAddr::new(ip, port)
 }
+/// 读满 `b`，超过上限视为测试失败。
+///
+/// 上限是「多久之内必须收到数据」，不是性能断言。原来的 3 秒在负载高的
+/// 机器上会被击穿（本机 load average 19 时 `xray_vless_reality_authentication`
+/// 间歇在 4.4 秒处失败，同一命令连跑多次结果不一致），共享 CI runner 上
+/// 更不可靠。放宽到 10 秒仍能捕获真正的挂起。
 pub async fn read_exact<R: AsyncRead + Unpin>(r: &mut R, b: &mut [u8]) {
-    timeout(Duration::from_secs(3), r.read_exact(b))
+    timeout(Duration::from_secs(10), r.read_exact(b))
         .await
         .unwrap()
         .unwrap();

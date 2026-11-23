@@ -1064,8 +1064,10 @@ impl Inbound {
             | Self::VmessHttp { .. }
             | Self::TrojanHttp { .. }
             | Self::Snell { .. }
-            | Self::ShadowTls { .. }
-            | Self::Nw3 { .. } => (true, false),
+            | Self::ShadowTls { .. } => (true, false),
+            // NW3 Portal 同端口绑 TCP（TLS 1.3）与 UDP（QUIC）两个 socket，
+            // 实测 lsof 两个 FD 都在监听。
+            Self::Nw3 { .. } => (true, true),
             // 只占 UDP。
             Self::Hysteria2 { .. } | Self::Tuic { .. } | Self::Wireguard { .. } => (false, true),
             // 联合绑定 TCP + UDP。
@@ -1077,10 +1079,17 @@ impl Inbound {
             Self::VlessQuic { .. } | Self::VmessQuic { .. } | Self::TrojanQuic { .. } => {
                 (false, true)
             }
-            // XHTTP：h3 走 UDP，h1/h2 走 TCP。
+            // XHTTP：h1/h2 走 TCP；h3 在 runtime 里走 `continue`，**只**绑 UDP，
+            // 不起 TCP 监听，因此两者互斥而不是叠加。
             Self::VlessXhttp { xhttp, .. }
             | Self::VmessXhttp { xhttp, .. }
-            | Self::TrojanXhttp { xhttp, .. } => (true, xhttp.h3),
+            | Self::TrojanXhttp { xhttp, .. } => {
+                if xhttp.h3 {
+                    (false, true)
+                } else {
+                    (true, false)
+                }
+            }
             // dokodemo-door 依 `network` 字段。
             Self::DokodemoDoor { network, .. } => {
                 crate::config::dokodemo_networks(network).unwrap_or((true, true))

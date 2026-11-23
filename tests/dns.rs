@@ -187,6 +187,8 @@ async fn total_dial_timeout_cancels_slow_dns_and_returns_budget() {
         .await
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    // 断言的是「拨号总超时 40ms 生效，没有等满 dns_timeout_ms=500ms」。
+    // 期望值 40ms，400ms 上界有 10 倍余量，不是贴边断言。
     assert!(start.elapsed() < Duration::from_millis(400));
     let pending_target = target("budget-returned.test.");
     let mut lookup = Box::pin(ctx.dns.resolve(&pending_target));
@@ -379,6 +381,7 @@ async fn race_rule_returns_the_first_successful_server() {
     let started = std::time::Instant::now();
     let addresses = dns.resolve(&target("race.test")).await.unwrap();
     assert_eq!(addresses[0].ip(), Ipv4Addr::new(127, 0, 0, 3));
+    // 快服务器延迟为 0，700ms 上界有数量级余量。
     assert!(
         started.elapsed() < Duration::from_millis(700),
         "并发查询不应等待慢服务器"

@@ -23,7 +23,7 @@ jobs:
         os:
           - ubuntu-24.04
           - ubuntu-24.04-arm
-          - macos-14
+          - macos-15
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -126,3 +126,43 @@ jobs:
           for target in config vision socks5_datagram http_authority address_read xudp_read vless_datagram trojan_datagram xhttp_head xhttp_uplink grpc_payload vmess_header snell_request snell_udp tuic_wire; do
             cargo +nightly fuzz run "$target" -- -max_total_time=30 -rss_limit_mb=2048
           done
+
+  interop:
+    name: interop (${{ matrix.os }})
+    # 第三方客户端互通是本项目最核心的声明，必须能被自动复现。
+    # 这些用例全部 #[ignore]（要下载数百 MB 官方二进制），因此不进 push/PR：
+    # 定时跑一次 + 手动触发。
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: interop-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+      # 下载脚本会校验上游 release 资产摘要、二进制平台与 `version` 输出；
+      # 任何一步失败都让 job 失败，不静默跳过。
+      - name: Fetch pinned reference clients
+        run: python3 -I tools/fetch_reference_clients.py
+      - name: Run interop suite
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --test reference_clients -- --ignored --test-threads=1 2>&1 | tee interop.log
+      - name: Upload interop log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-log-${{ matrix.os }}
+          path: interop.log
