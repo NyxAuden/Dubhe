@@ -69,6 +69,8 @@ fn ipnet_of(cidr: crate::geo::Cidr) -> Result<IpNet> {
 enum CompiledGeoDomain {
     Full(String),
     Suffix(String),
+    /// 仅子域（sing-box 的 `domain_suffix: [".a.test"]` 写法）。
+    Subdomain(String),
     Keyword(String),
     Regex(regex::Regex),
 }
@@ -78,6 +80,7 @@ impl CompiledGeoDomain {
         Ok(match item {
             crate::geo::DomainMatcher::Full(value) => Self::Full(value.clone()),
             crate::geo::DomainMatcher::Suffix(value) => Self::Suffix(value.clone()),
+            crate::geo::DomainMatcher::Subdomain(value) => Self::Subdomain(value.clone()),
             crate::geo::DomainMatcher::Keyword(value) => Self::Keyword(value.clone()),
             crate::geo::DomainMatcher::Regex(value) => Self::Regex(
                 regex::Regex::new(value)
@@ -91,6 +94,9 @@ impl CompiledGeoDomain {
         match self {
             Self::Full(value) => domain == value,
             Self::Suffix(value) => matches_domain_suffix(domain, value),
+            Self::Subdomain(value) => domain
+                .strip_suffix(value.as_str())
+                .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1),
             Self::Keyword(value) => domain.contains(value.as_str()),
             Self::Regex(pattern) => pattern.is_match(domain),
         }
@@ -593,9 +599,11 @@ impl Router {
             Host::Ip(_) => None,
         };
         self.rules.iter().any(|rule| {
-            // mmdb-only 规则也要触发 DNS 解析，否则 `ip_if_non_match` 下
-            // 它永远拿不到解析结果、永远不会命中。
-            (!rule.ip_cidrs.is_empty() || !rule.mmdb_codes.is_empty() || rule.geo_ip_used)
+            // 只有「确实可能存在 IP 条件」才值得解析：
+            // - 具体 CIDR / mmdb / 私网谓词；
+            // - **不要**用 `geo_ip_used`：空分类永远不可能命中，
+            //   用它会让 `ip_if_non_match` 白白发起一次 DNS。
+            (!rule.ip_cidrs.is_empty() || !rule.mmdb_codes.is_empty() || rule.ip_is_private)
                 && rule.matches_base(inbound, network, target, domain.as_deref())
         })
     }

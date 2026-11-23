@@ -33,6 +33,10 @@ pub enum DomainMatcher {
     Full(String),
     /// 域名及其子域（Xray `Domain`、`domain:` 的后缀语义）。
     Suffix(String),
+    /// **仅子域**，不含根域。sing-box 的 `domain_suffix` 用前导点表达此意
+    /// （`.a.test` 匹配 `sub.a.test` 但不匹配 `a.test`），与 Xray/本项目
+    /// 原生后缀语义不同，因此单独一类。
+    Subdomain(String),
     /// 子串（Xray `Substr`、`keyword:`）。
     Keyword(String),
     /// 正则（Xray `Regex`、`regexp:`）。
@@ -56,6 +60,9 @@ impl DomainMatcher {
                             .strip_suffix(core)
                             .is_some_and(|prefix| prefix.ends_with('.')))
             }
+            Self::Subdomain(value) => domain
+                .strip_suffix(value.as_str())
+                .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1),
             Self::Keyword(value) => domain.contains(value.as_str()),
             Self::Regex(value) => regex::Regex::new(value).is_ok_and(|re| re.is_match(domain)),
         }
@@ -116,8 +123,10 @@ pub struct GeoData {
     /// rule-set 独立命名空间：不与 geosite/geoip 的 code 混用，避免
     /// 「tag=cn 覆盖 geosite 的 cn」这类静默覆盖。
     rule_sets: HashMap<String, RuleSetData>,
-    /// MaxMind 数据库：只能「输入 IP → 查国家码」，无法反向列出某国的
-    /// 全部网段。因此它走**运行期匹配**，不像 dat 那样在加载期展开。
+    /// MaxMind 数据库。
+    ///
+    /// `maxminddb` 提供 `networks()` 可以遍历网段，但本项目**选择**运行期
+    /// 按 IP 查询：全库展开在启动时更慢、占用更大，而单次查询本身很便宜。
     mmdb: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
@@ -240,6 +249,12 @@ pub fn expand(data: &GeoData, domains: &[String], ips: &[String]) -> Result<Expa
                     .rule_sets
                     .get(&code.to_ascii_lowercase())
                     .ok_or_else(|| anyhow::anyhow!("{value} 不在已加载的 rule_sets 里"))?;
+                // 与 IP 侧对称：只含 IP 的集合用在域名侧会让阻断规则
+                // 永不命中，必须报错而不是静默失效。
+                ensure!(
+                    !set.domains.is_empty(),
+                    "{value} 不含域名项，不能用在 domains 里"
+                );
                 out.domains.extend_from_slice(&set.domains);
             }
             GeoKind::Ip | GeoKind::Mmdb => {
@@ -270,7 +285,7 @@ pub fn expand(data: &GeoData, domains: &[String], ips: &[String]) -> Result<Expa
                 );
                 out.ips.extend_from_slice(&set.ips);
             }
-            // mmdb 不能反查：交给运行期按国家码匹配。
+            // mmdb 不展开：交给运行期按国家码匹配（实现取舍，不是格式限制）。
             GeoKind::Mmdb => {
                 ensure!(data.mmdb.is_some(), "{value} 需要配置 geo.mmdb 才能使用");
                 out.mmdb_codes.push(code.to_owned());
@@ -508,42 +523,34 @@ fn parse_rule_set(path: &Path) -> Result<RuleSetData> {
             .as_object()
             .with_context(|| format!("rule-set 的 rules[{index}] 必须是对象"))?;
         // 拒绝任何我们不支持的字段：静默忽略会扩大匹配范围。
-        for key in object.keys() {
+        for (key, value) in object {
+            if key == "type" {
+                // 只放行默认规则的显式写法。
+                ensure!(
+                    value.as_str() == Some("default"),
+                    "rule-set 的 rules[{index}].type 只支持 \"default\"，实际 {value}"
+                );
+                continue;
+            }
+            if key == "invert" {
+                // 只放行「不取反」的显式写法。
+                ensure!(
+                    value == &serde_json::Value::Bool(false),
+                    "rule-set 的 rules[{index}].invert 只支持 false；取反规则请先在 sing-box 侧展开"
+                );
+                continue;
+            }
             ensure!(
                 ALLOWED.contains(&key.as_str()),
                 "rule-set 的 rules[{index}] 含不支持的条件 {key:?}；本实现只接受纯域名/IP 列表（{ALLOWED:?}），\
-                 逻辑规则、invert、port、network 等请先在 sing-box 侧展开"
+                 逻辑规则、invert: true、port、network 等请先在 sing-box 侧展开"
             );
         }
-        collect_domains(
-            object,
-            "domain",
-            &mut data.domains,
-            DomainMatcher::Full,
-            false,
-        )?;
-        collect_domains(
-            object,
-            "domain_suffix",
-            &mut data.domains,
-            DomainMatcher::Suffix,
-            false,
-        )?;
-        collect_domains(
-            object,
-            "domain_keyword",
-            &mut data.domains,
-            DomainMatcher::Keyword,
-            false,
-        )?;
-        // 正则保留原文大小写：`\D` 与 `\d` 是不同表达式，改写会改变语义。
-        collect_domains(
-            object,
-            "domain_regex",
-            &mut data.domains,
-            DomainMatcher::Regex,
-            true,
-        )?;
+        collect_domains(object, "domain", &mut data.domains)?;
+        collect_domains(object, "domain_suffix", &mut data.domains)?;
+        collect_domains(object, "domain_keyword", &mut data.domains)?;
+        // 正则保留原文（大小写与首尾空白都可能是语义的一部分）。
+        collect_domains(object, "domain_regex", &mut data.domains)?;
         if let Some(list) = object.get("ip_cidr").and_then(serde_json::Value::as_array) {
             for item in list {
                 let text = item
@@ -561,37 +568,64 @@ fn parse_rule_set(path: &Path) -> Result<RuleSetData> {
     Ok(data)
 }
 
+/// 读取一个域名字段。sing-box 允许**字符串或字符串数组**两种写法，
+/// 两者都必须支持；其它类型必须报错，不能当作字段不存在而静默丢弃。
 fn collect_domains(
     rule: &serde_json::Map<String, serde_json::Value>,
     key: &str,
     out: &mut Vec<DomainMatcher>,
-    wrap: fn(String) -> DomainMatcher,
-    keep_case: bool,
 ) -> Result<()> {
-    let Some(list) = rule.get(key).and_then(serde_json::Value::as_array) else {
+    let Some(value) = rule.get(key) else {
         return Ok(());
     };
-    for item in list {
+    let items: Vec<&serde_json::Value> = match value {
+        serde_json::Value::String(_) => vec![value],
+        serde_json::Value::Array(items) => items.iter().collect(),
+        other => bail!("rule-set 的 {key} 必须是字符串或字符串数组，实际 {other}"),
+    };
+    for item in items {
         let text = item
             .as_str()
-            .with_context(|| format!("rule-set 的 {key} 必须是字符串数组"))?;
-        let value = if keep_case {
-            text.trim().to_owned()
-        } else {
-            text.trim().to_ascii_lowercase()
-        };
-        if value.is_empty() {
-            bail!("rule-set 的 {key} 含空字符串");
+            .with_context(|| format!("rule-set 的 {key} 必须是字符串，实际 {item}"))?;
+        // 正则保留原文（含首尾空白与大小写）：`\D` 与 `\d` 不同，
+        // 首尾空格可能是有意的锚点。
+        if key == "domain_regex" {
+            ensure!(!text.is_empty(), "rule-set 的 {key} 含空字符串");
+            out.push(DomainMatcher::Regex(text.to_owned()));
+            continue;
         }
-        out.push(wrap(value));
+        let value = text.trim().to_ascii_lowercase();
+        ensure!(!value.is_empty(), "rule-set 的 {key} 含空字符串");
+        let item = match key {
+            "domain" => DomainMatcher::Full(value),
+            "domain_suffix" => {
+                // 前导点是 sing-box 的「仅子域」写法，不能当普通后缀处理，
+                // 否则根域也会命中（与上游实测不符）。
+                if let Some(core) = value.strip_prefix('.') {
+                    ensure!(!core.is_empty(), "rule-set 的 {key} 只有点");
+                    DomainMatcher::Subdomain(core.to_owned())
+                } else {
+                    DomainMatcher::Suffix(value)
+                }
+            }
+            "domain_keyword" => DomainMatcher::Keyword(value),
+            other => bail!("内部错误：未知域名字段 {other}"),
+        };
+        out.push(item);
     }
     Ok(())
 }
 
 fn parse_cidr_text(value: &str) -> Result<Cidr> {
-    let (addr, prefix) = value
-        .split_once('/')
-        .with_context(|| format!("CIDR 缺少前缀长度: {value}"))?;
+    // sing-box 允许裸地址，等价于 /32 或 /128（实测 `rule-set match`
+    // 对 `ip_cidr: ["192.0.2.1"]` 能命中该地址）。
+    let Some((addr, prefix)) = value.split_once('/') else {
+        let addr: IpAddr = value
+            .parse()
+            .with_context(|| format!("IP 地址无效: {value}"))?;
+        let prefix = if addr.is_ipv4() { 32 } else { 128 };
+        return Ok(Cidr { addr, prefix });
+    };
     let addr: IpAddr = addr
         .parse()
         .with_context(|| format!("CIDR 地址无效: {value}"))?;

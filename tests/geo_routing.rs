@@ -125,14 +125,11 @@ fn ip(text: &str) -> Host {
 }
 
 /// 真实数据集目录。用 `tools/fetch_geodata.sh` 下载。
-fn real_geodata() -> Option<std::path::PathBuf> {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".test-artifacts/geodata");
-    let needed = ["geosite.dat", "geoip.dat", "Country.mmdb"];
-    if needed.iter().all(|name| dir.join(name).is_file()) {
-        Some(dir)
-    } else {
-        None
-    }
+fn real_geodata(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".test-artifacts/geodata")
+        .join(name);
+    path.is_file().then_some(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -291,12 +288,12 @@ fn empty_geoip_category_never_matches() {
 /// CIDR 与 mmdb 必须取并集（都来自 `ip_cidrs` 数组）。
 #[test]
 fn ip_cidrs_array_is_union_of_cidr_and_mmdb() {
-    let Some(dir) = real_geodata() else {
-        eprintln!("跳过：未下载真实数据集");
+    let Some(mmdb) = real_geodata("Country.mmdb") else {
+        eprintln!("跳过：未下载 Country.mmdb");
         return;
     };
     let rule = json!({"ip_cidrs": ["127.0.0.0/8", "mmdb:CN"], "outbound": "reject"});
-    let geo = json!({"mmdb": dir.join("Country.mmdb").display().to_string()});
+    let geo = json!({"mmdb": mmdb.display().to_string()});
     // 回环命中 CIDR。
     assert_eq!(
         select(geo.clone(), rule.clone(), ip("127.0.0.1"), 443),
@@ -379,6 +376,108 @@ fn rule_set_regex_keeps_original_case() {
         ),
         OutboundKind::Direct
     );
+}
+
+/// sing-box 允许单个字符串代替数组；丢它会静默少一条条件。
+#[test]
+fn rule_set_accepts_scalar_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({"version": 3, "rules": [{"domain": "a.test"}]});
+    let path = write(dir.path(), "rules.json", rules.to_string().as_bytes());
+    assert_eq!(
+        select(
+            json!({"rule_sets": [{"tag": "s", "path": path}]}),
+            json!({"domains": ["rule_set:s"], "outbound": "reject"}),
+            domain("a.test"),
+            443
+        ),
+        OutboundKind::Reject
+    );
+}
+
+/// 字段类型错误必须报错，不能被当成「字段不存在」。
+#[test]
+fn rule_set_rejects_wrong_value_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({"version": 3, "rules": [{"domain": 42}]});
+    let path = write(dir.path(), "rules.json", rules.to_string().as_bytes());
+    let error = check_error(&config(
+        json!({"rule_sets": [{"tag": "t", "path": path}]}),
+        json!({"domains": ["rule_set:t"], "outbound": "reject"}),
+    ));
+    assert!(error.contains("domain"), "{error}");
+}
+
+/// sing-box 的 `domain_suffix: [".a.test"]` 只匹配子域，不含根域。
+/// （实测 sing-box 1.14.4 `rule-set match`：a.test 不匹配，sub.a.test 匹配）
+#[test]
+fn rule_set_leading_dot_suffix_requires_subdomain() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({"version": 3, "rules": [{"domain_suffix": [".a.test"]}]});
+    let path = write(dir.path(), "rules.json", rules.to_string().as_bytes());
+    let geo = json!({"rule_sets": [{"tag": "s", "path": path}]});
+    let rule = json!({"domains": ["rule_set:s"], "outbound": "reject"});
+    assert_eq!(
+        select(geo.clone(), rule.clone(), domain("a.test"), 443),
+        OutboundKind::Direct,
+        "根域不应匹配前导点后缀"
+    );
+    assert_eq!(
+        select(geo, rule, domain("sub.a.test"), 443),
+        OutboundKind::Reject,
+        "子域应匹配"
+    );
+}
+
+/// sing-box 允许裸 IP，等价于 /32 或 /128。
+#[test]
+fn rule_set_accepts_bare_ip() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({"version": 3, "rules": [{"ip_cidr": ["192.0.2.1"]}]});
+    let path = write(dir.path(), "rules.json", rules.to_string().as_bytes());
+    assert_eq!(
+        select(
+            json!({"rule_sets": [{"tag": "s", "path": path}]}),
+            json!({"ip_cidrs": ["rule_set:s"], "outbound": "reject"}),
+            ip("192.0.2.1"),
+            443
+        ),
+        OutboundKind::Reject
+    );
+}
+
+/// `type: "default"` 与 `invert: false` 是 sing-box 的合法显式写法，
+/// 语义上不改变任何东西，应当放行。
+#[test]
+fn rule_set_accepts_default_type_and_invert_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({
+        "version": 3,
+        "rules": [{"type": "default", "invert": false, "domain": ["a.test"]}]
+    });
+    let path = write(dir.path(), "rules.json", rules.to_string().as_bytes());
+    assert_eq!(
+        select(
+            json!({"rule_sets": [{"tag": "s", "path": path}]}),
+            json!({"domains": ["rule_set:s"], "outbound": "reject"}),
+            domain("a.test"),
+            443
+        ),
+        OutboundKind::Reject
+    );
+}
+
+/// 只含 IP 的 rule-set 用在 `domains` 里必须报错：否则阻断规则永不命中。
+#[test]
+fn rule_set_ip_only_in_domains_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({"version": 3, "rules": [{"ip_cidr": ["192.0.2.1"]}]});
+    let path = write(dir.path(), "rules.json", rules.to_string().as_bytes());
+    let error = check_error(&config(
+        json!({"rule_sets": [{"tag": "t", "path": path}]}),
+        json!({"domains": ["rule_set:t"], "outbound": "reject"}),
+    ));
+    assert!(error.contains("不含域名项"), "{error}");
 }
 
 // ---------------------------------------------------------------------------
@@ -517,11 +616,11 @@ fn geo_reference_in_wrong_field_fails_loudly() {
 /// 真实 `geosite.dat`：`google.com` 是 **Domain（后缀）**，因此子域命中。
 #[test]
 fn real_geosite_classifies_known_domains() {
-    let Some(dir) = real_geodata() else {
-        eprintln!("跳过：未下载真实数据集（tools/fetch_geodata.sh）");
+    let Some(geosite) = real_geodata("geosite.dat") else {
+        eprintln!("跳过：未下载 geosite.dat（tools/fetch_geodata.sh）");
         return;
     };
-    let geo = json!({"geosite": dir.join("geosite.dat").display().to_string()});
+    let geo = json!({"geosite": geosite.display().to_string()});
     let rule = json!({"domains": ["geosite:google"], "outbound": "reject"});
     for host in ["google.com", "www.google.com", "mail.gmail.com"] {
         assert_eq!(
@@ -538,11 +637,11 @@ fn real_geosite_classifies_known_domains() {
 
 #[test]
 fn real_geoip_classifies_known_addresses() {
-    let Some(dir) = real_geodata() else {
-        eprintln!("跳过：未下载真实数据集");
+    let Some(geoip) = real_geodata("geoip.dat") else {
+        eprintln!("跳过：未下载 geoip.dat");
         return;
     };
-    let geo = json!({"geoip": dir.join("geoip.dat").display().to_string()});
+    let geo = json!({"geoip": geoip.display().to_string()});
     let rule = json!({"ip_cidrs": ["geoip:cn"], "outbound": "reject"});
     assert_eq!(
         select(geo.clone(), rule.clone(), ip("223.5.5.5"), 80),
@@ -553,11 +652,11 @@ fn real_geoip_classifies_known_addresses() {
 
 #[test]
 fn real_mmdb_classifies_known_addresses() {
-    let Some(dir) = real_geodata() else {
-        eprintln!("跳过：未下载真实数据集");
+    let Some(mmdb) = real_geodata("Country.mmdb") else {
+        eprintln!("跳过：未下载 Country.mmdb");
         return;
     };
-    let geo = json!({"mmdb": dir.join("Country.mmdb").display().to_string()});
+    let geo = json!({"mmdb": mmdb.display().to_string()});
     let rule = json!({"ip_cidrs": ["mmdb:CN"], "outbound": "reject"});
     assert_eq!(
         select(geo.clone(), rule.clone(), ip("223.5.5.5"), 80),
@@ -599,8 +698,11 @@ async fn geoip_reject_is_wired_end_to_end() {
     // 必须读完整个 SOCKS 应答（4 字节头 + BND 地址 + 端口），否则剩余
     // 地址字节会被下面的 read 当成「业务回显」。
     let (code, _) = common::read_socks_reply(&mut stream).await;
+    // REP 2 = connection not allowed by ruleset。不能只看「有没有回显」：
+    // 拨号失败、DNS 失败、超时都会让读操作失败，看起来也像拒绝。
+    assert_eq!(code, 2, "命中 reject 应返回 SOCKS REP 2，实际 {code}");
 
-    // 拒绝时不应回显；若规则未生效，echo 会原样返回探测字节。
+    // 双保险：即便返回 REP 2，也不应有业务数据。
     if code == 0 {
         stream.write_all(b"probe").await.ok();
     }

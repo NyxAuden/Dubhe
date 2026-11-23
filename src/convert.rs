@@ -905,8 +905,15 @@ fn convert_routing(
             rule.insert("outbound".into(), json!(outbound));
             if let Some(domains) = item.get("domain").and_then(Value::as_array) {
                 let mut exact = Vec::new();
+                // 同一 Xray `domain` 数组内部是并集；而 dubhe 的
+                // `domains` 与 `domain_suffix`/`domain_keyword`/`domain_regex`
+                // 是不同字段、彼此取交集。把并集拆到不同字段会改变语义，
+                // 因此混合时直接失败，不做有损转换。
+                let mut has_geosite = false;
+                let mut has_other_kind = false;
                 for domain in domains.iter().filter_map(Value::as_str) {
                     if domain.starts_with("geosite:") {
+                        has_geosite = true;
                         // dubhe 支持 geosite:，但要求配置里给出 geo.geosite
                         // 数据文件。**必须并进 `exact`**：之前直接写进
                         // `rule["domains"]`，随后 `rule.insert("domains", exact)`
@@ -920,18 +927,21 @@ fn convert_routing(
                             "routing.rules[{index}] 的 {domain} 需要外部规则集，已跳过；可用 geo.rule_sets 引用 sing-box source JSON"
                         ));
                     } else if let Some(suffix) = domain.strip_prefix("domain:") {
+                        has_other_kind = true;
                         rule.entry("domain_suffix")
                             .or_insert_with(|| json!([]))
                             .as_array_mut()
                             .expect("数组")
                             .push(json!(suffix));
                     } else if let Some(keyword) = domain.strip_prefix("keyword:") {
+                        has_other_kind = true;
                         rule.entry("domain_keyword")
                             .or_insert_with(|| json!([]))
                             .as_array_mut()
                             .expect("数组")
                             .push(json!(keyword));
                     } else if let Some(pattern) = domain.strip_prefix("regexp:") {
+                        has_other_kind = true;
                         rule.entry("domain_regex")
                             .or_insert_with(|| json!([]))
                             .as_array_mut()
@@ -940,6 +950,7 @@ fn convert_routing(
                     } else if let Some(full) = domain.strip_prefix("full:") {
                         exact.push(json!(full));
                     } else if domain.starts_with("dotless:") {
+                        has_other_kind = true;
                         report.note(format!(
                             "routing.rules[{index}] 的 {domain}（无点域名）暂无对应字段，已跳过"
                         ));
@@ -947,14 +958,23 @@ fn convert_routing(
                         exact.push(json!(domain));
                     }
                 }
+                anyhow::ensure!(
+                    !(has_geosite && has_other_kind),
+                    "routing.rules[{index}] 在同一 domain 数组里混用了 geosite: 与 domain:/keyword:/regexp:；\
+                     Xray 里它们是并集，而 dubhe 的这些字段之间是交集，无法等价转换。\
+                     请拆成多条规则，或在 Xray 侧展开后再转换"
+                );
                 if !exact.is_empty() {
                     rule.insert("domains".into(), Value::Array(exact));
                 }
             }
             if let Some(ips) = item.get("ip").and_then(Value::as_array) {
                 let mut cidrs = Vec::new();
+                let mut has_private = false;
+                let mut has_other_ip = false;
                 for ip in ips.iter().filter_map(Value::as_str) {
                     if ip == "geoip:private" {
+                        has_private = true;
                         // Xray 的 geoip:private 来自 geoip.dat 预定义标签，其实际地址
                         // 集合未核实；与 sing-box ip_is_private（!IsPublicAddr）可能
                         // 不完全相同，这里做近似映射并提示人工复核。
@@ -963,6 +983,7 @@ fn convert_routing(
                         ));
                         rule.insert("ip_is_private".into(), json!(true));
                     } else if let Some(code) = ip.strip_prefix("geoip:") {
+                        has_other_ip = true;
                         // dubhe 的 ip_cidrs 支持 geoip:<code>，同样要求
                         // geo.geoip 指向数据文件。
                         cidrs.push(json!(format!("geoip:{code}")));
@@ -970,19 +991,28 @@ fn convert_routing(
                             "routing.rules[{index}] 的 {ip} 已保留；在 dubhe 配置里设置 geo.geoip 指向 geoip.dat 才会生效"
                         ));
                     } else if ip.starts_with("ext:") {
+                        has_other_ip = true;
                         report.note(format!(
                             "routing.rules[{index}] 的 {ip} 需要外部规则集，已跳过；可用 geo.rule_sets 引用 sing-box source JSON"
                         ));
                     } else if ip.starts_with('!') {
+                        has_other_ip = true;
                         // Xray 的 `!` 只否定 IP 条件，而 dubhe 的 invert 翻转整条规则；
                         // 两者只在「规则没有其它条件」时才等价，不做有损转换。
                         report.note(format!(
                             "routing.rules[{index}] 的 {ip}（反向 IP 匹配）无法等价表达，已跳过"
                         ));
                     } else {
+                        has_other_ip = true;
                         cidrs.push(json!(ip));
                     }
                 }
+                anyhow::ensure!(
+                    !(has_private && has_other_ip),
+                    "routing.rules[{index}] 在同一 ip 数组里混用了 geoip:private 与其它项；\
+                     Xray 里它们是并集，而 dubhe 的 ip_is_private 与 ip_cidrs 之间是交集，\
+                     无法等价转换。请拆成多条规则"
+                );
                 if !cidrs.is_empty() {
                     rule.insert("ip_cidrs".into(), Value::Array(cidrs));
                 }
@@ -1015,6 +1045,27 @@ fn convert_routing(
                     rule.insert("networks".into(), Value::Array(networks));
                 }
             }
+            // 只允许把**有匹配条件**的规则写出去。若条件全都被跳过
+            // （例如只有 `ext:` 引用），剩下的 `{outbound}` 会变成
+            // 无条件规则——把所有流量导向该出站。
+            let has_condition = [
+                "domains",
+                "domain_suffix",
+                "domain_keyword",
+                "domain_regex",
+                "ip_cidrs",
+                "ip_is_private",
+                "ports",
+                "inbounds",
+                "networks",
+            ]
+            .iter()
+            .any(|key| rule.contains_key(*key));
+            anyhow::ensure!(
+                has_condition,
+                "routing.rules[{index}] 转换后没有任何匹配条件（引用均被跳过），\
+                 继续输出会变成无条件规则；请在 Xray 侧展开或补充具体值"
+            );
             rules.push(Value::Object(rule));
         }
     }
@@ -1149,8 +1200,10 @@ mod tests {
             "routing": {
                 "domainStrategy": "IPIfNonMatch",
                 "rules": [
-                    {"type": "field", "domain": ["domain:example.org", "keyword:ads", "geosite:cn"], "outboundTag": "direct"},
-                    {"type": "field", "ip": ["10.0.0.0/8"], "port": "53,80-90", "outboundTag": "block"}
+                    {"type": "field", "domain": ["domain:example.org", "keyword:ads", "full:exact.example"], "outboundTag": "direct"},
+                    {"type": "field", "ip": ["10.0.0.0/8"], "port": "53,80-90", "outboundTag": "block"},
+                    // geosite 单独一条：与 domain:/keyword: 混写无法等价转换。
+                    {"type": "field", "domain": ["geosite:google"], "outboundTag": "block"}
                 ]
             }
         })
@@ -1171,8 +1224,8 @@ mod tests {
         assert_eq!(inbounds[1]["certificate"], "/c.pem");
         assert_eq!(inbounds[2]["type"], "shadowsocks");
         assert_eq!(inbounds[2]["method"], "aes-256-gcm");
-        // geosite 无法转换，必须进报告而不是静默丢弃。
-        assert!(report.notes.iter().any(|note| note.contains("geosite:cn")));
+        // geosite 已保留，必须在报告里提示需要配置 geo.geosite。
+        assert!(report.notes.iter().any(|note| note.contains("geo.geosite")));
     }
 
     #[test]
@@ -1188,15 +1241,25 @@ mod tests {
         assert_eq!(rules[0]["outbound"], "direct");
         assert_eq!(rules[0]["domain_suffix"][0], "example.org");
         assert_eq!(rules[0]["domain_keyword"][0], "ads");
-        // geosite 引用必须保留在 domains 里（此前被后续 insert 覆盖）。
+        // `full:` 必须进 domains（此前会被 geosite 分支覆盖掉）。
         assert!(
             rules[0]["domains"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|item| item == "geosite:cn"),
-            "domains 应保留 geosite:cn：{:?}",
+                .any(|item| item == "exact.example"),
+            "domains 应保留 full:exact.example：{:?}",
             rules[0]["domains"]
+        );
+        // geosite 引用必须保留在 domains 里（此前被后续 insert 覆盖）。
+        assert!(
+            rules[2]["domains"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item == "geosite:google"),
+            "domains 应保留 geosite:google：{:?}",
+            rules[2]["domains"]
         );
         assert_eq!(rules[1]["ports"][0]["start"], 53);
         assert_eq!(rules[1]["ports"][1]["start"], 80);
@@ -1465,12 +1528,65 @@ mod routing_field_alignment_tests {
     #[test]
     fn negated_ip_is_reported_instead_of_lossy_invert() {
         // Xray 的 `!` 只否定 IP 条件，整条规则 invert 会改变语义。
+        // 加一个 port 条件，使这条规则在丢弃 IP 后仍有匹配条件
+        // （只剩被丢弃引用的规则现在会直接报错，见下一条用例）。
         let (value, report) = convert(serde_json::json!([
-            {"type": "field", "ip": ["!geoip:cn"], "outboundTag": "direct"}
+            {"type": "field", "ip": ["!geoip:cn"], "port": "443", "outboundTag": "direct"}
         ]));
         assert!(value["route"]["rules"][0].get("invert").is_none());
         assert!(value["route"]["rules"][0].get("ip_cidrs").is_none());
         assert!(report.contains("反向 IP 匹配"), "{report}");
+    }
+
+    /// 规则的所有条件都被跳过时必须报错：只剩 `{outbound}` 会变成
+    /// 无条件规则，把所有流量导向该出站。
+    #[test]
+    fn rule_with_only_dropped_references_is_rejected() {
+        let text = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [
+                {"type": "field", "domain": ["ext:my.dat:google"], "outboundTag": "direct"}
+            ]}
+        })
+        .to_string();
+        let error = from_xray(&text, None).unwrap_err().to_string();
+        assert!(
+            error.contains("没有任何匹配条件"),
+            "应拒绝无条件规则：{error}"
+        );
+    }
+
+    /// 同一 domain 数组混用 geosite 与 domain:/keyword:/regexp: 无法等价
+    /// 转换（Xray 是并集，dubhe 这些字段之间是交集），必须报错。
+    #[test]
+    fn mixed_geosite_and_suffix_in_one_array_is_rejected() {
+        let text = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [
+                {"type": "field", "domain": ["domain:a.test", "geosite:google"],
+                 "outboundTag": "direct"}
+            ]}
+        })
+        .to_string();
+        let error = from_xray(&text, None).unwrap_err().to_string();
+        assert!(error.contains("混用了"), "{error}");
+    }
+
+    /// geoip:private 与其它 IP 项混写同样无法等价转换。
+    #[test]
+    fn mixed_private_and_geoip_is_rejected() {
+        let text = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [
+                {"type": "field", "ip": ["geoip:private", "geoip:cn"], "outboundTag": "direct"}
+            ]}
+        })
+        .to_string();
+        let error = from_xray(&text, None).unwrap_err().to_string();
+        assert!(error.contains("geoip:private"), "{error}");
     }
 
     #[test]
