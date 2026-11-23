@@ -44,7 +44,7 @@ h2 = { version = "=0.4.20", default-features = false }
 h3 = { version = "=0.0.8", default-features = false }
 h3-quinn = { version = "=0.0.10", default-features = false, features = ["datagram"] }
 ipnet = { version = "2", features = ["serde"] }
-rcgen = { version = "=0.13.2", default-features = false }
+rcgen = { version = "=0.14.10", default-features = false }
 # 已在 env_filter 的依赖树内；直接命名用于路由 domain_regex。
 # unicode-perl 是必需的：真实 geosite.dat 里有 `\d` 这类 Perl 字符类
 # （例如 ^cdn\d-epicgames-\d+\.file\.myqcloud\.com$），缺了它整条规则会被拒。
@@ -71,7 +71,7 @@ x509-parser = { version = "=0.18.1", default-features = false }
 
 [dev-dependencies]
 aes = "0.9"
-rcgen = "0.13"
+rcgen = "0.14"
 tempfile = "3"
 yasna = "=0.5.2"
 
