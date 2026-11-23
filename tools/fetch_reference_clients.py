@@ -55,7 +55,12 @@ def detect_platform():
         raise SystemExit(
             f"不支持的平台 {key[0]}/{key[1]}；已钉住的上游资源只覆盖: {supported}"
         )
-    return f"{key[0].lower()}-{key[1]}", {
+    # 规范化标签必须与 Rust 侧 `platform_tag()` 完全一致：
+    # `macos`→`darwin`，`aarch64`→`arm64`，`x86_64` 保持。
+    # 不能直接用 `platform.machine()`（Linux ARM64 上它是 `aarch64`）。
+    os_name = "darwin" if key[0] == "Darwin" else key[0].lower()
+    arch = "arm64" if key[1] == "aarch64" else key[1]
+    return f"{os_name}-{arch}", {
         "platform": sing_box_name,
         "xray_platform": xray_name,
     }
@@ -252,7 +257,7 @@ def tag_commit(repo, tag):
     raise ValueError("Tag did not resolve to a commit")
 
 
-def prepare_client(spec, run_dir, platform_names):
+def prepare_client(spec, run_dir, platform_names, platform_label):
     name, repo, version, asset_name, executable, version_arg = spec
     asset_name = asset_name.format(**platform_names)
     print(f"{name}: querying official release {version}", flush=True)
@@ -292,7 +297,10 @@ def prepare_client(spec, run_dir, platform_names):
     print(f"{name}: verified {output.splitlines()[0]}", flush=True)
     return {
         "name": name, "path": str(binary), "version": version,
-        "platform": f"{platform.system().lower()}-{platform.machine()}",
+        # 与 `detect_platform()` 的规范化名字一致（`arm64` 而非 `aarch64`），
+        # 否则 Linux ARM64 上 manifest 写 `linux-aarch64` 而测试侧期望
+        # `linux-arm64`，会报平台不匹配。
+        "platform": platform_label,
         "source": asset["browser_download_url"],
         "release_url": release["html_url"], "release_api_url": release_url,
         "release_published_at": release["published_at"],
@@ -328,7 +336,9 @@ def main():
     }
     for spec in CLIENTS:
         try:
-            manifest["clients"].append(prepare_client(spec, run_dir, platform_names))
+            manifest["clients"].append(
+                prepare_client(spec, run_dir, platform_names, platform_label)
+            )
         except Exception as error:
             manifest["clients"].append({
                 "name": spec[0], "version": spec[2], "path": None,
