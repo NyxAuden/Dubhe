@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -64,7 +64,7 @@ pub(crate) async fn serve(
     config: Inbound,
     tls: Option<crate::tls::ServerTls>,
     ctx: Arc<Context>,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
     _stop: CancellationToken,
     _force: CancellationToken,
 ) -> io::Result<()> {

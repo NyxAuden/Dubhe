@@ -24,6 +24,10 @@ use crate::{
 };
 
 mod accept;
+
+/// 握手期的两个名额（全局并发 + 单 IP 在途）。协议实现只需按原样持有并在
+/// 握手完成时 `drop`，两者的释放时机因此自动对齐。
+pub(crate) use accept::HandshakePermits;
 mod listener;
 mod reload;
 mod serve;
@@ -817,6 +821,8 @@ impl Server {
                     .filter(|_| uses_security(inbound))
                     .map(|tls| tls::InboundSecurity::Tls(tls.clone())),
                 handshakes,
+                per_ip_handshakes: config.limits.per_ip_handshakes,
+                max_handshakes: config.limits.max_handshakes,
                 shadowsocks,
                 prepared: None,
                 snell,

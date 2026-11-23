@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +29,7 @@ pub(crate) async fn serve(
     security: Option<crate::tls::InboundSecurity>,
     vmess: Option<std::sync::Arc<vmess::Prepared>>,
     ctx: std::sync::Arc<Context>,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
     _stop: CancellationToken,
     force: CancellationToken,
 ) -> io::Result<()> {

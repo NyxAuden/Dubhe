@@ -382,7 +382,7 @@ pub(crate) async fn serve(
                         ctx,
                         stop,
                         force,
-                        handshake,
+                        crate::runtime::HandshakePermits::new(handshake, None),
                     )
                     .await
                     {
@@ -419,7 +419,7 @@ async fn handle_connection(
     ctx: Arc<Context>,
     stop: CancellationToken,
     force: CancellationToken,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
 ) -> io::Result<()> {
     let cancel = CancellationToken::new();
     let (auth_tx, auth_rx) = watch::channel(AuthState::Pending);
@@ -662,7 +662,7 @@ async fn auth_timeout_task(
     shared: Arc<SessionShared>,
     mut auth: watch::Receiver<AuthState>,
     fatal: mpsc::Sender<()>,
-    _permit: OwnedSemaphorePermit,
+    _permit: crate::runtime::HandshakePermits,
 ) {
     // 与 0.5-RTT 改造前一致：认证超时从完整握手完成后开始，不把握手耗时
     // 重复计入认证窗口；握手本身由 handshake_task 计时。

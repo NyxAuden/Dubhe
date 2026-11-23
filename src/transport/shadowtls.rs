@@ -32,7 +32,6 @@ use aws_lc_rs::{
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    sync::OwnedSemaphorePermit,
     time::timeout,
 };
 
@@ -347,7 +346,7 @@ pub(crate) enum AuthOutcome<S> {
     /// 认证成功；握手许可继续交给内层协议，覆盖其认证阶段。
     Authenticated {
         stream: Verified<S>,
-        permit: OwnedSemaphorePermit,
+        permit: crate::runtime::HandshakePermits,
     },
     /// 未认证流量已按真实 TLS 回落到伪装服务器。
     Fallback,
@@ -361,7 +360,7 @@ pub(crate) async fn accept<S: DetourStream>(
     stream: S,
     prepared: Arc<Prepared>,
     ctx: Arc<forward::Context>,
-    permit: OwnedSemaphorePermit,
+    permit: crate::runtime::HandshakePermits,
 ) -> io::Result<AuthOutcome<S>> {
     let deadline = Duration::from_millis(ctx.limits.handshake_timeout_ms);
     let mut stream = stream;

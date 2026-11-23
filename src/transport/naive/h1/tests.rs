@@ -41,7 +41,7 @@ async fn response_frame<S: AsyncRead + Unpin>(client: &mut S) -> Vec<u8> {
 fn spawn(
     wire: tokio::io::DuplexStream,
     ctx: Arc<Context>,
-    permit: OwnedSemaphorePermit,
+    permit: crate::runtime::HandshakePermits,
     deadline: Instant,
 ) -> tokio::task::JoinHandle<io::Result<()>> {
     tokio::spawn(async move {
@@ -78,7 +78,7 @@ async fn slow_partial_head_deadline_returns_handshake_permit_without_dial_or_chi
     let task = spawn(
         wire,
         ctx.clone(),
-        permit,
+        crate::runtime::HandshakePermits::new(permit, None),
         Instant::now() + Duration::from_millis(30),
     );
     client
@@ -106,7 +106,7 @@ async fn h1_uot_shared_bytes_and_slot_limits_release_after_cancel_without_instan
     let task = spawn(
         wire,
         ctx.clone(),
-        slots.clone().acquire_owned().await.unwrap(),
+        crate::runtime::HandshakePermits::new(slots.clone().acquire_owned().await.unwrap(), None),
         Instant::now() + WAIT,
     );
     client
@@ -133,7 +133,7 @@ async fn h1_uot_shared_bytes_and_slot_limits_release_after_cancel_without_instan
     let other_task = spawn(
         other_wire,
         ctx.clone(),
-        slots.clone().acquire_owned().await.unwrap(),
+        crate::runtime::HandshakePermits::new(slots.clone().acquire_owned().await.unwrap(), None),
         Instant::now() + WAIT,
     );
     other
@@ -210,7 +210,10 @@ async fn aborting_partial_uot_or_truncated_padding_does_not_leave_reader_or_udp_
         let task = spawn(
             wire,
             ctx.clone(),
-            slots.clone().acquire_owned().await.unwrap(),
+            crate::runtime::HandshakePermits::new(
+                slots.clone().acquire_owned().await.unwrap(),
+                None,
+            ),
             Instant::now() + WAIT,
         );
         client

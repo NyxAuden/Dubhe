@@ -35,7 +35,7 @@ pub(crate) async fn serve(
     stream: TcpStream,
     config: Inbound,
     ctx: Arc<Context>,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
     deadline: Instant,
 ) -> io::Result<()> {
     let (tag, target) = match &config {

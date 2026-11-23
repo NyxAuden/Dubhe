@@ -7,7 +7,6 @@ use std::{io, sync::Arc};
 
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::OwnedSemaphorePermit,
     time::{Instant, timeout_at},
 };
 
@@ -30,7 +29,7 @@ pub(crate) async fn dispatch<S>(
     tls_enabled: bool,
     ctx: Arc<Context>,
     deadline: Instant,
-    handshake: Option<OwnedSemaphorePermit>,
+    handshake: Option<crate::runtime::HandshakePermits>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,

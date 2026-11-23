@@ -151,7 +151,14 @@ impl Fixture {
             if let Some(gate) = gate {
                 gate.wait().await;
             }
-            serve_tcp(stream, prepared, ctx, "ss", permit).await
+            serve_tcp(
+                stream,
+                prepared,
+                ctx,
+                "ss",
+                crate::runtime::HandshakePermits::new(permit, None),
+            )
+            .await
         })
     }
 }
@@ -1105,7 +1112,7 @@ async fn handshake_timeout_closes_socket_and_releases_permit_without_dialing() {
                 fixture.prepared.clone(),
                 fixture.ctx.clone(),
                 "ss",
-                permit,
+                crate::runtime::HandshakePermits::new(permit, None),
             ))
             .await
             .unwrap_err();
@@ -1138,7 +1145,7 @@ async fn cancelling_a_polled_handshake_closes_socket_and_releases_permit() {
                 fixture.prepared.clone(),
                 fixture.ctx.clone(),
                 "ss",
-                permit,
+                crate::runtime::HandshakePermits::new(permit, None),
             ));
             // 确定已经进入握手并读到 Pending，而不是只取消一个未运行的任务。
             poll_fn(|cx| {

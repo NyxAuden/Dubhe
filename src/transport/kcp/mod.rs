@@ -161,7 +161,7 @@ pub(crate) async fn serve(
                     let result = tokio::select! {
                         biased;
                         _ = force.cancelled() => Ok(()),
-                        result = dispatch(stream, config.clone(), tls, vmess, ctx.clone(), handshake, deadline) => result,
+                        result = dispatch(stream, config.clone(), tls, vmess, ctx.clone(), crate::runtime::HandshakePermits::new(handshake, None), deadline) => result,
                     };
                     if let Err(error) = result {
                         if !forward::is_route_rejection(&error) {
@@ -190,7 +190,7 @@ async fn dispatch(
     tls: Option<TlsAcceptor>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
     deadline: Duration,
 ) -> io::Result<()> {
     let tls_enabled = tls.is_some();

@@ -15,7 +15,6 @@ use prost::bytes::Bytes;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    sync::OwnedSemaphorePermit,
     task::JoinSet,
     time::{Instant, timeout_at},
 };
@@ -42,7 +41,7 @@ pub(crate) async fn serve(
     tls: Option<crate::tls::ServerTls>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
     stop: CancellationToken,
     force: CancellationToken,
 ) -> io::Result<()> {
@@ -97,7 +96,7 @@ async fn serve_h1<S>(
     http: V2rayHttp,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
     deadline: Instant,
 ) -> io::Result<()>
 where
@@ -141,7 +140,7 @@ async fn serve_h2<S>(
     http: V2rayHttp,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<crate::runtime::HandshakePermits>,
     stop: CancellationToken,
     force: CancellationToken,
     deadline: Instant,

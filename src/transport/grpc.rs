@@ -524,7 +524,7 @@ pub(crate) async fn serve(
     security: Option<crate::tls::InboundSecurity>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
     slots: Arc<Semaphore>,
     stop: CancellationToken,
     force: CancellationToken,

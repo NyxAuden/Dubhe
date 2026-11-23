@@ -46,6 +46,10 @@ pub(super) struct Listener {
     /// WS/gRPC/XHTTP/HTTPUpgrade 的安全层；TLS 或 REALITY。
     pub(super) security: Option<tls::InboundSecurity>,
     pub(super) handshakes: Arc<Semaphore>,
+    /// 单源 IP 的握手并发上限；`0` 表示不限制。
+    pub(super) per_ip_handshakes: usize,
+    /// 本入口的全局握手并发上限，用于把 `per_ip_handshakes` 收敛到有效值。
+    pub(super) max_handshakes: usize,
     pub(super) shadowsocks: Option<ShadowsocksListener>,
     pub(super) prepared: Option<Arc<shadowsocks::Prepared>>,
     pub(super) snell: Option<Arc<crate::protocol::snell::Prepared>>,
@@ -202,7 +206,7 @@ impl Detour {
         self,
         mut stream: S,
         ctx: Arc<Context>,
-        handshake: tokio::sync::OwnedSemaphorePermit,
+        handshake: crate::runtime::HandshakePermits,
     ) -> io::Result<()>
     where
         S: transport::DetourStream + 'static,

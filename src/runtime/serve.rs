@@ -320,7 +320,7 @@ pub(super) async fn serve_trojan_reality(
     users: &[crate::config::User],
     prepared: Arc<tls::reality::Prepared>,
     ctx: Arc<Context>,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: super::HandshakePermits,
     deadline: Duration,
 ) -> io::Result<()> {
     let absolute = tokio::time::Instant::now() + deadline;
@@ -353,7 +353,7 @@ pub(super) async fn handle_vmess_reality(
     prepared: Arc<vmess::Prepared>,
     reality: Arc<tls::reality::Prepared>,
     ctx: Arc<Context>,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: super::HandshakePermits,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let deadline = Duration::from_millis(ctx.limits.handshake_timeout_ms);
@@ -379,7 +379,7 @@ pub(super) async fn handle_vmess(
     tls: Option<tls::ServerTls>,
     prepared: Arc<vmess::Prepared>,
     ctx: Arc<Context>,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: super::HandshakePermits,
 ) -> io::Result<()> {
     use tokio::io::{AsyncRead, AsyncWrite};
     // 一次有限分派抹除仅用于直承载/标准TLS两种类型，不引入永久worker。
@@ -491,7 +491,7 @@ pub(super) async fn handle_websocket(
     security: Option<tls::InboundSecurity>,
     prepared: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: super::HandshakePermits,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let websocket = match config {
@@ -597,7 +597,7 @@ pub(super) async fn serve_reality_encrypted(
     ctx: Arc<Context>,
     deadline: Duration,
     absolute: tokio::time::Instant,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: super::HandshakePermits,
 ) -> io::Result<()> {
     let mut stream = tokio::time::timeout_at(absolute, prepared.accept(stream))
         .await
@@ -736,7 +736,7 @@ pub(super) async fn serve_socks5_stream<S>(
     users: &[crate::config::User],
     ctx: Arc<Context>,
     deadline: Duration,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: super::HandshakePermits,
 ) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -760,7 +760,7 @@ pub(super) async fn serve_socks5(
     users: &[crate::config::User],
     ctx: Arc<Context>,
     deadline: Duration,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: super::HandshakePermits,
 ) -> io::Result<()> {
     let request = timeout(deadline, socks5::handshake(&mut stream, users))
         .await
@@ -794,7 +794,7 @@ pub(super) async fn serve_socks5_detoured<S>(
     users: &[crate::config::User],
     ctx: Arc<Context>,
     deadline: Duration,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: super::HandshakePermits,
 ) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -950,7 +950,7 @@ pub(crate) async fn serve_http<S>(
     tls: Option<tls::ServerTls>,
     ctx: Arc<Context>,
     deadline: Duration,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: super::HandshakePermits,
 ) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -974,7 +974,7 @@ pub(super) async fn serve_http_h1<S>(
     users: &[crate::config::User],
     ctx: Arc<Context>,
     deadline: Duration,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: super::HandshakePermits,
 ) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1017,7 +1017,7 @@ pub(super) async fn serve_http_h2<S>(
     users: &[crate::config::User],
     ctx: Arc<Context>,
     deadline: Duration,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: super::HandshakePermits,
 ) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,

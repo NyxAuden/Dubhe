@@ -15,7 +15,6 @@ use shadowsocks::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
-    sync::OwnedSemaphorePermit,
     time::timeout,
 };
 
@@ -112,7 +111,7 @@ pub(crate) async fn serve_tcp(
     prepared: Arc<Prepared>,
     ctx: Arc<forward::Context>,
     tag: &str,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
 ) -> io::Result<()> {
     serve_generic(stream, prepared, ctx, tag, handshake).await
 }
@@ -123,7 +122,7 @@ pub(crate) async fn serve_generic<S: DetourStream + 'static>(
     prepared: Arc<Prepared>,
     ctx: Arc<forward::Context>,
     tag: &str,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
 ) -> io::Result<()> {
     let method = prepared.keys.method;
     let is_2022 = method.is_aead_2022();

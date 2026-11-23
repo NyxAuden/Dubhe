@@ -154,6 +154,16 @@ Xray 输出按 v26 结构生成：
   `allow_insecure`。
 
 
+日志级别由环境变量 `DUBHE_LOG` 控制（语法同 `RUST_LOG`），例如
+`DUBHE_LOG=debug` 或 `DUBHE_LOG=dubhe=trace,quinn=warn`；未设置时保持 `info`。
+`shadowsocks` 目标始终关闭（协议库原生日志可能包含 EIH/身份哈希）。
+连接级日志包含对端 IP，但**默认不记录目标地址与载荷**（威胁模型 T14）；
+需要目标时打开 `DUBHE_LOG=debug`。
+
+`limits.per_ip_handshakes`（默认 8，`0` 表示不限制）限制**单个源 IP 同时占用的
+在途握手数**。它不限制并发连接数：完成握手的连接立即释放名额。没有这一层时，
+单个 IP 开满全局 `max_handshakes` 就能让该入口对其他所有 IP 不可用。
+
 示例默认仅监听 `127.0.0.1:1080`。检查模式不绑定端口、不连接代理目标；它会验证配置以及 Trojan 证书/私钥。**端口是否真的可绑定（被其他进程占用）只在 run 阶段验证**；但两个入口之间的监听冲突由 `check` 静态判定并拒绝——同一 `(地址, 端口, TCP/UDP)` 只能有一个入口占用，通配地址（`0.0.0.0` / `::`）与其覆盖范围内的具体地址也算冲突。UDP 与 TCP 不互相冲突（例如 `socks5` + `hysteria2` 可共用端口号），端口 `0` 由内核分配、不参与冲突判定。CLI 的成功退出为 0、配置/运行错误为 1、参数用法错误为 2。
 
 Trojan 使用 `examples/trojan.json` 作为模板，必须替换证书链、私钥的绝对路径及随机密码，再执行 check/run。VLESS 模板为 `examples/vless.json`，用户字段使用 `uuid`，须替换为随机标准 UUID，TLS 路径同样必填；命令 3 与目标 `v1.mux.cool` 进入完整 Mux.Cool（TCP 会话始终允许；UDP New/GlobalID 默认准入，`xudp:false` 可关闭），边界见 [Mux 说明](mux.md)。新增开发实现的Vision模板为 `examples/vless-vision.json`，仅用户级 `flow:"xtls-rprx-vision"` 开启，真正Vision请求要求TLS1.3；尚待官方/三平台集中验收，详见[Vision说明](vision.md)。VMess模板为`examples/vmess.json`（直承载）和`examples/vmess-tls.json`（成对可选TLS），四项扩展/弱化开关均默认false，须替换UUID，TLS模板另替换证书路径；详见[VMess边界及UDP大小公式](vmess.md)。REALITY采用独立`examples/vless-reality.json`及`vless-reality`入口，已实现待集中验收（21/29）；固定自持回环target、两层身份及有限模板边界见[REALITY说明](reality.md)，旧vless不能混入REALITY选项。REALITY 还可作为三协议 gRPC、XHTTP 的安全层：入口内配置 `reality` 后不得再配置 `certificate`/`private_key` 或 `allow_insecure_transport`，XHTTP/3 除外；gRPC 使用 h2。与上游一致，WebSocket/HTTPUpgrade 不组合 REALITY，配置阶段拒绝。WS/WSS另有`vless-ws`/`vmess-ws`/`trojan-ws`及六份独立回环占位模板（如`examples/vless-wss.json`），显式header/path early-data、严格路径/Host及关闭限制见[WebSocket说明](websocket.md)；新入口不会放松旧类型TLS契约。gRPC另有`vless-grpc`/`vmess-grpc`/`trojan-grpc`及六份独立回环占位模板（如`examples/vless-grpc.json`），`grpc.path`必填完整RPC路径，可选`multi_path`；VMess gRPC 必须真实TLS或REALITY，VLESS/Trojan明文须显式`allow_insecure_transport`。single/multiMode消息framing、1MiB上限、半关闭与资源边界见[gRPC说明](grpc.md)。TCP 复用由协议命令 3/`v1.mux.cool` 触发，不提供独立配置开关。仓库不附带生产证书和私钥。模板仅有明确占位值，不可直接作为公网部署配置。测试会用临时证书和凭据替换占位项后验证真实启动与转发。

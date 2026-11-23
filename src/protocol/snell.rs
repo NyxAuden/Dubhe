@@ -22,7 +22,7 @@ use subtle::{Choice, ConstantTimeEq};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::{TcpStream, UdpSocket},
-    sync::{Notify, OwnedSemaphorePermit, mpsc},
+    sync::{Notify, mpsc},
     task::{AbortHandle, JoinSet},
     time::{Instant, timeout},
 };
@@ -246,7 +246,7 @@ pub(crate) async fn serve(
     prepared: Arc<Prepared>,
     ctx: Arc<forward::Context>,
     tag: &str,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
 ) -> io::Result<()> {
     serve_stream(stream, prepared, ctx, tag, handshake).await
 }
@@ -256,7 +256,7 @@ pub(crate) fn serve_stream<'a, S>(
     prepared: Arc<Prepared>,
     ctx: Arc<forward::Context>,
     tag: &'a str,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'a,
@@ -281,7 +281,7 @@ async fn serve_stream_impl<S>(
     prepared: Arc<Prepared>,
     ctx: Arc<forward::Context>,
     tag: &str,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -342,7 +342,7 @@ async fn serve_tunnel<S>(
     mode: Mode,
     first: Request,
     first_early: Vec<u8>,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,

@@ -63,10 +63,26 @@ async fn main() -> std::process::ExitCode {
         .lossy(true)
         .finish(std::io::stderr());
     use tracing_subscriber::{Layer, prelude::*};
-    // 协议库原生日志可能包含EIH/身份哈希；只保留内核的脱敏、限速错误分类。
-    let filter = tracing_subscriber::filter::Targets::new()
-        .with_default(tracing::Level::INFO)
-        .with_target("shadowsocks", tracing::level_filters::LevelFilter::OFF);
+    // 日志级别由 `DUBHE_LOG` 控制（语法同 `RUST_LOG`，例如
+    // `DUBHE_LOG=debug` 或 `DUBHE_LOG=dubhe=trace,quinn=warn`）。
+    //
+    // 为什么不用 `RUST_LOG`：那是 reqwest/rustls 等第三方库的约定，多个
+    // 依赖都会读它，容易互相干扰；用一个项目自己的变量更可控。
+    //
+    // 未设置时保持 INFO，与历史行为一致。shadowsocks 一律关闭：协议库的
+    // 原生日志可能包含 EIH/身份哈希。
+    let filter = match std::env::var("DUBHE_LOG") {
+        Ok(value) if !value.trim().is_empty() => {
+            tracing_subscriber::filter::EnvFilter::try_new(&value)
+                .unwrap_or_else(|error| {
+                    eprintln!("DUBHE_LOG 无效（{error}），回退到 info");
+                    tracing_subscriber::filter::EnvFilter::new("info")
+                })
+                .add_directive("shadowsocks=off".parse().expect("静态指令"))
+        }
+        _ => tracing_subscriber::filter::EnvFilter::new("info")
+            .add_directive("shadowsocks=off".parse().expect("静态指令")),
+    };
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()

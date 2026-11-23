@@ -253,7 +253,7 @@ pub(crate) async fn serve(
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
     pool: Arc<Pool>,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
     stop: CancellationToken,
     force: CancellationToken,
 ) -> io::Result<()> {

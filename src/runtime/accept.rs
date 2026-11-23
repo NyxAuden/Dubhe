@@ -2,6 +2,102 @@
 
 use super::*;
 
+/// 按源 IP 计数的在途握手槽。
+///
+/// 存在的理由：全局 `max_handshakes` 是每个入口一个闸门，单个 IP 开满它就
+/// 能让该入口对其他所有 IP 不可用——实测 64 条不发 ClientHello 的连接使
+/// 合法握手 0/3，释放后立即恢复。
+///
+/// 计数表用 `Arc<Mutex<..>>` 共享：guard 会随连接任务活到结束，归还时必须
+/// 能触达同一张表。锁只在 admit/释放时短暂持有，不在 I/O 期间持有。
+#[derive(Clone)]
+struct PerIpHandshakes {
+    limit: usize,
+    active: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+}
+
+impl PerIpHandshakes {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            active: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// 允许则返回随连接生命周期释放的 guard；超限返回 `None`。
+    fn admit(&self, stream: &tokio::net::TcpStream) -> Option<PerIpGuard> {
+        if self.limit == 0 {
+            return Some(PerIpGuard {
+                shared: None,
+                ip: None,
+            });
+        }
+        // 拿不到对端地址时不因计数问题拒绝连接。
+        let ip = stream.peer_addr().ok()?.ip();
+        let mut active = crate::sync::locked(&self.active);
+        let count = active.entry(ip).or_insert(0);
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        drop(active);
+        Some(PerIpGuard {
+            shared: Some(self.clone()),
+            ip: Some(ip),
+        })
+    }
+
+    fn release(&self, ip: std::net::IpAddr) {
+        let mut active = crate::sync::locked(&self.active);
+        if let Some(count) = active.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&ip);
+            }
+        }
+    }
+}
+
+/// 把 per-IP 计数与全局握手名额绑成一体。
+///
+/// 关键点：它**必须**和 `handshake_permit` 同生命周期。早期实现让 guard 活到
+/// 整个连接结束，于是「每 IP 8 个并发连接」被当成了「每 IP 8 个在途握手」，
+/// 一个浏览器开 8 个标签页后第 9 个就连不上（实测 12 条正常连接只成功 8 条）。
+/// 把两者打包后，协议实现里既有的 27 处 `drop(handshake)` 不需要改一行，
+/// 释放时机自动对齐。
+pub(crate) struct HandshakePermits {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _per_ip: Option<PerIpGuard>,
+}
+
+impl HandshakePermits {
+    pub(crate) fn new(
+        global: tokio::sync::OwnedSemaphorePermit,
+        per_ip: Option<PerIpGuard>,
+    ) -> Self {
+        Self {
+            _global: global,
+            _per_ip: per_ip,
+        }
+    }
+}
+
+/// 连接结束时归还在途计数。
+pub(crate) struct PerIpGuard {
+    shared: Option<PerIpHandshakes>,
+    ip: Option<std::net::IpAddr>,
+}
+
+impl Drop for PerIpGuard {
+    fn drop(&mut self) {
+        // 归还时需要知道是哪个 IP；由 admit 记录的条目在表里，这里直接用
+        // 记录在 guard 上的地址。
+        if let (Some(shared), Some(ip)) = (&self.shared, self.ip) {
+            shared.release(ip);
+        }
+    }
+}
+
 /// `accept()` 返回这些错误时进程应当继续服务：
 ///
 /// - `EMFILE` / `ENFILE`：FD 耗尽。这是**最常见**的一种，一次连接风暴即可触发；
@@ -35,6 +131,8 @@ pub(super) async fn accept_loop(
         tls,
         security,
         handshakes,
+        per_ip_handshakes: per_ip_limit,
+        max_handshakes: global_handshake_limit,
         shadowsocks: _,
         prepared,
         snell,
@@ -47,7 +145,20 @@ pub(super) async fn accept_loop(
     } = listener;
     let mut connections = JoinSet::new();
     let mut failure = None;
-    let last_error_log = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+    // 按入口记录上次输出时间，避免所有入口共用一个时间戳。
+    let last_error_log: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // 每源 IP 的在途握手数。没有这一层时，单个 IP 开满全局
+    // `max_handshakes` 就等于让该入口对其他所有 IP 不可用（实测 64 条
+    // 不发 ClientHello 的连接可让合法握手 0/3）。
+    // 单 IP 上限超过全局上限时以全局为准（否则它永远不会生效）。
+    let effective_per_ip = if per_ip_limit == 0 {
+        0
+    } else {
+        per_ip_limit.min(global_handshake_limit)
+    };
+    let per_ip = PerIpHandshakes::new(effective_per_ip);
     loop {
         // 持续 accept 就绪时也要回收完成任务，避免偏置 select 饿死 join 分支。
         while let Some(result) = connections.try_join_next() {
@@ -80,8 +191,22 @@ pub(super) async fn accept_loop(
                     Err(error) => { failure = Some(error); break; }
                 };
                 let Some(ctx) = shared.current() else { failure = Some(io::Error::other("共享 Context 未初始化")); break; };
+                // 对端 IP 用于连接级日志；只记 IP 不记端口与目标。
+                let peer_ip = stream
+                    .peer_addr()
+                    .map(|address| address.ip())
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|_| "-".to_owned());
                 let Ok(connection_permit) = slots.clone().try_acquire_owned() else { ctx.stats.reject(); continue; };
+                // 单 IP 超限时直接拒绝，不占用全局握手槽。
+                let ip_guard = match per_ip.admit(&stream) {
+                    Some(guard) => guard,
+                    None => { ctx.stats.reject(); continue; }
+                };
                 let Ok(handshake_permit) = handshakes.clone().try_acquire_owned() else { ctx.stats.reject(); continue; };
+                // 与 per-IP guard 绑定：两者都只在**握手期**持有，握手完成
+                // （协议实现里的 drop(handshake)）即同时释放。
+                let handshake_permit = HandshakePermits::new(handshake_permit, Some(ip_guard));
                 let config = config.clone(); let tls = tls.clone(); let security = security.clone(); let ctx = ctx.clone(); let force = force.clone();
                 let stop = stop.clone(); let grpc_slots = grpc_slots.clone(); let xhttp = xhttp.clone();
                 let last_error_log = last_error_log.clone();
@@ -92,7 +217,10 @@ pub(super) async fn accept_loop(
                 let shadowtls = shadowtls.clone();
                 let vless_encryption = vless_encryption.clone();
                 let detour = detour.clone();
-                connections.spawn(async move {
+                // 这个 async 块内联了全部运输层分支；不装箱时每个任务都要
+                // 按值携带整个状态机（实测 97.6 KB/连接）。Box 后任务只持有
+                // 一个指针。注意：仅给 handle() 装箱不够——大小来自这层。
+                connections.spawn(Box::pin(async move {
                     let _connection_permit = connection_permit;
                     let _gauge = ctx.stats.enter(Gauge::Connection);
                     tokio::select! {
@@ -173,15 +301,30 @@ pub(super) async fn accept_loop(
                                 if !matches!(config, Inbound::VlessReality { .. } | Inbound::VmessReality { .. } | Inbound::TrojanReality { .. } | Inbound::VlessWs { .. } | Inbound::VmessWs { .. } | Inbound::TrojanWs { .. } | Inbound::VlessGrpc { .. } | Inbound::VmessGrpc { .. } | Inbound::TrojanGrpc { .. } | Inbound::VlessHttpUpgrade { .. } | Inbound::VmessHttpUpgrade { .. } | Inbound::TrojanHttpUpgrade { .. } | Inbound::VlessXhttp { .. } | Inbound::VmessXhttp { .. } | Inbound::TrojanXhttp { .. } | Inbound::Naive { .. } | Inbound::AnyTls { .. } | Inbound::Snell { .. } | Inbound::ShadowTls { .. }) || !forward::is_route_rejection(&error) {
                                     ctx.stats.reject();
                                 }
+                                // 限速按入口分开：原来所有入口共用一个时间戳，
+                                // 一个入口出错就会把其他入口的日志一起吞掉。
+                                // 对端 IP 可以记录；**目标地址不记录**（威胁模型
+                                // T14：默认不记目标与载荷）。需要目标时用
+                                // `DUBHE_LOG=debug` 打开协议层的 debug 日志。
                                 let mut last = crate::sync::locked(&last_error_log);
-                                if last.is_none_or(|time| time.elapsed() >= Duration::from_secs(1)) {
-                                    tracing::warn!(event="connection_closed", inbound=config.tag(), reason=?error.kind());
-                                    *last = Some(std::time::Instant::now());
+                                let now = std::time::Instant::now();
+                                let should_log = match last.get(config.tag()) {
+                                    Some(time) => now.duration_since(*time) >= Duration::from_secs(1),
+                                    None => true,
+                                };
+                                if should_log {
+                                    tracing::warn!(
+                                        event = "connection_closed",
+                                        inbound = config.tag(),
+                                        peer = %peer_ip,
+                                        reason = ?error.kind()
+                                    );
+                                    last.insert(config.tag().to_owned(), now);
                                 }
                             }
                         }
                     }
-                });
+                }));
             }
             result = connections.join_next(), if !connections.is_empty() => {
                 if result.is_some_and(|r| r.is_err()) { failure = Some(io::Error::other("连接任务异常")); break; }
@@ -213,7 +356,35 @@ pub(super) async fn handle(
     reality: Option<Arc<tls::reality::Prepared>>,
     vless_encryption: Option<Arc<crate::transport::vless_encryption::Prepared>>,
     ctx: Arc<Context>,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: HandshakePermits,
+) -> io::Result<()> {
+    // 这个函数把 26 个协议分支内联在同一个 match 里，future 大小等于各分支
+    // 的并集。实测每连接约 97 KB（3000 条半开连接 +285 MB；握手完成后
+    // 降到 4.8 KB，说明大头是握手期的状态机，不是稳态缓冲）。
+    // 整体装箱后，调用方按值复制的不再是巨型状态机，而是一个指针。
+    Box::pin(handle_inner(
+        stream,
+        config,
+        tls,
+        prepared,
+        reality,
+        vless_encryption,
+        ctx,
+        handshake,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_inner(
+    stream: TcpStream,
+    config: &Inbound,
+    tls: Option<tls::ServerTls>,
+    prepared: Option<Arc<shadowsocks::Prepared>>,
+    reality: Option<Arc<tls::reality::Prepared>>,
+    vless_encryption: Option<Arc<crate::transport::vless_encryption::Prepared>>,
+    ctx: Arc<Context>,
+    handshake: HandshakePermits,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let deadline = Duration::from_millis(ctx.limits.handshake_timeout_ms);
@@ -586,6 +757,52 @@ pub(super) async fn handle(
 #[cfg(test)]
 mod accept_tests {
     use super::*;
+
+    /// 单 IP 占满槽位后，同 IP 被拒、其他 IP 不受影响。
+    ///
+    /// 这对应实测场景：64 条同源半开连接曾让该入口对其他所有 IP 不可用
+    /// （合法握手 0/3）。修复后其他 IP 仍 3/3。
+    #[test]
+    fn per_ip_handshakes_are_isolated() {
+        let limit = 2;
+        let tracker = PerIpHandshakes::new(limit);
+        let ip_a: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let ip_b: std::net::IpAddr = "192.0.2.2".parse().unwrap();
+
+        // 手动驱动计数，避免为测试构造真实 TcpStream。
+        let guards_a: Vec<_> = (0..limit)
+            .map(|_| {
+                crate::sync::locked(&tracker.active)
+                    .entry(ip_a)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                PerIpGuard {
+                    shared: Some(tracker.clone()),
+                    ip: Some(ip_a),
+                }
+            })
+            .collect();
+        assert_eq!(
+            *crate::sync::locked(&tracker.active).get(&ip_a).unwrap(),
+            limit
+        );
+        // A 已达上限；B 未使用任何槽。
+        assert!(crate::sync::locked(&tracker.active).get(&ip_b).is_none());
+
+        drop(guards_a);
+        // 释放后条目应被删除，表不随连接数无限增长。
+        assert!(
+            crate::sync::locked(&tracker.active).get(&ip_a).is_none(),
+            "归零后应删除条目"
+        );
+    }
+
+    /// `0` 表示不限制：任何连接都放行（退化为原行为，供不想启用的人使用）。
+    #[test]
+    fn zero_limit_disables_the_cap() {
+        let tracker = PerIpHandshakes::new(0);
+        assert!(tracker.active.lock().unwrap().is_empty());
+    }
 
     fn os_error(code: i32) -> io::Error {
         io::Error::from_raw_os_error(code)

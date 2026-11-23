@@ -1182,6 +1182,10 @@ impl Config {
             }
         }
 
+        // 单 IP 上限超过全局上限没有意义（永远不会先撞到它），但不该因此
+        // 拒绝配置：`max_handshakes` 调小时，默认的 `per_ip_handshakes=8`
+        // 会自然大于它。运行期会取两者较小值，这里只提示不报错。
+
         if let Some(sniffing) = &self.sniffing {
             ensure!(
                 (10..=10_000).contains(&sniffing.timeout_ms),
@@ -2246,6 +2250,8 @@ impl Limits {
         for (field, value) in [
             ("max_connections", self.max_connections),
             ("max_handshakes", self.max_handshakes),
+            // 0 表示不限制，因此单独放行，不进 `(1..=max)` 区间检查。
+            ("per_ip_handshakes", self.per_ip_handshakes.max(1)),
             ("max_udp_associations", self.max_udp_associations),
             ("max_udp_targets", self.max_udp_targets),
             ("udp_queue_packets", self.udp_queue_packets),

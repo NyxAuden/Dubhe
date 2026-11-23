@@ -94,7 +94,7 @@ pub(crate) async fn serve(
                     let _slot=slot;let _gauge=ctx.stats.enter(Gauge::Connection);
                     let wait=Duration::from_millis(ctx.limits.handshake_timeout_ms);
                     let Ok(Ok(connection))=timeout(wait,incoming).await else {return};
-                    if let Err(error)=serve_connection(connection,&tag,&users,ctx,handshake,streams,stop,force).await {
+                    if let Err(error)=serve_connection(connection,&tag,&users,ctx,crate::runtime::HandshakePermits::new(handshake, None),streams,stop,force).await {
                         tracing::debug!(?error,"Naive H3连接结束");
                     }
                 }));
@@ -122,7 +122,7 @@ async fn serve_connection(
     tag: &str,
     users: &[User],
     ctx: Arc<Context>,
-    handshake: tokio::sync::OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
     slots: Arc<Semaphore>,
     stop: CancellationToken,
     force: CancellationToken,

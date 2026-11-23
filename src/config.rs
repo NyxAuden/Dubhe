@@ -1696,11 +1696,27 @@ pub struct PortRange {
     pub end: u16,
 }
 
+/// 单个源 IP 的默认握手槽上限。
+///
+/// 取 `max_handshakes`(64) 的 1/8：单个 IP 仍可并发握手 8 条（足够正常客户端
+/// 的并发），而占不满全局闸门，其他 IP 始终有槽可用。
+fn default_per_ip_handshakes() -> usize {
+    8
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_connections: usize,
     pub max_handshakes: usize,
+    /// 单个源 IP 同时可占用的握手槽上限。
+    ///
+    /// `max_handshakes` 是每个入口的**全局**闸门：一个 IP 开满它就等于
+    /// 让该入口对其他所有 IP 不可用（实测 64 条不发 ClientHello 的连接可让
+    /// 合法握手 0/3）。这个字段给单个源 IP 单独设上限，保证握手机会不被
+    /// 一方独占。`0` 表示不限制（退化为原行为）。
+    #[serde(default = "default_per_ip_handshakes")]
+    pub per_ip_handshakes: usize,
     pub max_grpc_streams: usize,
     pub max_grpc_streams_per_connection: usize,
     pub max_xhttp_sessions: usize,
@@ -1729,6 +1745,7 @@ impl Default for Limits {
         Self {
             max_connections: 1024,
             max_handshakes: 64,
+            per_ip_handshakes: 8,
             max_grpc_streams: 256,
             max_grpc_streams_per_connection: 16,
             max_xhttp_sessions: 256,

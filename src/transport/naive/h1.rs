@@ -10,7 +10,7 @@ pub(super) fn serve<'a, S>(
     users: &'a [crate::config::User],
     ctx: Arc<Context>,
     deadline: Instant,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
 ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,

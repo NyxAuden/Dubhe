@@ -12,7 +12,7 @@ use http::{HeaderValue, Response, StatusCode};
 use prost::bytes::Bytes;
 use tokio::io::AsyncRead;
 use tokio::net::TcpStream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -30,7 +30,7 @@ pub(crate) async fn serve(
     config: Inbound,
     tls: Option<crate::tls::ServerTls>,
     ctx: Arc<Context>,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
     global_streams: Arc<Semaphore>,
     stop: CancellationToken,
     force: CancellationToken,
@@ -86,7 +86,7 @@ async fn serve_h2<S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
     users: &[crate::config::User],
     ctx: &Arc<Context>,
     deadline: Instant,
-    handshake: OwnedSemaphorePermit,
+    handshake: crate::runtime::HandshakePermits,
     global_streams: Arc<Semaphore>,
     stop: CancellationToken,
     force: CancellationToken,
