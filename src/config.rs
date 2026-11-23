@@ -647,6 +647,24 @@ pub struct VlessUser {
     pub uuid: String,
     #[serde(default)]
     pub flow: VlessFlow,
+    /// Xray `users[].reverse: { tag }`：该用户的命令 4 连接成为反向隧道，
+    /// 并归属到 `tag` 指向的 `reverse` 出站。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverse: Option<ReverseTag>,
+}
+
+impl VlessUser {
+    /// 该用户是否被允许建立反向隧道。
+    pub fn reverse_tag(&self) -> Option<&str> {
+        self.reverse.as_ref().map(|reverse| reverse.tag.as_str())
+    }
+}
+
+/// Xray 的 `reverse: { tag: "..." }` 结构。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReverseTag {
+    pub tag: String,
 }
 
 impl fmt::Debug for VlessUser {
@@ -656,6 +674,7 @@ impl fmt::Debug for VlessUser {
             .field("name", &self.name)
             .field("uuid", &"[REDACTED]")
             .field("flow", &self.flow)
+            .field("reverse", &self.reverse_tag())
             .finish()
     }
 }

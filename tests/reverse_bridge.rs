@@ -104,6 +104,60 @@ async fn bridge_relays_portal_traffic_over_plain_vless() {
     assert_reverse_relay(portal, bridge).await;
 }
 
+/// Portal 用户在 `users[].reverse.tag` 里声明归属（Xray 写法）。
+///
+/// 关键点：这条配置**故意不给 `v1.rvs.cool` 配路由规则**，并让默认路由
+/// 指向 `direct`。如果实现仍然依赖路由匹配，命令 4 会落到 `direct`、
+/// 拿不到 reverse 出站，隧道建立失败；只有真正读取了 `reverse.tag`，
+/// 中继才能通。
+fn portal_config_with_user_reverse() -> Value {
+    let mut value = portal_config(None, false);
+    value["inbounds"][0]["users"] =
+        json!([{"name": "u", "uuid": UUID, "reverse": {"tag": "portal"}}]);
+    // 移除路由规则：归属必须来自用户声明，而不是域名匹配。
+    value["route"] = json!({"default": "direct"});
+    value
+}
+
+#[tokio::test]
+async fn portal_accepts_xray_style_user_reverse_tag() {
+    let portal = Running::start(portal_config_with_user_reverse()).await;
+    let bridge = Running::start(bridge_config(portal.address, None, false)).await;
+    assert_reverse_relay(portal, bridge).await;
+}
+
+/// 用户声明的 tag 没有对应的 `reverse` 出站时，必须在**配置加载阶段**拒绝，
+/// 而不是等到运行期命令 4 才失败。
+#[test]
+fn portal_rejects_unknown_user_reverse_tag() {
+    let mut value = portal_config(None, false);
+    value["inbounds"][0]["users"] =
+        json!([{"name": "u", "uuid": UUID, "reverse": {"tag": "does-not-exist"}}]);
+    // 校验在配置解析阶段完成，不等到 Server::check。
+    let error = dubhe::Config::from_json(&value.to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("reverse.tag") && error.contains("不存在的出站"),
+        "错误信息应指出 reverse.tag 引用了不存在的出站，实际：{error}"
+    );
+}
+
+/// tag 指向非 `reverse` 出站时同样拒绝。
+#[test]
+fn portal_rejects_user_reverse_tag_pointing_to_non_reverse_outbound() {
+    let mut value = portal_config(None, false);
+    value["inbounds"][0]["users"] =
+        json!([{"name": "u", "uuid": UUID, "reverse": {"tag": "direct"}}]);
+    let error = dubhe::Config::from_json(&value.to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("必须指向 reverse 出站"),
+        "错误信息应指出类型不符，实际：{error}"
+    );
+}
+
 #[tokio::test]
 async fn bridge_relays_portal_udp_over_mux() {
     let portal = Running::start(portal_config(None, false)).await;

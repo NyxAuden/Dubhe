@@ -2055,6 +2055,30 @@ impl Config {
                 "reverse_bridges[{index}].outbound 必须是 vless 出站"
             );
         }
+        // Xray 写法 `users[].reverse.tag`：声明的 tag 必须指向一个 `reverse`
+        // 出站，否则命令 4 在运行期才报错。
+        for (index, inbound) in self.inbounds.iter().enumerate() {
+            let users = match inbound {
+                Inbound::Vless { users, .. } | Inbound::VlessReality { users, .. } => users,
+                _ => continue,
+            };
+            for (user_index, user) in users.iter().enumerate() {
+                let Some(reverse) = user.reverse.as_ref() else {
+                    continue;
+                };
+                ensure!(
+                    valid_tag(&reverse.tag),
+                    "inbounds[{index}].users[{user_index}].reverse.tag 格式无效"
+                );
+                let target = outbound_by_tag.get(reverse.tag.as_str()).ok_or_else(|| {
+                    anyhow!("inbounds[{index}].users[{user_index}].reverse.tag 引用了不存在的出站")
+                })?;
+                ensure!(
+                    target.kind == OutboundKind::Reverse,
+                    "inbounds[{index}].users[{user_index}].reverse.tag 必须指向 reverse 出站"
+                );
+            }
+        }
         Ok(())
     }
 }

@@ -9,20 +9,33 @@ use super::*;
 pub(super) const REVERSE_TARGET: &str = "v1.rvs.cool";
 
 /// 把已认证的反向连接交给对应的 `reverse` 出站 portal。
-pub(super) fn serve_reverse<S>(stream: S, inbound: &str, ctx: Arc<Context>) -> io::Result<()>
+pub(super) fn serve_reverse<S>(
+    stream: S,
+    inbound: &str,
+    declared: Option<&str>,
+    ctx: Arc<Context>,
+) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let target = Target {
-        host: Host::Domain(REVERSE_TARGET.to_owned()),
-        port: 0,
-    };
-    let selected = ctx.router.select_outbound(inbound, Network::Tcp, &target);
-    let Some(tag) = selected.reverse else {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "反向 Mux 连接未命中 reverse 出站",
-        ));
+    // 优先用 `users[].reverse.tag` 声明的归属（Xray 写法）；
+    // 未声明时回退到路由匹配，兼容既有 `reverse_bridges` 配置。
+    let tag = match declared {
+        Some(tag) => std::sync::Arc::<str>::from(tag),
+        None => {
+            let target = Target {
+                host: Host::Domain(REVERSE_TARGET.to_owned()),
+                port: 0,
+            };
+            let selected = ctx.router.select_outbound(inbound, Network::Tcp, &target);
+            let Some(tag) = selected.reverse else {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "反向 Mux 连接未命中 reverse 出站",
+                ));
+            };
+            tag
+        }
     };
     ctx.reverse.attach(&tag, stream, &ctx)
 }
@@ -40,18 +53,19 @@ pub(super) async fn serve_controlled_vless<
     // 认证已完成：把之后的客户端字节归到该用户；Vision/Mux 共用同一承载。
     let user = match &accepted.accepted {
         vless::Accepted::Single(request) => request.user.clone(),
-        vless::Accepted::Mux { user } | vless::Accepted::Reverse { user } => Some(user.clone()),
+        vless::Accepted::Mux { user } | vless::Accepted::Reverse { user, .. } => Some(user.clone()),
     };
-    if matches!(accepted.accepted, vless::Accepted::Reverse { .. }) {
+    if let vless::Accepted::Reverse { tag: declared, .. } = &accepted.accepted {
+        let declared = declared.clone();
         timeout(deadline, vless::reply(&mut stream))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "应答超时"))??;
         return match accepted.vision {
             Some(uuid) => {
                 let stream = tls::vision::Vision::new(stream, uuid);
-                serve_reverse(stream, tag, ctx)
+                serve_reverse(stream, tag, declared.as_deref(), ctx)
             }
-            None => serve_reverse(stream, tag, ctx),
+            None => serve_reverse(stream, tag, declared.as_deref(), ctx),
         };
     }
     // 命令 3 与「命令 1 + v1.mux.cool」都进入复用层；Vision 包装保持不变。
@@ -168,18 +182,19 @@ pub(super) async fn serve_plain_vision_vless_impl<
     // 认证已完成：把之后的客户端字节归到该用户；Vision/Mux 共用同一承载。
     let user = match &accepted.accepted {
         vless::Accepted::Single(request) => request.user.clone(),
-        vless::Accepted::Mux { user } | vless::Accepted::Reverse { user } => Some(user.clone()),
+        vless::Accepted::Mux { user } | vless::Accepted::Reverse { user, .. } => Some(user.clone()),
     };
-    if matches!(accepted.accepted, vless::Accepted::Reverse { .. }) {
+    if let vless::Accepted::Reverse { tag: declared, .. } = &accepted.accepted {
+        let declared = declared.clone();
         timeout(deadline, vless::reply(&mut stream))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "应答超时"))??;
         return match accepted.vision {
             Some(uuid) => {
                 let stream = tls::vision::Vision::new_plain(stream, uuid);
-                serve_reverse(stream, tag, ctx)
+                serve_reverse(stream, tag, declared.as_deref(), ctx)
             }
-            None => serve_reverse(stream, tag, ctx),
+            None => serve_reverse(stream, tag, declared.as_deref(), ctx),
         };
     }
     // 命令 3 与「命令 1 + v1.mux.cool」都进入复用层；Vision 包装保持不变。
@@ -624,14 +639,15 @@ pub(crate) async fn serve_plain_vless_scoped<
     // 认证已完成：之后所有客户端字节都归到该用户；Mux 子流共用同一承载。
     let user = match &accepted {
         vless::Accepted::Single(request) => request.user.clone(),
-        vless::Accepted::Mux { user } | vless::Accepted::Reverse { user } => Some(user.clone()),
+        vless::Accepted::Mux { user } | vless::Accepted::Reverse { user, .. } => Some(user.clone()),
     };
     let mut stream = ctx.stats.count_user(tag, user.as_deref(), stream);
-    if matches!(accepted, vless::Accepted::Reverse { .. }) {
+    if let vless::Accepted::Reverse { tag: declared, .. } = &accepted {
+        let declared = declared.clone();
         timeout(deadline, vless::reply(&mut stream))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "应答超时"))??;
-        return serve_reverse(stream, tag, ctx);
+        return serve_reverse(stream, tag, declared.as_deref(), ctx);
     }
     let request = match accepted {
         vless::Accepted::Single(request) => request,

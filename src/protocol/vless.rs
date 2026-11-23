@@ -19,8 +19,12 @@ pub enum Accepted {
         user: String,
     },
     /// 命令 4：反向 Mux portal 隧道。
+    ///
+    /// `tag` 来自 `users[].reverse.tag`（Xray 写法）；未配置时为 `None`，
+    /// 此时沿用旧行为——由路由规则把 `v1.rvs.cool` 匹配到某个 `reverse` 出站。
     Reverse {
         user: String,
+        tag: Option<String>,
     },
 }
 
@@ -149,8 +153,12 @@ async fn read_request<R: AsyncRead + Unpin>(
         _ => return Err(invalid("VLESS flow、命令或 TLS 版本不匹配")),
     };
     let accepted = if command == 4 {
+        // Xray 语义：只有声明了 `reverse.tag` 的用户才能建立反向隧道。
+        // 未声明时保留旧行为（由路由匹配决定归属），不在这里直接拒绝，
+        // 以免破坏既有 `reverse_bridges` 配置。
         Accepted::Reverse {
             user: user.name.clone(),
+            tag: user.reverse_tag().map(str::to_owned),
         }
     } else if command == 3 {
         // 命令 3 没有基础目标字段；由 Mux 层逐帧解析 network 与目标。
@@ -284,16 +292,19 @@ mod tests {
                 name: "first".into(),
                 uuid: "00000000-0000-0000-0000-000000000000".into(),
                 flow: VlessFlow::None,
+                reverse: None,
             },
             VlessUser {
                 name: "alice".into(),
                 uuid: "00112233-4455-6677-8899-AABBCCDDEEFF".into(),
                 flow: VlessFlow::None,
+                reverse: None,
             },
             VlessUser {
                 name: "last".into(),
                 uuid: "ffffffff-ffff-ffff-ffff-ffffffffffff".into(),
                 flow: VlessFlow::None,
+                reverse: None,
             },
         ]
     }
@@ -479,7 +490,7 @@ mod tests {
                                             assert_eq!(command, 3);
                                             assert_eq!(user, "alice");
                                         }
-                                        Accepted::Reverse { user } => {
+                                        Accepted::Reverse { user, .. } => {
                                             assert_eq!(command, 4);
                                             assert_eq!(user, "alice");
                                         }
@@ -773,6 +784,7 @@ mod tests {
                 name: "invalid".into(),
                 uuid: "non-uuid-secret".into(),
                 flow: VlessFlow::Vision,
+                reverse: None,
             }],
         ] {
             let mut bytes = valid.clone();

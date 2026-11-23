@@ -1,9 +1,27 @@
 # 反向 Mux（Portal 与 Bridge）
 
-状态：**已实现待集中验收**。本实现覆盖 Xray `app/reverse` 的 **Portal** 与 **Bridge** 两种角色：
-Portal 接收 Bridge 主动拨入的命令 4 并登记反向隧道；普通流量经 `reverse` 出站回到
-Bridge 的 Mux 服务端。Bridge 使用顶层 `reverse_bridges` 引用一个标准 `vless` 出站，
-连接断开后按 `reconnect_ms` 重连。
+状态：**已实现待集中验收**。
+
+本实现对应 Xray 的 **VLESS 命令 4** 反向隧道（`RequestCommandRvs = 0x04`），
+也就是官方文档《VLESS Reverse Proxy Examples》描述的 `users[].reverse` 机制，
+**不是** `app/reverse` 的 `tunnel` 入站机制——后者是另一套并存实现
+（固定域名 `v1.rvs.cool`，在 Xray v26.10.31 中仍存在且未标记弃用）。
+
+两者的差别（2026-11-23 核对）：
+
+| | `app/reverse` | 命令 4 / 本项目 |
+|---|---|---|
+| 声明方式 | `tunnel` 入站 + Portal/Bridge | `users[].reverse` 或 `reverse_bridges` |
+| 目标域名 | 固定 `v1.rvs.cool` | 同左（命令 4 的固定目标） |
+| Xray 状态 | 存在，无弃用警告 | 官方文档推荐 |
+
+本实现覆盖 **Portal** 与 **Bridge** 两种角色：Portal 接收 Bridge 主动拨入的
+命令 4 并登记反向隧道；普通流量经 `reverse` 出站回到 Bridge 的 Mux 服务端。
+Bridge 使用顶层 `reverse_bridges` 引用一个标准 `vless` 出站，连接断开后按
+`reconnect_ms` 重连。
+
+> 配置格式差异：Xray 把反向声明写在 `users[].reverse: {tag}` 里，本项目用顶层
+> `reverse_bridges`。两者语义相同但写法不同，Xray 配置不能直接拿来用。
 
 ## 配置
 
