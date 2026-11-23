@@ -29,7 +29,11 @@
 >   ML-KEM-768 种子展开），已用 `xray vlessenc` + `xray x25519 -i` 官方输出
 >   逐字节核对。sing-box/Mihomo 的 VLESS 出站无该字段，用例显式跳过。
 > - **REALITY**（2026-11-22）：Xray v26.10.31 客户端 valid / wrong-uuid
->   通过（TCP）。**只对 Xray 生成用例，这不是偷懒而是协议事实**：
+>   通过（TCP）。**2026-11-23 复跑发现该用例约 50% 概率失败**（连跑 6 次：
+>   3 通过 / 3 失败；失败都在 valid 场景的 TCP 回显前超时，且连
+>   `result.json` 都未写出）。同一命令重复执行结果不一致，且与机器负载
+>   无稳定关系。**查清之前不应把 REALITY 入站记为「通过」**。
+>   **只对 Xray 生成用例，这不是偷懒而是协议事实**：
 >   sing-box 的 `common/tls/reality_client.go` 主动把 X25519MLKEM768 从
 >   `SupportedCurves`/`KeyShare` 里过滤掉，而本内核与 Xray 服务端都硬要求
 >   该 hybrid share（缺了直接回落）；Mihomo 默认也移除，需非默认开关
