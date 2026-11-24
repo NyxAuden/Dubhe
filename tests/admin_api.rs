@@ -358,6 +358,47 @@ async fn users_endpoint_returns_empty_list_without_traffic() {
     assert!(head.starts_with("HTTP/1.1 401"), "{head}");
 }
 
+/// 限额更新的两个参数各自可选，但给了就必须能解析。
+///
+/// 此前两个参数分别 `.ok()`：`quota_bytes=oops&expires_at_ms=123` 返回 200，
+/// 错误字段被静默忽略，调用方以为两个值都生效了。
+#[tokio::test]
+async fn partially_invalid_user_limits_are_rejected() {
+    let server = Running::start(config()).await;
+    let api = server.api_address.expect("API 已绑定");
+
+    for (query, field) in [
+        ("quota_bytes=oops&expires_at_ms=123", "quota_bytes"),
+        ("quota_bytes=123&expires_at_ms=oops", "expires_at_ms"),
+    ] {
+        let (head, body) = request(
+            api,
+            format!(
+                "POST /stats/users/limits?{query} HTTP/1.1\r\nHost: localhost\r\n\
+                 Authorization: Bearer {TOKEN}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 400"), "{query}: {head}");
+        assert!(body.contains(field), "{query}: {body}");
+    }
+
+    // 合法请求仍然成功（没有匹配用户时 updated 为 0）。
+    let (head, body) = request(
+        api,
+        format!(
+            "POST /stats/users/limits?quota_bytes=123 HTTP/1.1\r\nHost: localhost\r\n\
+             Authorization: Bearer {TOKEN}\r\nContent-Length: 0\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(body.contains("updated"), "{body}");
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn user_traffic_is_attributed_after_an_authenticated_socks_connection() {
     let mut config = socks_config();

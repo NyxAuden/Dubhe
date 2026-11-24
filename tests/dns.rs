@@ -354,6 +354,109 @@ async fn delayed_dns(
     (address, task)
 }
 
+/// 只对 `ttl.test.` 的 A 查询应答；TTL 可控，第一次答 `.2`、之后答 `.3`。
+async fn changing_dns(
+    ttl: u32,
+) -> (
+    SocketAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let socket = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let address = socket.local_addr().unwrap();
+    let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = queries.clone();
+    let task = tokio::spawn(async move {
+        let mut buffer = [0u8; 4096];
+        loop {
+            let Ok((length, peer)) = socket.recv_from(&mut buffer).await else {
+                break;
+            };
+            let Ok(request) = Message::from_vec(&buffer[..length]) else {
+                continue;
+            };
+            let query = request.queries[0].clone();
+            if query.name().to_ascii() != "ttl.test." || query.query_type() != RecordType::A {
+                continue;
+            }
+            let seen = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let answer = if seen == 0 {
+                Ipv4Addr::new(127, 0, 0, 2)
+            } else {
+                Ipv4Addr::new(127, 0, 0, 3)
+            };
+            let mut response = Message::response(request.metadata.id, request.metadata.op_code);
+            response.metadata.recursion_desired = true;
+            response.metadata.recursion_available = true;
+            response.add_query(query.clone());
+            response.add_answer(Record::from_rdata(
+                query.name().clone(),
+                ttl,
+                RData::A(A(answer)),
+            ));
+            let _ = socket.send_to(&response.to_vec().unwrap(), peer).await;
+        }
+    });
+    (address, queries, task)
+}
+
+/// `race: true` 的并发后端也必须尊重记录 TTL。
+///
+/// 此前把 Hickory 的结果固定成 60 秒写进外层缓存：TTL=1 的地址一分钟后
+/// 才重新查询，故障切换期间客户端一直用旧地址。
+#[tokio::test]
+async fn race_rule_cache_honours_the_record_ttl() {
+    let (server, queries, task) = changing_dns(1).await;
+    // 并发分支至少要有两个后端才会进入 `Backend::Race`（外层缓存只在那里）；
+    // 第二个服务器只收不回，保证结果始终来自前一个。
+    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let silent_address = silent.local_addr().unwrap();
+    let silent_task = tokio::spawn(async move {
+        let mut buffer = [0u8; 4096];
+        while silent.recv_from(&mut buffer).await.is_ok() {}
+    });
+    let config = Config::from_json(&format!(
+        r#"{{
+            "version": 1,
+            "inbounds": [{{"type":"socks5","tag":"s","listen":"127.0.0.1:0"}}],
+            "outbounds": [{{"type":"direct","tag":"d"}}],
+            "route": {{"default":"d"}},
+            "dns": {{
+                "servers": ["{server}"],
+                "rules": [{{"domain_suffix": ["ttl.test"],
+                            "servers": ["{server}", "{silent_address}"], "race": true}}]
+            }}
+        }}"#
+    ))
+    .unwrap();
+    let dns = Dns::from_config(config.dns.as_ref(), 4, Duration::from_secs(3)).unwrap();
+    let first = dns.resolve(&target("ttl.test")).await.unwrap();
+    assert_eq!(first[0].ip(), Ipv4Addr::new(127, 0, 0, 2));
+    // TTL 内必须复用，不能再查一次。
+    let cached = dns.resolve(&target("ttl.test")).await.unwrap();
+    assert_eq!(cached[0].ip(), Ipv4Addr::new(127, 0, 0, 2));
+    assert_eq!(
+        queries.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "TTL 内的第二次解析不应再发查询"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let second = dns.resolve(&target("ttl.test")).await.unwrap();
+    assert_eq!(
+        second[0].ip(),
+        Ipv4Addr::new(127, 0, 0, 3),
+        "TTL 到期后必须重新查询"
+    );
+    assert_eq!(
+        queries.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "应发生第二次查询"
+    );
+    task.abort();
+    silent_task.abort();
+}
+
 #[tokio::test]
 async fn race_rule_returns_the_first_successful_server() {
     let (slow, slow_task) =

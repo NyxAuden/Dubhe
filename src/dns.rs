@@ -441,7 +441,14 @@ impl Dns {
                 if addresses.is_empty() {
                     return Err(io::Error::new(io::ErrorKind::NotFound, "DNS 无地址"));
                 }
-                Ok((addresses, 60))
+                // 用记录自身的剩余有效期。写死 60 秒会把 TTL=1 的答案复用到
+                // 一分钟后：故障切换时客户端一直拿着旧地址。
+                let ttl = response
+                    .valid_until()
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs()
+                    .min(u64::from(u32::MAX)) as u32;
+                Ok((addresses, ttl))
             }
             Backend::Encrypted(encrypted) => Self::lookup_encrypted(encrypted, domain).await,
             Backend::Race(_) => Err(io::Error::other("DNS 并发后端不得嵌套")),
