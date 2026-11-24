@@ -77,6 +77,10 @@ cargo test --locked --test reference_clients --no-run
 
 每个测试会创建 `.test-artifacts/interop-<client>-<random>/` 并打印该路径。场景子目录保存 `client.json`、`server.json`、`client.log`、测试证书和测试私钥；汇总状态保存在 `result.json`。配置、证书、私钥和日志文件按 `0600` 创建，顶层产物目录由 tempfile 创建；测试不向普通输出打印密码或配置。产物保留供失败定位，包含仅用于本机测试的凭据，不应作为公共日志发布。
 
+`result.json` 的 `status` 有三种：`passed`（实际执行并完成场景）、`failed`、`unsupported`（该客户端没有这个协议或承载；测试直接返回成功，但**不计入**互通覆盖数）。统计互通覆盖时按 `status` 计数，不要用 `cargo test` 输出的 `N passed`。
+
+2026-11-24 全量运行：`78 passed / 0 failed`（66 份 `status:passed` + 12 份 `status:unsupported`），6 线程 92 秒；同一轮的 `tcp_flows=1` 停机断言未复现，断言保留。
+
 每个参考客户端只绑定 `127.0.0.1` 的动态高端口，只向本项目回环 TLS 入口转发。工作目录独立且在启动时为空，环境不继承系统代理变量。Mihomo 禁用 DNS、TUN、NTP、嗅探、进程查找、地理数据自动更新和外部 UI，不使用 GEOIP/GEOSITE 或远程 provider，地理数据备用 URL 也固定到回环地址。
 
 客户端由 RAII 进程守卫管理，正常返回、错误、panic 和总测试超时均执行 kill/wait；正常场景结束后还检查原 TCP/UDP 监听端口可重新绑定。每个测试总时限为 60 秒；该互通测试不安装服务、不修改系统代理，也不操作 Docker。
