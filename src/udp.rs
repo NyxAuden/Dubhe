@@ -504,10 +504,7 @@ impl Association {
             .last_used
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Instant::now();
-        self.ctx.stats.uplink.fetch_add(n as u64, Ordering::Relaxed);
-        if let Some(traffic) = &self.traffic {
-            traffic.add(true, n);
-        }
+        self.count_uplink(n);
         Ok(())
     }
 
@@ -524,9 +521,7 @@ impl Association {
 
     async fn prepare_direct(&mut self, target: &Target) -> io::Result<()> {
         if !self.mappings.contains_key(target) {
-            if self.mappings.len() >= self.ctx.limits.max_udp_targets {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "UDP 目标上限"));
-            }
+            self.ensure_target_capacity(target)?;
             let address = self
                 .ctx
                 .dns
@@ -607,10 +602,7 @@ impl Association {
         self.prepare_reverse(tag, target).await?;
         let sender = &self.reverse.as_ref().expect("反向会话已建立").1;
         sender.send(target, payload).await?;
-        self.ctx
-            .stats
-            .uplink
-            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        self.count_uplink(payload.len());
         Ok(())
     }
 
@@ -658,6 +650,39 @@ impl Association {
         Ok(())
     }
 
+    /// 本关联已占用的逐目标资源数：直连映射 + 逐目标代理隧道。
+    ///
+    /// 文档承诺 `max_udp_targets` 是「每关联，直连与代理目标合计」；两条
+    /// 路径各数各的会让混合路由突破上限。
+    fn target_count(&self) -> usize {
+        let tunnels = match self.relay.as_ref().map(|relay| &relay.uplink) {
+            Some(Uplink::Vless(tunnels)) => tunnels.len(),
+            Some(Uplink::Vmess(tunnels)) => tunnels.len(),
+            _ => 0,
+        };
+        self.mappings.len() + tunnels
+    }
+
+    /// 新目标拨号前统一检查容量；已存在的目标复用，不重复占名额。
+    fn ensure_target_capacity(&self, target: &Target) -> io::Result<()> {
+        if self.mappings.contains_key(target) || self.has_proxy_tunnel(target) {
+            return Ok(());
+        }
+        if self.target_count() >= self.ctx.limits.max_udp_targets {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "UDP 目标上限"));
+        }
+        Ok(())
+    }
+
+    fn has_proxy_tunnel(&self, target: &Target) -> bool {
+        match self.relay.as_ref().map(|relay| &relay.uplink) {
+            Some(Uplink::Vless(tunnels)) => tunnels.contains_key(target),
+            Some(Uplink::Vmess(tunnels)) => tunnels.contains_key(target),
+            Some(Uplink::Datagrams(targets)) => targets.contains_key(target),
+            _ => false,
+        }
+    }
+
     async fn prepare_proxy(&mut self, proxy: ProxyOutbound, target: &Target) -> io::Result<()> {
         if let Some(relay) = &self.relay {
             if relay.proxy != proxy {
@@ -673,12 +698,14 @@ impl Association {
             self.relay.as_ref().map(|relay| &relay.uplink),
             Some(Uplink::Vless(tunnels)) if !tunnels.contains_key(target)
         ) {
+            self.ensure_target_capacity(target)?;
             self.open_vless_tunnel(target).await?;
         }
         if matches!(
             self.relay.as_ref().map(|relay| &relay.uplink),
             Some(Uplink::Vmess(tunnels)) if !tunnels.contains_key(target)
         ) {
+            self.ensure_target_capacity(target)?;
             self.open_vmess_tunnel(target).await?;
         }
         if matches!(self.relay.as_ref().map(|relay| &relay.uplink),
@@ -687,6 +714,20 @@ impl Association {
             self.open_datagram_target(target).await?;
         }
         Ok(())
+    }
+
+    /// 记录一次成功的业务上行：全局计数 + 已认证用户的归因。
+    ///
+    /// 直连、代理、反向三条成功路径必须用同一处记账；只在直连里补用户计数
+    /// 会让代理出站的上行在 `/stats/users` 里恒为 0。
+    fn count_uplink(&self, bytes: usize) {
+        self.ctx
+            .stats
+            .uplink
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        if let Some(traffic) = &self.traffic {
+            traffic.add(true, bytes);
+        }
     }
 
     async fn send_proxy(
@@ -783,10 +824,7 @@ impl Association {
             .last_used
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Instant::now();
-        self.ctx
-            .stats
-            .uplink
-            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        self.count_uplink(payload.len());
         Ok(())
     }
 

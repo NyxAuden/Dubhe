@@ -81,10 +81,15 @@ impl Registry {
     }
 
     pub(crate) fn snapshot(&self) -> Vec<Entry> {
-        let mut entries: Vec<Entry> = self
-            .lock()
-            .values()
-            .filter_map(Weak::upgrade)
+        // 锁内只收集强引用，读元数据与排序都在锁外：如果连接恰好在快照期间
+        // 结束，最后一个 `Arc` 会在锁内析构并触发 `Drop → registry.remove()`，
+        // 那是同一把非重入锁——管理请求会把自己锁死。
+        let connections: Vec<Arc<Connection>> = {
+            let entries = self.lock();
+            entries.values().filter_map(Weak::upgrade).collect()
+        };
+        let mut snapshot: Vec<Entry> = connections
+            .iter()
             .map(|connection| {
                 let mut entry = connection.entry.clone();
                 entry.upload = connection.upload.load(Ordering::Relaxed);
@@ -92,8 +97,8 @@ impl Registry {
                 entry
             })
             .collect();
-        entries.sort_by_key(|entry| entry.id);
-        entries
+        snapshot.sort_by_key(|entry| entry.id);
+        snapshot
     }
 
     /// 请求关闭单条连接；返回是否命中。
@@ -221,6 +226,36 @@ mod tests {
         drop(connection);
         assert!(registry.snapshot().is_empty());
         assert!(!registry.close(id));
+    }
+
+    /// 快照与连接结束并发：不能在持锁时析构最后一个强引用。
+    ///
+    /// 这是真实时序竞态（升级成功 → 外部引用先释放 → `map` 里析构最后一个
+    /// `Arc` → `Drop` 再取同一把锁），单次调用无法稳定命中。这里用压测把
+    /// 窗口撞出来：旧实现下会自锁、测试超时，而不是断言失败。
+    #[test]
+    fn snapshot_never_deadlocks_while_connections_end() {
+        let registry = Arc::new(Registry::default());
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let registry = registry.clone();
+            let done = done.clone();
+            readers.push(std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    let _ = registry.snapshot();
+                }
+            }));
+        }
+        for _ in 0..2_000 {
+            let connection = registry.register("socks", "direct", &target());
+            drop(connection);
+        }
+        done.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert!(registry.snapshot().is_empty());
     }
 
     #[test]
