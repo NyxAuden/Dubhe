@@ -90,12 +90,23 @@
 | 值 | 含义 | 推进 `active_revision` |
 |---|---|---|
 | `pending` | 仍在处理 | 否 |
-| `applied` | 已确认生效 | 是 |
+| `applied` | 已确认生效 | **看 `mode`**（见下） |
 | `rejected` | 配置被拒绝，旧实例继续运行 | 否 |
 | `rolled_back` | **新配置没生效**，旧配置已恢复服务 | 否 |
 | `noop` | 无需动作（例如没有可轮换的 TLS 入口） | 否 |
 
 **`rolled_back` 是部署失败，不是成功。** `200` + `rolled_back` 的组合必须按失败处理。
+
+哪些 `mode` 会推进 `active_revision`：
+
+| `mode` | 推进 | 原因 |
+|---|---|---|
+| `hot` / `metadata` / `rebind` + `applied` | 是 | 运行配置换成新的一版 |
+| `tls` + `applied` | **否** | 只重载证书，配置没换 |
+| `validate` / `noop` / `rejected` / `rolled_back` | 否 | 配置没有生效 |
+
+所以 `tls / applied` 之后 `active_revision` 与 `active_deployment_id` **保持不变**——
+正常续证不能让面板以为部署身份丢了。
 
 ### `error_code`
 
@@ -118,7 +129,9 @@
 {"error_code":"apply_status_unavailable"}
 ```
 
-HTTP 状态 `503`。它表示**无法回答**，不是「还没应用过配置」。CLI `dubhe run` 始终可用。
+HTTP 状态 `503`。它表示**无法回答**，不是「还没应用过配置」。CLI `dubhe run` 始终可用：
+Unix 有 SIGHUP 重载协调器；非 Unix 没有重载路径，但启动状态仍然可信
+（`active_revision: 1`、`last_apply: null`）。
 
 ## 4. 状态转换
 
@@ -136,9 +149,11 @@ HTTP 状态 `503`。它表示**无法回答**，不是「还没应用过配置�
 | 需要重建 | 先 `rebind / pending` | 保留 |
 | 重建成功 | `rebind / applied / null`（新监听就绪后提交） | 推进 |
 | 重建失败，旧配置恢复 | `rebind / rolled_back / candidate_bind_failed` | 保留 |
-| 新旧配置都绑定失败 | 进程退出，API 通常已消失 | — |
+| 新旧配置都绑定失败 | 进程退出，API 通常已消失；日志含稳定码 `rollback_failed` | — |
 
 **`pending` 期间不能假设旧监听在线。** 重绑会先停旧实例。`applied` 直到新监听 `ready` 才提交，所以看到 `applied` 时端口已可用。
+
+**连续重载有屏障**：重建或回退后，内核会先等新监听 `ready` 提交终态，再接受下一次 `SIGHUP`。等待期间仍响应退出信号。所以不会出现「B 已经在服务、状态却仍称 A 生效」。
 
 ## 5. 其他端点的副作用
 

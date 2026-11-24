@@ -264,6 +264,11 @@ async fn rebind_apply_reports_same_instance_and_new_revision() {
         applied["instance_id"], baseline["instance_id"],
         "重建后必须复用同一状态句柄"
     );
+    assert_eq!(
+        applied["active_deployment_id"],
+        deployment_id(0x04),
+        "重建后生效的必须是候选标签"
+    );
 
     // 新端口可用，旧端口不再接受连接。
     assert_eq!(connect_status(next_proxy, echo.address).await, 0);
@@ -290,6 +295,11 @@ async fn rejected_candidates_keep_previous_revision() {
     cli.hangup();
     let broken = cli.wait_apply(api, 0).await;
     assert_eq!(broken["last_apply"]["result"], "rejected", "{broken}");
+    assert_eq!(broken["last_apply"]["mode"], "validate", "{broken}");
+    assert_eq!(
+        broken["last_apply"]["error_code"], "config_invalid",
+        "{broken}"
+    );
     assert_eq!(
         broken["last_apply"]["requested_deployment_id"],
         Value::Null,
@@ -313,6 +323,11 @@ async fn rejected_candidates_keep_previous_revision() {
     cli.hangup();
     let rejected = cli.wait_apply(api, 1).await;
     assert_eq!(rejected["last_apply"]["result"], "rejected", "{rejected}");
+    assert_eq!(rejected["last_apply"]["mode"], "validate", "{rejected}");
+    assert_eq!(
+        rejected["last_apply"]["error_code"], "config_invalid",
+        "{rejected}"
+    );
     assert_eq!(rejected["active_revision"], 1, "{rejected}");
     assert_eq!(
         rejected["last_apply"]["requested_deployment_id"],
@@ -333,6 +348,7 @@ async fn bind_failure_reports_rolled_back_and_keeps_old_revision() {
     let api = reserve_port();
     let mut cli = Cli::spawn(&config(proxy, api, Some(&deployment_id(0x07))));
     cli.wait_ready(proxy).await;
+    let baseline = status(api).await.expect("状态可读");
 
     // 始终占住一个端口，让候选配置无法绑定。
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -351,14 +367,31 @@ async fn bind_failure_reports_rolled_back_and_keeps_old_revision() {
         rolled_back["last_apply"]["error_code"], "candidate_bind_failed",
         "{rolled_back}"
     );
+    assert_eq!(
+        rolled_back["instance_id"], baseline["instance_id"],
+        "回退后仍是同一进程"
+    );
     assert_eq!(rolled_back["active_revision"], 1, "回退不得推进版本");
     assert_eq!(
         rolled_back["active_deployment_id"],
         deployment_id(0x07),
         "回退后生效的仍是旧标签"
     );
-    // 旧配置确实重新服务。
-    assert_eq!(connect_status(proxy, echo.address).await, 0);
+    // 旧配置确实重新服务，且能真实回显（不只是握手成功）。
+    let (mut tunnel, _) = timeout(
+        Duration::from_secs(5),
+        common::socks(
+            1,
+            address(echo.address),
+            SocketAddr::from(([127, 0, 0, 1], proxy)),
+        ),
+    )
+    .await
+    .expect("回退后 SOCKS 建连超时");
+    tunnel.write_all(b"after-rollback").await.unwrap();
+    let mut echoed = [0u8; 14];
+    tunnel.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"after-rollback");
     drop(occupied);
     cli.terminate().await;
 }
@@ -508,4 +541,86 @@ async fn library_instance_reports_status_unavailable() {
     );
     stop.cancel();
     let _ = timeout(WAIT, task).await;
+}
+
+/// 正常证书续期不能推进配置代数，也不能清空部署标签。
+///
+/// 真实运维最常见的一次 HUP 就是这个：配置没变、只是换了证书。若它被算作
+/// 一代，面板会看到 `active_deployment_id` 变成 `null`，误以为部署身份丢失。
+#[tokio::test]
+async fn tls_rotation_keeps_revision_and_deployment_id() {
+    let certificate = Certificate::new();
+    let proxy = reserve_port();
+    let api = reserve_port();
+    let mut inbound = certificate.inbound();
+    inbound["listen"] = json!(format!("127.0.0.1:{proxy}"));
+    let mut value = config(proxy, api, Some(&deployment_id(0x0d)));
+    value["inbounds"] = json!([inbound]);
+    let mut cli = Cli::spawn(&value);
+    cli.wait_ready(proxy).await;
+    let baseline = status(api).await.expect("状态可读");
+    assert_eq!(baseline["active_deployment_id"], deployment_id(0x0d));
+
+    let rotated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    fs::write(certificate.dir.path().join("cert.pem"), rotated.cert.pem()).unwrap();
+    let key = certificate.dir.path().join("key.pem");
+    fs::write(&key, rotated.key_pair.serialize_pem()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    cli.hangup();
+
+    let rotated_status = cli.wait_apply(api, 0).await;
+    assert_eq!(
+        rotated_status["last_apply"]["mode"], "tls",
+        "{rotated_status}"
+    );
+    assert_eq!(
+        rotated_status["last_apply"]["result"], "applied",
+        "{rotated_status}"
+    );
+    assert_eq!(
+        rotated_status["active_revision"], 1,
+        "证书轮换不是一代: {rotated_status}"
+    );
+    assert_eq!(
+        rotated_status["active_deployment_id"],
+        deployment_id(0x0d),
+        "轮换不得清空部署标签: {rotated_status}"
+    );
+    assert_eq!(rotated_status["instance_id"], baseline["instance_id"]);
+    cli.terminate().await;
+}
+
+/// 重建后立刻再来一次 HUP，不能把刚重建那一代的终态挤掉。
+///
+/// 时序：A 在跑 → 重建到 B 成功 → 新 future 尚未轮询 → 第二次 HUP 抢先
+/// `begin()`。旧实现会把 B 的暂存结果判为过期，最终 B 在服务但状态仍称 A。
+#[tokio::test]
+async fn second_hangup_after_rebind_does_not_lose_the_applied_revision() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let proxy = reserve_port();
+    let api = reserve_port();
+    let mut cli = Cli::spawn(&config(proxy, api, Some(&deployment_id(0x0e))));
+    cli.wait_ready(proxy).await;
+
+    let next_proxy = reserve_port();
+    let next = config(next_proxy, api, Some(&deployment_id(0x0f)));
+    cli.write_config(&next);
+    cli.hangup();
+    // 不等终态，紧接着再发一次；第二次是无效候选，应当被拒且不抹掉前一次。
+    cli.hangup();
+
+    let settled = cli.wait_apply(api, 0).await;
+    // 无论先后，最终生效的必须是 B（重建那一版），且 revision 已推进。
+    assert_eq!(settled["active_revision"], 2, "{settled}");
+    assert_eq!(
+        settled["active_deployment_id"],
+        deployment_id(0x0f),
+        "重建结果不得被后续 HUP 挤掉: {settled}"
+    );
+    assert_eq!(connect_status(next_proxy, echo.address).await, 0);
+    cli.terminate().await;
 }

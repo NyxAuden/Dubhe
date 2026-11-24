@@ -19,7 +19,7 @@ use serde::Serialize;
 /// 状态契约版本；与配置文件的 `version` 无关。
 pub const API_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyMode {
     /// 收到重载但候选配置未能读取或未通过校验。
@@ -34,7 +34,7 @@ pub enum ApplyMode {
     Rebind,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyResult {
     /// 正在处理。
@@ -49,7 +49,7 @@ pub enum ApplyResult {
     Noop,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyErrorCode {
     ConfigUnreadable,
@@ -168,7 +168,11 @@ impl ApplyState {
         }
     }
 
-    /// 结束本次尝试。只有 `Applied` 且带标签时才推进 `active_*`。
+    /// 结束本次尝试。
+    ///
+    /// **只有替换了运行配置的模式**才推进 `active_*`：`hot`、`metadata`、
+    /// `rebind`。`tls` 只是重新加载证书，配置本身没换——把它也算一代会让
+    /// 正常续证把 `active_deployment_id` 清空，面板误以为部署身份丢失。
     pub fn finish(
         &self,
         attempt: AttemptId,
@@ -188,11 +192,15 @@ impl ApplyState {
                 .record
                 .as_ref()
                 .and_then(|record| record.requested_deployment_id.clone()),
-            mode,
+            mode: mode.clone(),
             result: result.clone(),
             error_code,
         });
-        if matches!(result, ApplyResult::Applied) {
+        let replaces_configuration = matches!(
+            mode,
+            ApplyMode::Hot | ApplyMode::Metadata | ApplyMode::Rebind
+        );
+        if replaces_configuration && matches!(result, ApplyResult::Applied) {
             inner.revision += 1;
             inner.deployment_id = applied_deployment_id;
         }
@@ -235,6 +243,14 @@ impl ApplyState {
                 staged.deployment_id,
             );
         }
+    }
+
+    /// 是否还有等就绪提交的终态。
+    ///
+    /// 重绑协调器用它作「上一代已确认」的屏障：新实例 ready 之前不再接受
+    /// 下一次 HUP，否则下一次 `begin()` 会把本次暂存结果判为过期。
+    pub fn has_staged(&self) -> bool {
+        self.lock().staged.is_some()
     }
 
     pub fn snapshot(&self) -> StatusSnapshot {
@@ -316,6 +332,26 @@ mod tests {
         let rejected = state.snapshot();
         assert_eq!(rejected.active_revision, 2);
         assert_eq!(rejected.last_apply.as_ref().unwrap().attempt, 2);
+    }
+
+    /// 证书轮换不是配置变更：不能推进代数，也不能清空部署标签。
+    ///
+    /// 此前 `finish` 对所有 `Applied` 都推进，正常续证后 `active_deployment_id`
+    /// 变成 `null`，面板会误以为部署身份丢失。
+    #[test]
+    fn tls_applied_does_not_advance_or_clear_deployment_id() {
+        let id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let state = ApplyState::new(Some(id.to_owned()));
+        let attempt = state.begin();
+        state.finish(attempt, ApplyMode::Tls, ApplyResult::Applied, None, None);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.active_revision, 1, "轮换证书不算一代");
+        assert_eq!(snapshot.active_deployment_id.as_deref(), Some(id));
+        assert_eq!(
+            snapshot.last_apply.as_ref().unwrap().mode,
+            ApplyMode::Tls,
+            "尝试记录仍要反映发生了什么"
+        );
     }
 
     #[test]

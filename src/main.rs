@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -438,7 +438,18 @@ async fn run(path: PathBuf, mut config: Config) -> Result<()> {
                     Err(error) => {
                         tracing::error!(event = "reload_bind", reason = %error);
                         // 回退只恢复旧**配置**，不恢复旧会话与计数器。
-                        let server = Server::bind(config.clone()).await?;
+                        // 旧配置也绑不上时不要伪报 rolled_back：管理口通常
+                        // 已消失，用稳定码留证后退出。
+                        let server = match Server::bind(config.clone()).await {
+                            Ok(server) => server,
+                            Err(fallback) => {
+                                tracing::error!(
+                                    event = "rollback_failed",
+                                    reason = %fallback
+                                );
+                                return Err(fallback);
+                            }
+                        };
                         (
                             server,
                             (
@@ -456,6 +467,19 @@ async fn run(path: PathBuf, mut config: Config) -> Result<()> {
                 hot = next.hot_reload_handle();
                 stop = CancellationToken::new();
                 running = Box::pin(next.with_apply_state(apply.clone()).run(stop.clone()));
+                // 等新实例 ready 提交终态，再重新接受 HUP。否则下一次 `begin()`
+                // 会把本次暂存结果判为过期：B 在服务，状态却仍称 A 生效。
+                // 等待期间仍响应退出与启动失败。
+                tokio::select! {
+                    result = &mut running => return result,
+                    _ = interrupt.recv() => {}
+                    _ = terminate.recv() => {}
+                    _ = async {
+                        while apply.has_staged() {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    } => {}
+                }
                 continue;
             }
         }
@@ -468,7 +492,11 @@ async fn run(path: PathBuf, mut config: Config) -> Result<()> {
 #[cfg(not(unix))]
 async fn run(_path: PathBuf, config: Config) -> Result<()> {
     let stop = CancellationToken::new();
-    let mut running = Box::pin(Server::bind(config).await?.run(stop.clone()));
+    // 非 Unix 没有 SIGHUP，`last_apply` 恒为 `null`；但「启动的是哪一版」
+    // 仍然可知，不能因为缺重载就退化成库实例的 503。
+    let apply = ApplyState::new(config.deployment_id.clone());
+    let server = Server::bind(config).await?.with_apply_state(apply);
+    let mut running = Box::pin(server.run(stop.clone()));
     tokio::select! {
         result = &mut running => result,
         _ = tokio::signal::ctrl_c() => {
