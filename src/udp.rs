@@ -284,7 +284,13 @@ enum Uplink {
         socket: Arc<UdpSocket>,
         _control: Option<crate::forward::RelayControl>,
     },
-    Shadowsocks(Arc<::shadowsocks::relay::udprelay::ProxySocket<::shadowsocks::net::UdpSocket>>),
+    Shadowsocks {
+        socket: Arc<::shadowsocks::relay::udprelay::ProxySocket<::shadowsocks::net::UdpSocket>>,
+        /// AEAD-2022 的发送控制状态：服务端按 (client_session_id, packet_id)
+        /// 做重放窗口，固定 0 会让第一包之后的每个包都被判重放。
+        session: u64,
+        packet: u64,
+    },
     /// Trojan UDP：单条 TCP 隧道，逐包携带目标。
     Trojan(tokio::io::WriteHalf<crate::forward::Upstream>),
     /// VLESS UDP：每个目标一条固定目标隧道。
@@ -359,6 +365,18 @@ struct Association {
     /// 已认证用户的累计字节；未认证路径为 None。
     traffic: Option<Arc<crate::telemetry::UserCounters>>,
 }
+/// AEAD-2022 UDP 的客户端会话标识：非零随机值，服务端按它隔离关联。
+fn random_session_id() -> u64 {
+    loop {
+        let mut bytes = [0u8; 8];
+        aws_lc_rs::rand::fill(&mut bytes).expect("系统随机源不可用");
+        let value = u64::from_be_bytes(bytes);
+        if value != 0 {
+            return value;
+        }
+    }
+}
+
 impl Association {
     fn new(ctx: Arc<Context>, inbound: String) -> (Self, mpsc::Receiver<Packet>) {
         let (tx, rx) = mpsc::channel(ctx.limits.udp_queue_packets);
@@ -749,11 +767,24 @@ impl Association {
                     return Err(io::Error::new(io::ErrorKind::WriteZero, "UDP 不完整发送"));
                 }
             }
-            Uplink::Shadowsocks(socket) => {
+            Uplink::Shadowsocks {
+                socket,
+                session,
+                packet,
+            } => {
                 let address = to_shadowsocks_address(target);
-                socket.send(&address, payload).await.map_err(|error| {
-                    io::Error::other(format!("Shadowsocks UDP 发送失败: {error}"))
-                })?;
+                *packet = packet.wrapping_add(1);
+                // 结构是 non_exhaustive：先 default 再改字段。
+                let mut control =
+                    ::shadowsocks::relay::udprelay::options::UdpSocketControlData::default();
+                control.client_session_id = *session;
+                control.packet_id = *packet;
+                socket
+                    .send_with_ctrl(&address, &control, payload)
+                    .await
+                    .map_err(|error| {
+                        io::Error::other(format!("Shadowsocks UDP 发送失败: {error}"))
+                    })?;
             }
             Uplink::Trojan(write) => {
                 let datagram = crate::protocol::trojan::encode_datagram(target, payload)?;
@@ -973,6 +1004,7 @@ impl Association {
                             io::Error::other(format!("Shadowsocks UDP 连接失败: {error}"))
                         })?,
                 );
+                let client_session = random_session_id();
                 let read = socket.clone();
                 let (tx, session, native, ctx) = self.reader_params();
                 let mut tasks = JoinSet::new();
@@ -982,12 +1014,21 @@ impl Association {
                 tasks.spawn(tracker.track_future(async move {
                     let _lease = lease;
                     let _failure = failure;
+                    let expected_session = client_session;
                     let mut buffer = vec![0; 65536];
                     loop {
-                        let (length, address, _) = match read.recv(&mut buffer).await {
-                            Ok(value) => value,
-                            Err(_) => break,
-                        };
+                        let (length, address, _, control) =
+                            match read.recv_with_ctrl(&mut buffer).await {
+                                Ok(value) => value,
+                                Err(_) => break,
+                            };
+                        // 服务端回包必须属于本关联的客户端会话，避免错投。
+                        if control
+                            .is_some_and(|control| control.client_session_id != expected_session)
+                        {
+                            ctx.stats.drop_packet();
+                            continue;
+                        }
                         if length > ctx.limits.max_udp_payload {
                             ctx.stats.drop_packet();
                             continue;
@@ -1008,7 +1049,11 @@ impl Association {
                 }));
                 self.relay = Some(Relay {
                     proxy,
-                    uplink: Uplink::Shadowsocks(socket),
+                    uplink: Uplink::Shadowsocks {
+                        socket,
+                        session: client_session,
+                        packet: 0,
+                    },
                     tasks,
                     last_used: Arc::new(std::sync::Mutex::new(Instant::now())),
                 });
