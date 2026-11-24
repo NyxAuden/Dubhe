@@ -16,8 +16,9 @@ dubhe check -c dubhe.json
    `ca_file`。转换器要求 `--ca-file`，否则报错。
 2. **未知字段直接拒绝**。上游配置里常见的 `sniffing`、`allocate`、`mux` 等字段
    本项目的对应位置不同，写错不会被静默忽略。
-3. **规则集不解析**。`geosite:` / `geoip:` / `ext:` 需要外部数据，本项目不实现；
-   转换器会跳过并写进报告。
+3. **规则集按引用保留，但要配数据文件**。`geosite:` / `geoip:` 会原样写进
+   `domains` / `ip_cidrs`，运行前必须在 `geo` 段指向 `geosite.dat` / `geoip.dat`；
+   `ext:`（第三方 dat）没有等价字段，转换直接失败。
 
 ## Xray 字段对照
 
@@ -72,11 +73,16 @@ dubhe check -c dubhe.json
 | Xray | 本项目 |
 |---|---|
 | `routing.domainStrategy: "IPIfNonMatch"` | `route.domain_strategy: "ip-if-non-match"` |
-| `routing.rules[].domain: ["example.com"]` | `route.rules[].domains` |
+| `routing.rules[].domain: ["example.com"]` | `route.rules[].domain_keyword` |
 | `domain:example.com` | `domain_suffix` |
+| `full:example.com` | `domains`（精确） |
 | `keyword:ads` | `domain_keyword` |
-| `regexp:` | **不支持** |
-| `geosite:` / `geoip:` | **不支持**，需要自己展开 |
+| `regexp:^ads\.` | `domain_regex` |
+| `dotless:` | `domain_regex: "^[^.]*$"`（同一条正则） |
+| `geosite:google` | `domains: ["geosite:google"]`，需配 `geo.geosite` |
+| `geoip:cn` | `ip_cidrs: ["geoip:cn"]`，需配 `geo.geoip` |
+| `geoip:private` | `ip_is_private: true`（近似映射，需复核） |
+| `ext:xxx.dat:tag` | **拒绝转换**（无等价字段） |
 | `routing.rules[].ip` | `ip_cidrs` |
 | `routing.rules[].port: "80,443-445"` | `ports: [{"start":80,"end":80},{"start":443,"end":445}]` |
 | `routing.rules[].inboundTag` | `inbounds` |
@@ -84,6 +90,20 @@ dubhe check -c dubhe.json
 | `routing.balancers` | **不支持**；改用 `selector` / `urltest` 出站组 |
 | `dns.servers`（字符串或对象数组） | `dns.servers`（字符串数组，见 [usage](usage.md)） |
 | `dns.hosts` | `dns.hosts` |
+
+### 转换器会直接拒绝的项
+
+这些项继续输出会改变流量路径或安全条件，因此 `convert` 失败而不是静默跳过：
+
+- `routing.rules[].ip` 里的 `!cidr`、`ext:`；任一条件被丢弃都会让规则范围变化。
+- `routing.balancers`、`balancerTag`。
+- TCP header 伪装（`tcpSettings.header.type != "none"`）、`sockopt.dialerProxy` 链式代理。
+- TLS 的 `pinnedPeerCertSha256`、`verifyPeerCertByName`、客户端证书（`usage` 非
+  `verify`）、`minVersion: "1.3"`（本项目允许 TLS 1.2）。
+- SOCKS/HTTP 出站的自定义承载、REALITY；Shadowsocks 出站的 TLS。
+- gRPC 同一路径同时注册单流与多流（Xray 允许，本项目无法区分）。
+
+`network: "raw"` 与 `"tcp"` 等价，可以正常转换。
 
 ## sing-box 字段对照
 

@@ -149,13 +149,17 @@ pub struct ExportReport {
 }
 
 impl ExportReport {
-    fn skip(&mut self, target: &str, tag: &str, reason: &str) {
-        self.notes.push(format!("[{target}] 跳过 {tag}：{reason}"));
+    /// 某个目标被跳过的节点数；`skip` 的记录都带 `[target]` 前缀。
+    fn skipped(&self, target: Target) -> usize {
+        let prefix = format!("[{}] 跳过 ", target.name());
+        self.notes
+            .iter()
+            .filter(|note| note.starts_with(&prefix))
+            .count()
     }
 
-    /// 记录一条不针对具体节点的提示。
-    fn note(&mut self, message: &str) {
-        self.notes.push(message.to_owned());
+    fn skip(&mut self, target: &str, tag: &str, reason: &str) {
+        self.notes.push(format!("[{target}] 跳过 {tag}：{reason}"));
     }
 }
 
@@ -1092,12 +1096,39 @@ fn method_name(method: crate::config::ShadowsocksMethod) -> String {
 
 /// 生成目标格式的配置。
 pub fn export(target: Target, nodes: &[Node], report: &mut ExportReport) -> Result<Value> {
-    match target {
-        Target::Xray => Ok(export_xray(nodes, report)),
-        Target::SingBox => Ok(export_sing_box(nodes, report)),
-        Target::Mihomo => Ok(export_mihomo(nodes, report)),
-        Target::Anywhere => Ok(export_anywhere(nodes, report)),
+    let skipped_before = report.skipped(target);
+    let value = match target {
+        Target::Xray => export_xray(nodes, report),
+        Target::SingBox => export_sing_box(nodes, report),
+        Target::Mihomo => export_mihomo(nodes, report),
+        Target::Anywhere => export_anywhere(nodes, report),
+    };
+    // 某个目标把所有节点都跳过时，继续输出只会得到一份「纯直连」的客户端
+    // 配置：用户看到加载成功、目标也能访问，实际上流量根本没走服务器。
+    anyhow::ensure!(
+        report.skipped(target) - skipped_before < nodes.len(),
+        "{} 没有可用节点；拒绝生成纯直连的客户端配置",
+        target.name()
+    );
+    Ok(value)
+}
+
+/// 辅助出站/代理组的名字不能与节点 tag 或固定入站 tag 冲突。
+///
+/// Xray 的 tag 是全局的：入站叫 `socks-in`，用户节点也叫 `direct` 时，
+/// 固定出站 `direct` 会撞名，`xray run -test` 直接失败。
+fn free_name<'a>(base: &str, taken: impl IntoIterator<Item = &'a str>) -> String {
+    let taken: Vec<&str> = taken.into_iter().collect();
+    if !taken.contains(&base) {
+        return base.to_owned();
     }
+    for index in 1.. {
+        let candidate = format!("{base}-{index}");
+        if !taken.contains(&candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!("候选名字无限递增，必然会空闲")
 }
 
 /// Xray 客户端配置：`outbounds` 里每个节点一个 vnext/server。
@@ -1117,12 +1148,15 @@ fn export_xray(nodes: &[Node], report: &mut ExportReport) -> Value {
         .and_then(|value| value.get("tag"))
         .cloned()
         .unwrap_or_else(|| json!("direct"));
+    let direct = free_name(
+        "direct",
+        nodes
+            .iter()
+            .map(|node| node.tag.as_str())
+            .chain(std::iter::once("socks-in")),
+    );
     let mut outbounds = converted;
-    if outbounds.is_empty() {
-        // 没有任何可用节点时，不要产出「看起来能用、其实全直连」的配置。
-        report.note("Xray 导出没有可用节点；生成的客户端将直连，不经过服务器");
-    }
-    outbounds.push(json!({"tag": "direct", "protocol": "freedom"}));
+    outbounds.push(json!({"tag": direct, "protocol": "freedom"}));
     let mut route = json!({"domainStrategy": "AsIs"});
     if primary != json!("direct") {
         route["rules"] = json!([]);
@@ -1185,13 +1219,11 @@ fn xray_outbound(node: &Node) -> std::result::Result<Value, String> {
             }
             stream.insert("wsSettings".into(), Value::Object(ws));
         }
-        Transport::Grpc { ref path, multi } => {
+        Transport::Grpc { ref path, .. } => {
             stream.insert("network".into(), json!("grpc"));
             let mut grpc = Map::new();
-            grpc.insert("serviceName".into(), json!(xray_grpc_name(path)));
-            if multi {
-                grpc.insert("multiMode".into(), json!(true));
-            }
+            // 单流客户端对两条路径都可用；导出只写完整路径，不启用 multiMode。
+            grpc.insert("serviceName".into(), json!(xray_grpc_name(path)?));
             stream.insert("grpcSettings".into(), Value::Object(grpc));
         }
         Transport::HttpUpgrade { ref path, ref host } => {
@@ -1389,11 +1421,15 @@ fn export_sing_box(nodes: &[Node], report: &mut ExportReport) -> Value {
         .and_then(|value| value.get("tag"))
         .cloned()
         .unwrap_or_else(|| json!("direct"));
-    if converted.is_empty() {
-        report.note("sing-box 导出没有可用节点；生成的客户端将直连，不经过服务器");
-    }
+    let direct = free_name(
+        "direct",
+        nodes
+            .iter()
+            .map(|node| node.tag.as_str())
+            .chain(std::iter::once("mixed-in")),
+    );
     let mut outbounds = converted;
-    outbounds.push(json!({"type": "direct", "tag": "direct"}));
+    outbounds.push(json!({"type": "direct", "tag": direct}));
     json!({
         "log": {"level": "warn"},
         "inbounds": [{
@@ -1528,17 +1564,11 @@ fn sing_box_outbound(node: &Node) -> std::result::Result<Value, String> {
             "path": path,
             "headers": host.as_ref().map(|host| json!({"Host": host})).unwrap_or(Value::Null)
         })),
-        Transport::Grpc { ref path, multi } => {
-            if multi {
-                // sing-box 的 grpc transport 只有 service_name，客户端固定请求
-                // /<service>/Tun，没有 Xray 的 TunMulti。
-                return Err("sing-box 没有 gRPC multiMode，无法导出该承载".to_owned());
-            }
-            Some(json!({
-                "type": "grpc",
-                "service_name": plain_grpc_name(path)?
-            }))
-        }
+        Transport::Grpc { ref path, .. } => Some(json!({
+            "type": "grpc",
+            // sing-box 固定拼 `/<service>/Tun`；单流客户端对双路径服务同样可用。
+            "service_name": sing_box_grpc_name(path)?
+        })),
         Transport::HttpUpgrade { ref path, ref host } => Some(json!({
             "type": "httpupgrade",
             "path": path,
@@ -1611,28 +1641,19 @@ fn export_mihomo(nodes: &[Node], report: &mut ExportReport) -> Value {
         .iter()
         .filter_map(|proxy| proxy.get("name").cloned())
         .collect();
-    // 没有代理成员时 Mihomo 拒绝这条 proxy-group（"`use` or `proxies` missing"）；
-    // 此时退化为纯直连配置，仍可加载。
-    if names.is_empty() {
-        return json!({
-            "mixed-port": 7890,
-            "mode": "rule",
-            "log-level": "warning",
-            "proxies": [],
-            "rules": ["MATCH,DIRECT"]
-        });
-    }
+    // 代理组名不能与任一代理同名，否则 Mihomo 报代理组循环。
+    let group = free_name("PROXY", nodes.iter().map(|node| node.tag.as_str()));
     json!({
         "mixed-port": 7890,
         "mode": "rule",
         "log-level": "warning",
         "proxies": proxies,
         "proxy-groups": [{
-            "name": "PROXY",
+            "name": group,
             "type": "select",
             "proxies": names
         }],
-        "rules": ["MATCH,PROXY"]
+        "rules": [format!("MATCH,{group}")]
     })
 }
 
@@ -1764,15 +1785,12 @@ fn mihomo_proxy(node: &Node) -> std::result::Result<Value, String> {
             }
             out.insert("ws-opts".into(), opts);
         }
-        Transport::Grpc { ref path, multi } => {
-            if multi {
-                // Mihomo 的 grpc-opts 只有 grpc-service-name，没有 multiMode。
-                return Err("Mihomo 没有 gRPC multiMode，无法导出该承载".to_owned());
-            }
+        Transport::Grpc { ref path, .. } => {
             out.insert("network".into(), json!("grpc"));
+            // Mihomo 对以 `/` 开头的 service name 原样作为请求路径。
             out.insert(
                 "grpc-opts".into(),
-                json!({"grpc-service-name": plain_grpc_name(path)?}),
+                json!({"grpc-service-name": xray_grpc_name(path)?}),
             );
         }
         Transport::HttpUpgrade { ref path, ref host } => {
@@ -1949,10 +1967,10 @@ fn anywhere_proxy(node: &Node, index: usize) -> std::result::Result<Value, Strin
                 }
                 Some(ws)
             }
-            Transport::Grpc { path, multi } => Some(json!({
+            Transport::Grpc { path, .. } => Some(json!({
                 "type": "grpc",
-                "serviceName": xray_grpc_name(path),
-                "multiMode": multi
+                "serviceName": xray_grpc_name(path)?,
+                "multiMode": false
             })),
             Transport::HttpUpgrade { path, host } => {
                 let mut up = json!({"type": "httpupgrade", "path": path});
@@ -2035,36 +2053,38 @@ fn xhttp_mode(mode: crate::config::Mode) -> &'static str {
 }
 
 /// 判断导出目标是私有地址或私有域名（Xray 允许这类明文出站）。
-/// 本仓库的 `grpc.path` 存**完整 HTTP/2 路径**（`/GunService/Tun`），而
-/// Xray / sing-box / Mihomo 的 `serviceName` 只写服务名，路径由客户端自己拼
-/// `/Tun` 或 `/TunMulti`。导出时把流名去掉，否则客户端会请求
-/// `/GunService%2FTun/Tun`（Xray）或 `/GunService/Tun/Tun`（另两家）。
-fn grpc_service(path: &str) -> Option<&str> {
-    let service = path.strip_prefix('/')?;
-    service
-        .strip_suffix("/Tun")
-        .or_else(|| service.strip_suffix("/TunMulti"))
+/// 本仓库的 `grpc.path` 存**完整 HTTP/2 路径**（`/GunService/Tun`）。
+///
+/// Xray 与 Mihomo 对以 `/` 开头的 `serviceName` 使用原样路径：Xray 在最后一个
+/// `/` 处切出服务前缀、把最后一段当流名，拼回来仍是同一路径；Mihomo 直接当作
+/// 请求路径。因此两者都可以写完整路径，不必猜 `/<service>/Tun` 结构。
+///
+/// 需要 `/<service>/<stream>` 至少两段；含 `%` 时 Xray 会重新转义，路径会变。
+fn xray_grpc_name(path: &str) -> Result<String, String> {
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if segments.len() < 2 || segments[0].is_empty() {
+        return Err(format!(
+            "gRPC 路径 {path} 至少需要 `/<service>/<stream>` 两段，无法导出到这个目标"
+        ));
+    }
+    if path.contains('%') {
+        return Err(format!(
+            "gRPC 路径 {path} 含 `%`，Xray 会重新转义导致路径不同"
+        ));
+    }
+    Ok(path.to_owned())
 }
 
-/// Xray 的 `serviceName`：单段服务名用老式写法；多段或自定义路径按 Xray 的
-/// 新式完整路径原样写出（Xray 会把最后一段当流名）。
-fn xray_grpc_name(path: &str) -> String {
-    match grpc_service(path) {
-        Some(service) if !service.contains('/') => service.to_owned(),
-        _ => path.to_owned(),
-    }
-}
-
-/// sing-box / Mihomo 只能用老式 `serviceName`，也没有 multiMode。
-fn plain_grpc_name(path: &str) -> Result<&str, String> {
-    let service = grpc_service(path).ok_or_else(|| {
-        format!("自定义 gRPC 路径 {path} 无法导出到这个目标（只认 /<service>/Tun）")
-    })?;
-    if service.is_empty() {
-        return Err(format!("gRPC 路径 {path} 缺少服务名，无法导出到这个目标"));
-    }
-    if service.contains('/') {
-        return Err(format!("多段 gRPC 服务名 {service} 只支持 Xray 目标"));
+/// sing-box 固定把 `service_name` 拼成 `/<service>/Tun`，只能表达以 `/Tun` 结尾
+/// 的路径。双路径服务仍然可以用单流客户端。
+fn sing_box_grpc_name(path: &str) -> Result<&str, String> {
+    let service = path
+        .strip_prefix('/')
+        .and_then(|rest| rest.strip_suffix("/Tun"))
+        .filter(|service| !service.is_empty())
+        .ok_or_else(|| format!("sing-box 只能请求 `/<service>/Tun`，gRPC 路径 {path} 无法导出"))?;
+    if service.contains('%') {
+        return Err(format!("gRPC 路径 {path} 含 `%`，无法导出到 sing-box"));
     }
     Ok(service)
 }
@@ -2275,9 +2295,75 @@ mod tests {
         let mut report = ExportReport::default();
         let nodes = nodes(&config, "example.com", &mut report);
         let mut report = ExportReport::default();
-        let value = export(Target::Anywhere, &nodes, &mut report).unwrap();
-        assert_eq!(value["proxies"].as_array().unwrap().len(), 0);
+        let error = export(Target::Anywhere, &nodes, &mut report)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("没有可用节点"), "{error}");
         assert_eq!(report.notes.len(), 2);
+    }
+
+    fn rename_test_node(tag: &str) -> Node {
+        let value = json!({
+            "version": 1,
+            "inbounds": [{
+                "type": "shadowsocks", "tag": tag, "listen": "0.0.0.0:8388",
+                "method": "aes-128-gcm", "password": "rename-password"
+            }],
+            "outbounds": [{"tag": "direct", "type": "direct"}],
+            "route": {"default": "direct"}
+        });
+        let config = Config::from_json(&value.to_string()).expect("配置应合法");
+        let mut report = ExportReport::default();
+        nodes(&config, "example.com", &mut report)
+            .into_iter()
+            .next()
+            .expect("应生成一个节点")
+    }
+
+    /// 用户节点叫 `direct` / `PROXY` 时，辅助出站与代理组必须改名。
+    #[test]
+    fn reserved_names_do_not_collide_with_node_tags() {
+        let node = rename_test_node("direct");
+        let mut report = ExportReport::default();
+        let xray = export(Target::Xray, std::slice::from_ref(&node), &mut report).unwrap();
+        let tags: Vec<&str> = xray["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["tag"].as_str())
+            .collect();
+        assert!(tags.contains(&"direct"), "节点名应保留：{tags:?}");
+        assert!(
+            tags.iter().filter(|tag| **tag == "direct").count() == 1,
+            "辅助出站不能与节点同名：{tags:?}"
+        );
+
+        let sing = export(Target::SingBox, std::slice::from_ref(&node), &mut report).unwrap();
+        let tags: Vec<&str> = sing["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["tag"].as_str())
+            .collect();
+        assert_eq!(
+            tags.iter().filter(|tag| **tag == "direct").count(),
+            1,
+            "{tags:?}"
+        );
+        assert_eq!(sing["route"]["final"], "direct");
+
+        let proxy_named = rename_test_node("PROXY");
+        let mut report = ExportReport::default();
+        let mihomo = export(
+            Target::Mihomo,
+            std::slice::from_ref(&proxy_named),
+            &mut report,
+        )
+        .unwrap();
+        let group = mihomo["proxy-groups"][0]["name"].as_str().unwrap();
+        assert_ne!(group, "PROXY", "代理组不能与代理同名");
+        assert_eq!(mihomo["rules"][0], format!("MATCH,{group}"));
+        assert_eq!(mihomo["proxies"][0]["name"], "PROXY");
     }
 
     #[test]
@@ -2354,6 +2440,17 @@ mod transport_matrix_tests {
         (value, report)
     }
 
+    /// 该目标把所有节点都跳过时，`export` 必须拒绝生成纯直连配置。
+    fn rejected(target: Target, node: &Node) -> ExportReport {
+        let mut report = ExportReport::default();
+        let error = export(target, std::slice::from_ref(node), &mut report).unwrap_err();
+        assert!(
+            error.to_string().contains("没有可用节点"),
+            "{target:?} 应拒绝导出：{error}"
+        );
+        report
+    }
+
     #[test]
     fn mihomo_supports_xhttp() {
         let (value, _) = get(Target::Mihomo, &node_for("xhttp"));
@@ -2395,17 +2492,17 @@ mod transport_matrix_tests {
         }
     }
 
-    /// 本仓库的 `grpc.path` 是完整 HTTP/2 路径（`/TunService/Tun`），而客户端
-    /// 目标的 `serviceName` 只要服务名，路径由客户端自己拼。此前导出
-    /// `TunService/Tun`，Xray 会请求 `/TunService%2FTun/Tun`，Mihomo/sing-box
-    /// 会请求 `/TunService/Tun/Tun`。
+    /// 本仓库的 `grpc.path` 是完整 HTTP/2 路径（`/TunService/Tun`）：
+    /// Xray/Mihomo 原样写完整路径（已用真客户端验证可连通），sing-box 只能写
+    /// `/<service>/Tun` 里的服务名。此前导出 `TunService/Tun`，三家都会请求
+    /// 一个不存在的路径。
     #[test]
-    fn grpc_service_name_strips_the_stream_name() {
+    fn grpc_service_name_is_written_the_way_each_client_needs() {
         let node = node_for("grpc");
         let (xray, _) = get(Target::Xray, &node);
         assert_eq!(
             xray["outbounds"][0]["streamSettings"]["grpcSettings"]["serviceName"],
-            "TunService"
+            "/TunService/Tun"
         );
         let (sing, _) = get(Target::SingBox, &node);
         assert_eq!(
@@ -2415,53 +2512,46 @@ mod transport_matrix_tests {
         let (mihomo, _) = get(Target::Mihomo, &node);
         assert_eq!(
             mihomo["proxies"][0]["grpc-opts"]["grpc-service-name"],
-            "TunService"
+            "/TunService/Tun"
         );
         let (anywhere, _) = get(Target::Anywhere, &node);
         assert_eq!(
             anywhere["proxies"][0]["transport"]["serviceName"],
-            "TunService"
+            "/TunService/Tun"
         );
     }
 
-    /// 多流 gRPC：Xray 用 `serviceName + multiMode`；另两家没有 multiMode。
+    /// 双路径服务：单流客户端仍然可用，三家都应导出单流配置。
     #[test]
-    fn grpc_multi_mode_only_exports_to_xray() {
+    fn dual_path_grpc_still_exports_as_a_single_stream_client() {
         let node = node_from(json!({
             "type": "vless-grpc", "tag": "n", "listen": "0.0.0.0:443",
             "users": [{"name": "a", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
-            "grpc": {"path": "/TunService/TunMulti", "multi_path": "/TunService/Tun"},
+            "grpc": {"path": "/TunService/Tun", "multi_path": "/TunService/TunMulti"},
             "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"
         }));
-        // node_for 里的 multi 标志来自 path 后缀；这里直接确认 Xray 的写法。
         let (xray, _) = get(Target::Xray, &node);
         let grpc = &xray["outbounds"][0]["streamSettings"]["grpcSettings"];
-        assert_eq!(grpc["serviceName"], "TunService");
-        assert_eq!(grpc["multiMode"], true);
-        for target in [Target::SingBox, Target::Mihomo] {
-            let (value, report) = get(target, &node);
-            assert!(
-                report.notes.iter().any(|note| note.contains("multiMode")),
-                "{target:?} 应报告不支持 multiMode：{:?}",
-                report.notes
-            );
-            let entries = if target == Target::SingBox {
-                value["outbounds"].as_array().unwrap().clone()
-            } else {
-                value["proxies"].as_array().unwrap().clone()
-            };
-            assert!(
-                entries
-                    .iter()
-                    .all(|entry| entry["tag"] != "n" && entry["name"] != "n"),
-                "{target:?} 不应静默导出坏配置：{entries:?}"
-            );
-        }
+        assert_eq!(grpc["serviceName"], "/TunService/Tun");
+        assert!(
+            grpc.get("multiMode").is_none(),
+            "单流客户端不启用 multiMode"
+        );
+        let (sing, _) = get(Target::SingBox, &node);
+        assert_eq!(
+            sing["outbounds"][0]["transport"]["service_name"],
+            "TunService"
+        );
+        let (mihomo, _) = get(Target::Mihomo, &node);
+        assert_eq!(
+            mihomo["proxies"][0]["grpc-opts"]["grpc-service-name"],
+            "/TunService/Tun"
+        );
     }
 
-    /// 自定义路径（不是 `/.../Tun`）只能给 Xray 的新式完整路径写法。
+    /// 自定义路径：Xray/Mihomo 写完整路径，sing-box 只能拼 `/Tun` 必须报错。
     #[test]
-    fn custom_grpc_path_only_exports_to_xray() {
+    fn custom_grpc_path_is_rejected_only_where_it_cannot_be_expressed() {
         let node = node_from(json!({
             "type": "vless-grpc", "tag": "n", "listen": "0.0.0.0:443",
             "users": [{"name": "a", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
@@ -2473,14 +2563,34 @@ mod transport_matrix_tests {
             xray["outbounds"][0]["streamSettings"]["grpcSettings"]["serviceName"],
             "/svc/custom"
         );
-        for target in [Target::SingBox, Target::Mihomo] {
-            let (_, report) = get(target, &node);
-            assert!(
-                report.notes.iter().any(|note| note.contains("gRPC")),
-                "{target:?} 应报告自定义路径不可导出：{:?}",
-                report.notes
-            );
-        }
+        let (mihomo, _) = get(Target::Mihomo, &node);
+        assert_eq!(
+            mihomo["proxies"][0]["grpc-opts"]["grpc-service-name"],
+            "/svc/custom"
+        );
+        let report = rejected(Target::SingBox, &node);
+        assert!(
+            report.notes.iter().any(|note| note.contains("gRPC")),
+            "{:?}",
+            report.notes
+        );
+    }
+
+    /// 单段路径（没有流名）无法用 Xray 的 `/<service>/<stream>` 表达。
+    #[test]
+    fn single_segment_grpc_path_is_rejected_for_xray() {
+        let node = node_from(json!({
+            "type": "vless-grpc", "tag": "n", "listen": "0.0.0.0:443",
+            "users": [{"name": "a", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
+            "grpc": {"path": "/T"},
+            "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"
+        }));
+        let report = rejected(Target::Xray, &node);
+        assert!(
+            report.notes.iter().any(|note| note.contains("两段")),
+            "{:?}",
+            report.notes
+        );
     }
 
     #[test]
@@ -2496,7 +2606,7 @@ mod transport_matrix_tests {
         assert_eq!(mihomo["proxies"][0]["network"], "mkcp");
 
         for target in [Target::SingBox, Target::Anywhere] {
-            let (_, report) = get(target, &node);
+            let report = rejected(target, &node);
             assert!(
                 report.notes.iter().any(|note| note.contains("mKCP")),
                 "{target:?} 应报告不支持 mKCP：{:?}",
@@ -2637,9 +2747,10 @@ mod xray_shape_tests {
             vless_encryption: None,
         };
         let mut report = ExportReport::default();
-        let value = export(Target::Xray, std::slice::from_ref(&node), &mut report).unwrap();
-        // 只应有 direct，节点被跳过。
-        assert_eq!(value["outbounds"].as_array().unwrap().len(), 1);
+        let error = export(Target::Xray, std::slice::from_ref(&node), &mut report)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("没有可用节点"), "{error}");
         assert!(
             report.notes.iter().any(|note| note.contains("REALITY")),
             "{:?}",
@@ -2693,7 +2804,10 @@ mod tls_detection_tests {
         }));
         assert_eq!(node.security, Security::None);
         let mut report = ExportReport::default();
-        export(Target::Xray, std::slice::from_ref(&node), &mut report).unwrap();
+        let error = export(Target::Xray, std::slice::from_ref(&node), &mut report)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("没有可用节点"), "{error}");
         assert!(
             report.notes.iter().any(|note| note.contains("禁止无 TLS")),
             "{:?}",
@@ -2931,8 +3045,10 @@ mod version_limit_tests {
         let mut report = ExportReport::default();
         let nodes = nodes(&config, "example.com", &mut report);
         let mut report = ExportReport::default();
-        let value = export(Target::Mihomo, &nodes, &mut report).unwrap();
-        assert_eq!(value["proxies"].as_array().unwrap().len(), 0);
+        let error = export(Target::Mihomo, &nodes, &mut report)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("没有可用节点"), "{error}");
         assert!(
             report.notes.iter().any(|note| note.contains("Snell v6")),
             "{:?}",
@@ -2970,6 +3086,17 @@ mod coverage_gap_tests {
         (value, report)
     }
 
+    /// 该目标把所有节点都跳过时，`export` 必须拒绝生成纯直连配置。
+    fn rejected(target: Target, node: &Node) -> ExportReport {
+        let mut report = ExportReport::default();
+        let error = export(target, std::slice::from_ref(node), &mut report).unwrap_err();
+        assert!(
+            error.to_string().contains("没有可用节点"),
+            "{target:?} 应拒绝导出：{error}"
+        );
+        report
+    }
+
     #[test]
     fn naive_exports_to_sing_box_only() {
         let node = one(json!({
@@ -2982,9 +3109,8 @@ mod coverage_gap_tests {
         assert_eq!(sing["outbounds"][0]["password"], "pw");
         // 服务端按 `用户名:密码` 校验；空用户名会被自己的 407 拒绝。
         assert_eq!(sing["outbounds"][0]["username"], "a");
-        // Mihomo v1.19.33 没有 naive 代理类型，必须报告而不是生成。
-        let (mihomo, report) = get(Target::Mihomo, &node);
-        assert_eq!(mihomo["proxies"].as_array().unwrap().len(), 0);
+        // Mihomo v1.19.33 没有 naive 代理类型，必须报告并拒绝生成。
+        let report = rejected(Target::Mihomo, &node);
         assert!(report.notes.iter().any(|note| note.contains("Naive")));
     }
 
@@ -2997,8 +3123,7 @@ mod coverage_gap_tests {
             "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"
         }));
         // Xray v26 已移除 HTTP transport（文档仍列，实机拒绝）。
-        let (xray, report) = get(Target::Xray, &node);
-        assert_eq!(xray["outbounds"].as_array().unwrap().len(), 1);
+        let report = rejected(Target::Xray, &node);
         assert!(
             report
                 .notes
@@ -3026,17 +3151,9 @@ mod coverage_gap_tests {
         let (sing, _) = get(Target::SingBox, &node);
         assert_eq!(sing["outbounds"][0]["transport"]["type"], "quic");
 
-        // Xray v26 已移除旧 QUIC；Mihomo 也没有。
+        // Xray v26 已移除旧 QUIC；Mihomo 也没有。两者都必须拒绝生成。
         for target in [Target::Xray, Target::Mihomo] {
-            let (value, report) = get(target, &node);
-            let list = value["outbounds"]
-                .as_array()
-                .or_else(|| value["proxies"].as_array())
-                .unwrap();
-            let has_node = list
-                .iter()
-                .any(|item| item["tag"] == "vq" || item["name"] == "vq");
-            assert!(!has_node, "{target:?} 不应导出 QUIC 节点");
+            let report = rejected(target, &node);
             assert!(
                 report.notes.iter().any(|note| note.contains("QUIC")),
                 "{target:?} 应报告：{:?}",
@@ -3088,16 +3205,16 @@ mod coverage_gap_tests {
     }
 
     #[test]
-    fn mihomo_with_no_usable_proxies_falls_back_to_direct_only() {
-        // 唯一的入口是 Mihomo 不支持的协议；生成的配置仍必须能被加载。
+    fn mihomo_rejects_a_config_with_no_usable_proxies() {
+        // 唯一的入口是 Mihomo 不支持的协议：不能退化成 `MATCH,DIRECT`
+        // 的纯直连配置，必须拒绝。
         let node = one(json!({
             "type": "naive", "tag": "naive", "listen": "0.0.0.0:443",
             "users": [{"name": "a", "password": "pw"}],
             "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"
         }));
-        let (value, _) = get(Target::Mihomo, &node);
-        assert!(value.get("proxy-groups").is_none(), "{value}");
-        assert_eq!(value["rules"][0], "MATCH,DIRECT");
+        let report = rejected(Target::Mihomo, &node);
+        assert!(report.notes.iter().any(|note| note.contains("Naive")));
     }
 }
 
@@ -3130,7 +3247,7 @@ mod exhaustive_audit_tests {
                          "server_names": ["www.example.com"], "short_ids": ["ab"]}},
             // 每个入口独占一个端口：同 (地址, 端口, TCP) 会被 check 拒绝。
             {"type": "trojan-grpc", "tag": "tr-grpc", "listen": "0.0.0.0:8443",
-             "users": [{"name": "a", "password": "pw"}], "grpc": {"path": "/T"},
+             "users": [{"name": "a", "password": "pw"}], "grpc": {"path": "/TunService/Tun"},
              "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"},
             {"type": "trojan-httpupgrade", "tag": "tr-hu", "listen": "0.0.0.0:8444",
              "users": [{"name": "a", "password": "pw"}], "httpupgrade": {"path": "/u"},
@@ -3392,15 +3509,13 @@ mod default_route_tests {
     }
 
     /// 没有可用节点时必须显式提示：生成的客户端会直连。
+    /// 没有可用节点时必须**拒绝导出**，而不是生成一份能直连的配置。
     #[test]
-    fn no_nodes_reports_that_traffic_will_bypass_the_server() {
+    fn no_nodes_is_rejected_instead_of_producing_a_direct_client() {
         let mut report = ExportReport::default();
-        let value = export(Target::Xray, &[], &mut report).unwrap();
-        assert_eq!(value["outbounds"].as_array().unwrap().len(), 1);
-        assert!(
-            report.notes.iter().any(|note| note.contains("直连")),
-            "没有节点时必须提示会直连：{:?}",
-            report.notes
-        );
+        let error = export(Target::Xray, &[], &mut report)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("没有可用节点"), "{error}");
     }
 }

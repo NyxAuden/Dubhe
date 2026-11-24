@@ -73,6 +73,34 @@ fn convert_inbounds(value: Option<&Value>, report: &mut Report) -> Result<Vec<Va
     Ok(output)
 }
 
+/// 读取 `streamSettings.network` 并归一化别名：Xray 把 `raw` 当作 `tcp`。
+fn stream_network(stream: Option<&Value>) -> &str {
+    match stream
+        .and_then(|value| value.get("network"))
+        .and_then(Value::as_str)
+        .unwrap_or("tcp")
+    {
+        "raw" => "tcp",
+        other => other,
+    }
+}
+
+/// dubhe 没有 TCP header 伪装；`http` 等非默认 header 无法等价转换。
+fn ensure_no_tcp_header(stream: Option<&Value>, index: usize, side: &str) -> Result<()> {
+    let header = stream
+        .and_then(|value| value.get("tcpSettings"))
+        .and_then(|value| value.get("header"))
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    anyhow::ensure!(
+        header == "none",
+        "{side}[{index}] 使用 TCP header 伪装 type={header}，dubhe 不支持；\
+         继续转换会把这些流量当作裸 TCP"
+    );
+    Ok(())
+}
+
 fn convert_inbound(item: &Value, index: usize, report: &mut Report) -> Result<Value> {
     let object = item
         .as_object()
@@ -87,10 +115,8 @@ fn convert_inbound(item: &Value, index: usize, report: &mut Report) -> Result<Va
     let address = endpoint(listen, port)?;
 
     let stream = object.get("streamSettings");
-    let network = stream
-        .and_then(|s| s.get("network"))
-        .and_then(Value::as_str)
-        .unwrap_or("tcp");
+    let network = stream_network(stream);
+    ensure_no_tcp_header(stream, index, "inbounds")?;
     let security = stream
         .and_then(|s| s.get("security"))
         .and_then(Value::as_str)
@@ -421,17 +447,37 @@ fn convert_websocket(stream: Option<&Value>) -> Value {
 /// 本仓库的 `grpc.path` 存完整路径（`/GunService/Tun`）。Xray 老式写法只给服务名，
 /// 客户端请求 `/<service>/Tun`（multiMode 为 `/<service>/TunMulti`）；以 `/` 开头
 /// 是新式完整路径，服务端用 `单路径|多路径` 给出 multi 路径。
-fn grpc_paths(service: &str) -> (String, Option<String>) {
+fn grpc_paths(service: &str) -> Result<(String, String)> {
     if let Some(rest) = service.strip_prefix('/') {
-        return match rest.split_once('|') {
-            Some((single, multi)) => (format!("/{single}"), Some(format!("/{multi}"))),
-            None => (format!("/{rest}"), None),
+        // 新式写法：Xray 在**最后一个 `/`** 处切出服务前缀，只对最后一段
+        // 解析 `单流|多流`（transport/internet/grpc/config.go）。
+        let (prefix, streams) = rest.rsplit_once('/').unwrap_or(("", rest));
+        let (single, multi) = match streams.split_once('|') {
+            Some((single, multi)) => (single, multi),
+            // 只有一段时，Xray 的 getTunMultiStreamName 返回同一个流名。
+            None => (streams, streams),
         };
+        let mut paths = [String::new(), String::new()];
+        for (slot, stream) in paths.iter_mut().zip([single, multi]) {
+            anyhow::ensure!(
+                !prefix.contains('%') && !stream.contains('%'),
+                "gRPC 的 serviceName={service} 含 `%`；Xray 会重新转义，无法精确重建路径"
+            );
+            *slot = if prefix.is_empty() {
+                format!("/{stream}")
+            } else {
+                format!("/{prefix}/{stream}")
+            };
+        }
+        let [single, multi] = paths;
+        return Ok((single, multi));
     }
-    (
-        format!("/{service}/Tun"),
-        Some(format!("/{service}/TunMulti")),
-    )
+    let escaped = |name: &str| !name.contains('%');
+    anyhow::ensure!(
+        escaped(service),
+        "gRPC 的 serviceName={service} 含 `%`；Xray 会重新转义，无法精确重建路径"
+    );
+    Ok((format!("/{service}/Tun"), format!("/{service}/TunMulti")))
 }
 
 fn convert_grpc(stream: Option<&Value>, index: usize) -> Result<Value> {
@@ -439,22 +485,22 @@ fn convert_grpc(stream: Option<&Value>, index: usize) -> Result<Value> {
     let service = settings
         .and_then(|s| s.get("serviceName"))
         .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())
         .ok_or_else(|| anyhow!("inbounds[{index}] 的 gRPC 缺少 serviceName"))?;
     let multi_mode = settings
         .and_then(|s| s.get("multiMode"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (path, multi_path) = grpc_paths(service);
-    if multi_mode && multi_path.is_none() {
-        bail!(
-            "inbounds[{index}] 的 gRPC 使用新式完整路径 + multiMode，\
-             但 serviceName 缺少 `单路径|多路径` 分隔；无法推导 multi_path"
-        );
-    }
+    let (path, multi_path) = grpc_paths(service)?;
     let mut out = Map::new();
     out.insert("path".into(), json!(path));
-    if multi_mode && let Some(multi_path) = multi_path {
+    if multi_mode {
+        // Xray 允许 `serviceName` 没有 `单|多` 分隔，此时两种流注册在同一路径；
+        // dubhe 的同一路径只能有一种帧格式，无法区分。
+        anyhow::ensure!(
+            path != multi_path,
+            "inbounds[{index}] 的 gRPC 把单流与多流注册在同一路径 {path}；\
+             dubhe 无法区分两种帧格式，请写成 `/service/单流|多流`"
+        );
         out.insert("multi_path".into(), json!(multi_path));
     }
     Ok(Value::Object(out))
@@ -705,10 +751,7 @@ fn apply_plain_outbound_wrapping(
     ca_file: Option<&str>,
     report: &mut Report,
 ) -> Result<()> {
-    let network = stream
-        .and_then(|s| s.get("network"))
-        .and_then(Value::as_str)
-        .unwrap_or("tcp");
+    let network = stream_network(stream);
     anyhow::ensure!(
         network == "tcp",
         "outbounds[{index}] 的 {protocol} 出站使用 network={network} 承载，\
@@ -723,6 +766,7 @@ fn apply_plain_outbound_wrapping(
         "outbounds[{index}] 的 {protocol} 出站使用 REALITY，\
          dubhe 的该类出站不支持 REALITY；请改用 vless/vmess/trojan 出站"
     );
+    ensure_no_tcp_header(stream, index, "outbounds")?;
     if security == "tls" && protocol == "shadowsocks" {
         bail!(
             "outbounds[{index}] 的 shadowsocks 出站使用 TLS，dubhe 的 shadowsocks 出站不支持 TLS；\
@@ -746,11 +790,78 @@ fn apply_outbound_security(
     match security {
         "none" => Ok(()),
         "tls" => {
+            let tls_settings = stream.and_then(|s| s.get("tlsSettings"));
+            // Xray v26 用 pinnedPeerCertSha256 / verifyPeerCertByName 代替已移除的
+            // allowInsecure。这两项都在收紧信任条件，丢弃等于放宽。
+            if tls_settings
+                .and_then(|s| s.get("pinnedPeerCertSha256"))
+                .is_some_and(|value| match value {
+                    Value::Null => false,
+                    Value::String(text) => !text.trim().is_empty(),
+                    Value::Array(items) => !items.is_empty(),
+                    _ => true,
+                })
+            {
+                bail!(
+                    "outbounds[{index}] 的 TLS 使用 pinnedPeerCertSha256 证书固定，\
+                     dubhe 的 TLS 客户端不支持；继续转换会退化成只校验 CA"
+                );
+            }
+            if let Some(value) = tls_settings
+                .and_then(|s| s.get("verifyPeerCertByName"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+            {
+                bail!(
+                    "outbounds[{index}] 的 TLS 使用 verifyPeerCertByName={value} 限制证书名，\
+                     dubhe 的 TLS 客户端不支持"
+                );
+            }
+            if let Some(min_version) = tls_settings
+                .and_then(|s| s.get("minVersion"))
+                .and_then(Value::as_str)
+                && min_version == "1.3"
+            {
+                bail!(
+                    "outbounds[{index}] 的 TLS 要求 minVersion=1.3，\
+                     dubhe 的 TLS 客户端允许 TLS 1.2；继续转换会放宽版本下限"
+                );
+            }
+            if let Some(certificates) = tls_settings
+                .and_then(|s| s.get("certificates"))
+                .and_then(Value::as_array)
+            {
+                for certificate in certificates {
+                    // Xray 的默认 usage 是 encipherment（客户端证书）；
+                    // 只有 verify 是信任锚。
+                    let usage = certificate
+                        .get("usage")
+                        .and_then(Value::as_str)
+                        .unwrap_or("encipherment");
+                    anyhow::ensure!(
+                        usage == "verify",
+                        "outbounds[{index}] 的 TLS 使用 {usage} 证书（客户端证书/mTLS），\
+                         dubhe 的 TLS 客户端不支持；继续转换会丢掉这项认证"
+                    );
+                }
+                report.note(format!(
+                    "outbounds[{index}] 的 tlsSettings.certificates 是信任锚；请用 --ca-file 指定同一证书"
+                ));
+            }
+            for field in ["alpn", "fingerprint"] {
+                if tls_settings
+                    .and_then(|s| s.get(field))
+                    .is_some_and(|value| !value.is_null())
+                {
+                    report.note(format!(
+                        "outbounds[{index}] 的 tlsSettings.{field} 未携带（本项目按承载固定 ALPN 与指纹）"
+                    ));
+                }
+            }
             let ca_file = ca_file.ok_or_else(|| {
                 anyhow!("outbounds[{index}] 使用 TLS；请用 --ca-file 指定信任锚 PEM")
             })?;
-            let server_name = stream
-                .and_then(|s| s.get("tlsSettings"))
+            let server_name = tls_settings
                 .and_then(|s| s.get("serverName"))
                 .and_then(Value::as_str);
             let mut tls = Map::new();
@@ -796,10 +907,10 @@ fn apply_outbound_transport(
     out: &mut Map<String, Value>,
     index: usize,
 ) -> Result<()> {
-    let network = stream
-        .and_then(|s| s.get("network"))
-        .and_then(Value::as_str)
-        .unwrap_or("tcp");
+    let network = stream_network(stream);
+    if network == "tcp" {
+        ensure_no_tcp_header(stream, index, "outbounds")?;
+    }
     match network {
         "tcp" => Ok(()),
         "ws" => {
@@ -832,15 +943,9 @@ fn apply_outbound_transport(
                 .and_then(|s| s.get("multiMode"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let (single, multi_path) = grpc_paths(service);
-            // multiMode 时 Xray 客户端请求的是 `/<service>/TunMulti`，不是单流路径。
-            let path = if multi_mode {
-                multi_path.ok_or_else(|| {
-                    anyhow!("outbounds[{index}] 的 gRPC 使用新式完整路径 + multiMode，但缺少 `单路径|多路径` 分隔")
-                })?
-            } else {
-                single
-            };
+            let (single, multi_path) = grpc_paths(service)?;
+            // multiMode 时 Xray 客户端请求多流路径（`TunMulti` 或 `单|多` 的第二段）。
+            let path = if multi_mode { multi_path } else { single };
             let mut transport = Map::new();
             transport.insert("type".into(), json!("grpc"));
             transport.insert("path".into(), json!(path));
@@ -978,7 +1083,9 @@ fn convert_routing(
             }
             let mut base = Map::new();
             base.insert("outbound".into(), json!(outbound));
-            let domain_groups = convert_domains(item.get("domain"), index, report)?;
+            let (domain_groups, dropped_domains) =
+                convert_domains(item.get("domain"), index, report)?;
+            let mut dropped = dropped_domains;
             if let Some(ips) = item.get("ip").and_then(Value::as_array) {
                 let mut cidrs = Vec::new();
                 let mut has_private = false;
@@ -1003,16 +1110,12 @@ fn convert_routing(
                         ));
                     } else if ip.starts_with("ext:") {
                         has_other_ip = true;
-                        report.note(format!(
-                            "routing.rules[{index}] 的 {ip} 需要外部规则集，已跳过；可用 geo.rule_sets 引用 sing-box source JSON"
-                        ));
+                        dropped.push(ip.to_owned());
                     } else if ip.starts_with('!') {
                         has_other_ip = true;
                         // Xray 的 `!` 只否定 IP 条件，而 dubhe 的 invert 翻转整条规则；
                         // 两者只在「规则没有其它条件」时才等价，不做有损转换。
-                        report.note(format!(
-                            "routing.rules[{index}] 的 {ip}（反向 IP 匹配）无法等价表达，已跳过"
-                        ));
+                        dropped.push(ip.to_owned());
                     } else {
                         has_other_ip = true;
                         cidrs.push(json!(ip));
@@ -1047,15 +1150,25 @@ fn convert_routing(
                     match part.trim() {
                         "tcp" => networks.push(json!("tcp")),
                         "udp" => networks.push(json!("udp")),
-                        other => {
-                            report.note(format!("routing.rules[{index}] 的 network={other} 已跳过"))
-                        }
+                        other => bail!(
+                            "routing.rules[{index}] 的 network={other} 不是 tcp/udp，无法转换"
+                        ),
                     }
                 }
                 if !networks.is_empty() {
                     base.insert("networks".into(), Value::Array(networks));
                 }
             }
+            // 任何一个条件被丢弃都会改变匹配范围：规则会少命中（流量改走
+            // 默认出口）或多命中（无条件/只剩端口）。两种情况都是静默改变
+            // 流量路径，必须失败关闭。
+            anyhow::ensure!(
+                dropped.is_empty(),
+                "routing.rules[{index}] 的 {} 无法等价转换，继续输出会改变这条规则的\
+                 匹配范围并让流量走默认出口；请先展开这些引用（第三方 dat 可改用 \
+                 geo.rule_sets 引用 sing-box source JSON）",
+                dropped.join("、")
+            );
             // 只允许把**有匹配条件**的规则写出去。若条件全都被跳过
             // （例如只有 `ext:` 引用），剩下的 `{outbound}` 会变成
             // 无条件规则——把所有流量导向该出站。
@@ -1088,19 +1201,26 @@ fn convert_routing(
     Ok(Value::Object(route))
 }
 
-/// 把 Xray 的 `domain` 数组按种类拆成多组条件。
+/// 把 Xray 的 `domain` 数组按种类拆成多组条件，并返回无法表达的项。
 ///
 /// Xray 的 `domain` 数组内部是**并集**（`domain:a.com` 或 `keyword:b` 任一命中），
 /// 而 dubhe 的 `domains`/`domain_suffix`/`domain_keyword`/`domain_regex` 是不同
 /// 字段、彼此取**交集**。直接塞进同一条规则会从 OR 变成 AND：本该走代理的流量
 /// 落到默认出口。按种类拆成多条同 outbound 的相邻规则，才保持并集语义。
+///
+/// **裸域名在 Xray 里是子串匹配**（`ParseDomainRules(..., Domain_Substr)`，
+/// 实测 `example.com` 会命中 `notexample.com`），不是精确域名，因此写入
+/// `domain_keyword`。丢掉的项会让规则范围变化，调用方必须失败关闭。
+/// 同一 `domain` 数组拆出的条件组，以及无法表达的引用。
+type DomainGroups = (Vec<Map<String, Value>>, Vec<String>);
+
 fn convert_domains(
     value: Option<&Value>,
     index: usize,
     report: &mut Report,
-) -> Result<Vec<Map<String, Value>>> {
+) -> Result<DomainGroups> {
     let Some(value) = value else {
-        return Ok(vec![Map::new()]);
+        return Ok((vec![Map::new()], Vec::new()));
     };
     let domains = value
         .as_array()
@@ -1109,17 +1229,17 @@ fn convert_domains(
     let mut suffix = Vec::new();
     let mut keyword = Vec::new();
     let mut regex = Vec::new();
+    let mut dropped = Vec::new();
     for domain in domains.iter().filter_map(Value::as_str) {
         if domain.starts_with("geosite:") {
-            // dubhe 支持 geosite:，但要求配置里给出 geo.geosite 数据文件。
             exact.push(json!(domain));
             report.note(format!(
                 "routing.rules[{index}] 的 {domain} 已保留；在 dubhe 配置里设置 geo.geosite 指向 geosite.dat 才会生效"
             ));
         } else if domain.starts_with("ext:") {
-            report.note(format!(
-                "routing.rules[{index}] 的 {domain} 需要外部规则集，已跳过；可用 geo.rule_sets 引用 sing-box source JSON"
-            ));
+            // 外部规则集（ext:xxx.dat:tag）没有等价字段；丢掉会让这条规则
+            // 少匹配一批域名，流量改走默认出口。
+            dropped.push(domain.to_owned());
         } else if let Some(item) = domain.strip_prefix("domain:") {
             suffix.push(json!(item));
         } else if let Some(item) = domain.strip_prefix("keyword:") {
@@ -1128,12 +1248,20 @@ fn convert_domains(
             regex.push(json!(item));
         } else if let Some(item) = domain.strip_prefix("full:") {
             exact.push(json!(item));
-        } else if domain.starts_with("dotless:") {
-            report.note(format!(
-                "routing.rules[{index}] 的 {domain}（无点域名）暂无对应字段，已跳过"
-            ));
+        } else if let Some(item) = domain.strip_prefix("dotless:") {
+            // Xray 把 dotless: 编译成同一个正则：`^[^.]*$` 或
+            // `^[^.]*<substr>[^.]*$`（common/geodata/rule_parser.go）。
+            if item.contains('.') {
+                bail!("routing.rules[{index}] 的 {domain} 含有 '.'，Xray 自身也会拒绝该写法");
+            }
+            regex.push(json!(if item.is_empty() {
+                "^[^.]*$".to_owned()
+            } else {
+                format!("^[^.]*{item}[^.]*$")
+            }));
         } else {
-            exact.push(json!(domain));
+            // 没有前缀：Xray 的默认类型是 Domain_Substr（子串匹配）。
+            keyword.push(json!(domain));
         }
     }
     let mut groups = Vec::new();
@@ -1151,10 +1279,10 @@ fn convert_domains(
         groups.push(group);
     }
     if groups.is_empty() {
-        // 数组里只有被跳过的引用：让调用方的「没有匹配条件」检查处理。
+        // 数组里只有被丢弃的引用：让调用方的「没有匹配条件」检查处理。
         groups.push(Map::new());
     }
-    Ok(groups)
+    Ok((groups, dropped))
 }
 
 fn convert_ports(value: &Value) -> Result<Value> {
@@ -1470,6 +1598,82 @@ mod tests {
         assert_eq!(outbounds[1]["username"], serde_json::Value::Null);
     }
 
+    /// Xray v26 的证书固定（pinnedPeerCertSha256）无法迁移：丢掉等于把
+    /// 「只信任这张证书」放宽成「信任任一 CA 签发的证书」。
+    #[test]
+    fn tls_pinned_certificate_fails_closed() {
+        let value = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{
+                "tag": "pin",
+                "protocol": "http",
+                "settings": {"servers": [{"address": "proxy.example.com", "port": 8080}]},
+                "streamSettings": {
+                    "network": "tcp", "security": "tls",
+                    "tlsSettings": {
+                        "serverName": "proxy.example.com",
+                        "pinnedPeerCertSha256": "aa:bb:cc"
+                    }
+                }
+            }]
+        });
+        let error = from_xray(&value.to_string(), Some("/etc/ssl/cert.pem")).unwrap_err();
+        assert!(
+            error.to_string().contains("pinnedPeerCertSha256"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tls_client_certificates_fail_closed() {
+        let value = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{
+                "tag": "mtls",
+                "protocol": "http",
+                "settings": {"servers": [{"address": "proxy.example.com", "port": 8080}]},
+                "streamSettings": {
+                    "network": "tcp", "security": "tls",
+                    "tlsSettings": {"certificates": [{
+                        "certificateFile": "/c.pem", "keyFile": "/k.pem"
+                    }]}
+                }
+            }]
+        });
+        let error = from_xray(&value.to_string(), Some("/etc/ssl/cert.pem")).unwrap_err();
+        assert!(error.to_string().contains("客户端证书"), "{error}");
+    }
+
+    /// usage=verify 的证书是信任锚，转换后由 --ca-file 承担，只需提示。
+    #[test]
+    fn tls_verify_certificate_only_notes_the_trust_anchor() {
+        let value = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{
+                "tag": "upstream",
+                "protocol": "http",
+                "settings": {"servers": [{"address": "proxy.example.com", "port": 8080}]},
+                "streamSettings": {
+                    "network": "tcp", "security": "tls",
+                    "tlsSettings": {"certificates": [{
+                        "usage": "verify", "certificateFile": "/ca.pem"
+                    }]}
+                }
+            }]
+        });
+        let converted =
+            from_xray(&value.to_string(), Some("/etc/ssl/cert.pem")).expect("信任锚不应阻止转换");
+        assert!(
+            converted
+                .report
+                .notes
+                .iter()
+                .any(|note| note.contains("--ca-file")),
+            "{:?}",
+            converted.report.notes
+        );
+    }
+
     /// dubhe 的 shadowsocks 出站不支持 TLS；不能静默丢掉。
     #[test]
     fn shadowsocks_outbound_tls_fails_closed() {
@@ -1654,12 +1858,79 @@ mod transport_tests {
     /// 新式写法：Xray 把以 `/` 开头的 serviceName 当完整路径，`单|多` 分隔。
     #[test]
     fn grpc_inbound_accepts_full_path_service_name() {
+        // Xray 在最后一个 `/` 处切服务前缀，只对最后一段解析 `单|多`。
         let mut stream = certs();
         stream["network"] = json!("grpc");
-        stream["grpcSettings"] = json!({"serviceName": "/svc/a|svc/b", "multiMode": true});
+        stream["grpcSettings"] = json!({"serviceName": "/svc/a|b", "multiMode": true});
         let inbound = convert_inbound(stream);
         assert_eq!(inbound["grpc"]["path"], "/svc/a");
         assert_eq!(inbound["grpc"]["multi_path"], "/svc/b");
+
+        // 没有 `|` 时 Xray 把两种流注册在同一路径；dubhe 无法区分，必须报错。
+        let mut stream = certs();
+        stream["network"] = json!("grpc");
+        stream["grpcSettings"] = json!({"serviceName": "/svc/batch", "multiMode": true});
+        let error = from_xray(&config_with(stream).to_string(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("同一路径"), "{error}");
+
+        // 空 serviceName：Xray 生成 `//Tun`。
+        let mut stream = certs();
+        stream["network"] = json!("grpc");
+        stream["grpcSettings"] = json!({"serviceName": ""});
+        let inbound = convert_inbound(stream);
+        assert_eq!(inbound["grpc"]["path"], "//Tun");
+    }
+
+    /// `raw` 是 `tcp` 的别名；此前会被当成未知承载直接拒绝。
+    #[test]
+    fn raw_alias_is_treated_as_tcp() {
+        let mut stream = certs();
+        stream["network"] = json!("raw");
+        let inbound = convert_inbound(stream);
+        assert_eq!(inbound["type"], "vless");
+
+        let value = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{
+                "tag": "up",
+                "protocol": "socks",
+                "settings": {"servers": [{"address": "127.0.0.2", "port": 1080}]},
+                "streamSettings": {"network": "raw", "security": "none"}
+            }]
+        });
+        let converted = from_xray(&value.to_string(), None).expect("raw 应可转换");
+        let rendered = serde_json::to_value(&converted.json).unwrap();
+        assert_eq!(rendered["outbounds"][0]["type"], "socks5");
+        assert!(rendered["outbounds"][0].get("transport").is_none());
+    }
+
+    /// TCP header 伪装无法表达，必须报错而不是当作裸 TCP。
+    #[test]
+    fn tcp_header_disguise_fails_closed() {
+        let mut stream = certs();
+        stream["network"] = json!("tcp");
+        stream["tcpSettings"] = json!({"header": {"type": "http"}});
+        let error = from_xray(&config_with(stream).to_string(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("TCP header"), "{error}");
+
+        let value = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{
+                "tag": "up",
+                "protocol": "socks",
+                "settings": {"servers": [{"address": "127.0.0.2", "port": 1080}]},
+                "streamSettings": {
+                    "network": "tcp", "security": "none",
+                    "tcpSettings": {"header": {"type": "http"}}
+                }
+            }]
+        });
+        let error = from_xray(&value.to_string(), None).unwrap_err().to_string();
+        assert!(error.contains("TCP header"), "{error}");
     }
 
     #[test]
@@ -1800,17 +2071,23 @@ mod routing_field_alignment_tests {
         assert_eq!(value["route"]["rules"][0]["domains"][0], "xray.com");
     }
 
+    /// Xray 的 `!` 只否定 IP 条件，整条规则 invert 会改变语义。
+    ///
+    /// 以前是「提示后丢掉 IP、保留 port」——规则从「非 cn 的 443」变成
+    /// 「所有 443」，静默改变流量路径。现在必须失败关闭。
     #[test]
-    fn negated_ip_is_reported_instead_of_lossy_invert() {
-        // Xray 的 `!` 只否定 IP 条件，整条规则 invert 会改变语义。
-        // 加一个 port 条件，使这条规则在丢弃 IP 后仍有匹配条件
-        // （只剩被丢弃引用的规则现在会直接报错，见下一条用例）。
-        let (value, report) = convert(serde_json::json!([
-            {"type": "field", "ip": ["!geoip:cn"], "port": "443", "outboundTag": "direct"}
-        ]));
-        assert!(value["route"]["rules"][0].get("invert").is_none());
-        assert!(value["route"]["rules"][0].get("ip_cidrs").is_none());
-        assert!(report.contains("反向 IP 匹配"), "{report}");
+    fn negated_ip_is_rejected_instead_of_lossy_invert() {
+        let text = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [
+                {"type": "field", "ip": ["!geoip:cn"], "port": "443", "outboundTag": "direct"}
+            ]}
+        })
+        .to_string();
+        let error = from_xray(&text, None).unwrap_err().to_string();
+        assert!(error.contains("!geoip:cn"), "{error}");
+        assert!(error.contains("无法等价转换"), "{error}");
     }
 
     /// 规则的所有条件都被跳过时必须报错：只剩 `{outbound}` 会变成
@@ -1827,8 +2104,8 @@ mod routing_field_alignment_tests {
         .to_string();
         let error = from_xray(&text, None).unwrap_err().to_string();
         assert!(
-            error.contains("没有任何匹配条件"),
-            "应拒绝无条件规则：{error}"
+            error.contains("无法等价转换") || error.contains("没有任何匹配条件"),
+            "应拒绝被丢弃的条件：{error}"
         );
     }
 
@@ -1853,6 +2130,104 @@ mod routing_field_alignment_tests {
         assert_eq!(rules[1]["domain_suffix"][0], "a.test");
     }
 
+    /// 裸域名在 Xray 里是**子串**匹配（`Domain_Substr`），不是精确域名。
+    ///
+    /// 此前写进 `domains`（精确），子域名反而漏掉，`notexample.com` 又匹配不上。
+    #[test]
+    fn bare_domain_is_a_substring_match_like_xray() {
+        use crate::config::OutboundKind;
+        use crate::session::{Host, Network, Target};
+
+        let text = serde_json::json!({
+            "inbounds": [{"tag": "in", "listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [
+                {"tag": "node", "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.2", "port": 1080}]}},
+                {"tag": "block", "protocol": "blackhole"}
+            ],
+            "routing": {"rules": [
+                {"type": "field", "domain": ["example.com"], "outboundTag": "block"}
+            ]}
+        })
+        .to_string();
+        let converted = from_xray(&text, None).expect("应可转换");
+        let rendered = serde_json::to_value(&converted.json).unwrap();
+        assert_eq!(
+            rendered["route"]["rules"][0]["domain_keyword"][0], "example.com",
+            "裸域名必须落到子串条件：{rendered}"
+        );
+        let router = crate::route::Router::new(&converted.config).expect("路由应可编译");
+        let select = |host: &str| {
+            router.select(
+                "in",
+                Network::Tcp,
+                &Target {
+                    host: Host::Domain(host.into()),
+                    port: 443,
+                },
+            )
+        };
+        // 与真 Xray 实测一致：自身、子域名、以及含该子串的域名都命中。
+        assert_eq!(select("example.com"), OutboundKind::Reject);
+        assert_eq!(select("www.example.com"), OutboundKind::Reject);
+        assert_eq!(select("notexample.com"), OutboundKind::Reject);
+        assert_ne!(select("other.test"), OutboundKind::Reject);
+    }
+
+    /// `dotless:` 在 Xray 里编译成固定正则，可以精确翻译。
+    #[test]
+    fn dotless_becomes_the_same_regex() {
+        use crate::config::OutboundKind;
+        use crate::session::{Host, Network, Target};
+
+        let text = serde_json::json!({
+            "inbounds": [{"tag": "in", "listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [
+                {"tag": "node", "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.2", "port": 1080}]}},
+                {"tag": "block", "protocol": "blackhole"}
+            ],
+            "routing": {"rules": [
+                {"type": "field", "domain": ["dotless:"], "outboundTag": "block"}
+            ]}
+        })
+        .to_string();
+        let converted = from_xray(&text, None).expect("应可转换");
+        let rendered = serde_json::to_value(&converted.json).unwrap();
+        assert_eq!(
+            rendered["route"]["rules"][0]["domain_regex"][0], "^[^.]*$",
+            "{rendered}"
+        );
+        let router = crate::route::Router::new(&converted.config).expect("路由应可编译");
+        let select = |host: &str| {
+            router.select(
+                "in",
+                Network::Tcp,
+                &Target {
+                    host: Host::Domain(host.into()),
+                    port: 443,
+                },
+            )
+        };
+        assert_eq!(select("localhost"), OutboundKind::Reject);
+        assert_ne!(select("a.b"), OutboundKind::Reject);
+    }
+
+    /// 条件被丢弃时必须失败：以前会保留 port，规则从「该域名的 443」
+    /// 扩大成「所有 443」，后面的规则再也匹配不到。
+    #[test]
+    fn dropped_domain_reference_does_not_widen_the_rule() {
+        let text = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [
+                {"type": "field", "domain": ["domain:a.test", "ext:my.dat:x"],
+                 "port": "443", "outboundTag": "direct"}
+            ]}
+        })
+        .to_string();
+        let error = from_xray(&text, None).unwrap_err().to_string();
+        assert!(error.contains("ext:my.dat:x"), "{error}");
+    }
+
     /// geoip:private 与其它 IP 项混写同样无法等价转换。
     #[test]
     fn mixed_private_and_geoip_is_rejected() {
@@ -1869,10 +2244,16 @@ mod routing_field_alignment_tests {
     }
 
     #[test]
-    fn negated_ip_mixed_with_positive_is_also_reported() {
-        let (_, report) = convert(serde_json::json!([
-            {"type": "field", "ip": ["!geoip:cn", "geoip:telegram"], "outboundTag": "direct"}
-        ]));
-        assert!(report.contains("反向 IP 匹配"), "{report}");
+    fn negated_ip_mixed_with_positive_is_also_rejected() {
+        let text = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [
+                {"type": "field", "ip": ["!geoip:cn", "geoip:telegram"], "outboundTag": "direct"}
+            ]}
+        })
+        .to_string();
+        let error = from_xray(&text, None).unwrap_err().to_string();
+        assert!(error.contains("!geoip:cn"), "{error}");
     }
 }

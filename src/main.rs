@@ -136,12 +136,17 @@ async fn execute(cli: Cli) -> Result<()> {
                 }
                 return Err(anyhow::anyhow!("配置里没有可导出的入站"));
             }
-            std::fs::create_dir_all(&output)?;
+            // 先在内存里生成全部目标，任何一个目标没有可用节点就整体失败：
+            // `--to all` 不能留下半套文件，更不能把纯直连配置冒充成导出结果。
+            let mut rendered = Vec::with_capacity(targets.len());
             for target in targets {
                 let value = dubhe::export::export(target, &nodes, &mut report)?;
-                let name = format!("{}.json", target.file_name());
-                let path = output.join(&name);
-                write_private(&path, &(serde_json::to_string_pretty(&value)? + "\n"))?;
+                rendered.push((target, serde_json::to_string_pretty(&value)? + "\n"));
+            }
+            std::fs::create_dir_all(&output)?;
+            for (target, text) in rendered {
+                let path = output.join(format!("{}.json", target.file_name()));
+                write_private(&path, &text)?;
                 println!("{}", path.display());
             }
             if !report.notes.is_empty() {
@@ -200,21 +205,40 @@ async fn execute(cli: Cli) -> Result<()> {
 #[cfg(unix)]
 /// 导出/转换结果里有 UUID、密码与 REALITY 私钥，必须 0600。
 ///
-/// `mode(0o600)` 只在创建时生效，所以写完后对已存在的文件再收紧一次权限，
-/// 避免旧文件仍是 0644。
+/// 先写同目录的临时文件（创建即 0600），再原子替换目标：
+/// - 已有 0644 文件不会在写入期间先被截断、又以旧权限可读；
+/// - 中途失败时旧文件保持完整，不会留下半份配置。
+///
+/// 目标是符号链接时替换链接本身，不跟随写入（避免改写链接指向的文件）。
 fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(text.as_bytes())?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "输出路径缺少文件名")
+        })?;
+        let temp = path.with_file_name(format!(
+            ".{}.{}.tmp",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        let written = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temp)?;
+            file.write_all(text.as_bytes())?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.sync_all()?;
+            std::fs::rename(&temp, path)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        written
     }
     #[cfg(not(unix))]
     {

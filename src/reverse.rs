@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex, Weak,
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     task::{Context as TaskContext, Poll},
     time::Duration,
@@ -54,9 +54,17 @@ struct Portal {
 type UdpReplySender = mpsc::Sender<(Target, Vec<u8>)>;
 type UdpReplyReceiver = mpsc::Receiver<(Target, Vec<u8>)>;
 
+/// 一条本地 TCP 会话的投递端与终止原因。
+#[derive(Clone)]
+struct Session {
+    sender: mpsc::Sender<Vec<u8>>,
+    /// 因背压/载体错误被终止：读端必须返回错误，不能把截断当成正常 EOF。
+    failed: Arc<AtomicBool>,
+}
+
 struct ClientInner {
     writer: mpsc::Sender<Vec<u8>>,
-    sessions: StdMutex<HashMap<u16, mpsc::Sender<Vec<u8>>>>,
+    sessions: StdMutex<HashMap<u16, Session>>,
     /// Mux UDP 会话：回包携带实际来源目标。
     udp_sessions: StdMutex<HashMap<u16, UdpReplySender>>,
     next: AtomicU16,
@@ -73,7 +81,17 @@ impl ClientInner {
             .closed
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = true;
-        // 丢弃会话发送端会让对应 SessionStream 读到 EOF。
+        // 载体断开属于异常结束：先标记原因，再丢弃发送端，让本地读端
+        // 先排空已交付数据、然后收到错误而不是正常 EOF。
+        {
+            let sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for session in sessions.values() {
+                session.failed.store(true, Ordering::Release);
+            }
+        }
         self.sessions
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -94,7 +112,10 @@ impl ClientInner {
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    fn allocate(&self, target: &Target) -> io::Result<(u16, mpsc::Receiver<Vec<u8>>)> {
+    fn allocate(
+        &self,
+        target: &Target,
+    ) -> io::Result<(u16, mpsc::Receiver<Vec<u8>>, Arc<AtomicBool>)> {
         let mut sessions = self
             .sessions
             .lock()
@@ -125,7 +146,14 @@ impl ClientInner {
         }
         drop(udp);
         let (tx, rx) = mpsc::channel(8);
-        sessions.insert(id, tx);
+        let failed = Arc::new(AtomicBool::new(false));
+        sessions.insert(
+            id,
+            Session {
+                sender: tx,
+                failed: failed.clone(),
+            },
+        );
         let frame = mux::encode_new(id, Network::Tcp, target, &[])?;
         if self.writer.try_send(frame).is_err() {
             sessions.remove(&id);
@@ -134,7 +162,7 @@ impl ClientInner {
                 "反向隧道写队列已满",
             ));
         }
-        Ok((id, rx))
+        Ok((id, rx, failed))
     }
 
     fn session_count(&self) -> usize {
@@ -205,6 +233,17 @@ impl ClientInner {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&id);
+    }
+
+    /// 标记异常终止并移除会话；读端排空已交付字节后返回错误。
+    fn fail_session(&self, id: u16) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(session) = sessions.remove(&id) {
+            session.failed.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -342,7 +381,8 @@ impl Registry {
                 .find(|client| client.session_count() < MAX_SESSIONS)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "没有可用的反向隧道"))?
         };
-        let (id, incoming) = client.allocate(target)?;
+        let (id, incoming, failed) = client.allocate(target)?;
+        let queue_timeout_ms = client.queue_timeout_ms;
         Ok(Upstream::from_parts(
             Box::new(SessionStream {
                 id,
@@ -352,6 +392,9 @@ impl Registry {
                 buffer: Vec::new(),
                 offset: 0,
                 shutdown: false,
+                failed,
+                queue_timeout_ms,
+                shutdown_since: None,
             }),
             // 反向隧道没有真实本地地址；SOCKS5 应答使用通配地址。
             Some(std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
@@ -497,14 +540,23 @@ async fn handle_frame(frame: mux::Frame, client: &Arc<ClientInner>) -> bool {
                 .get(&frame.id)
                 .cloned();
             match sender {
-                Some(sender) => {
+                Some(session) => {
                     // 背压时必须**显式结束会话**：丢弃单个分片后连接继续，
                     // 对端只看到数据少了一段，属于静默损坏。
                     let deadline = Duration::from_millis(client.queue_timeout_ms);
-                    let sent = tokio::time::timeout(deadline, sender.send(chunk.payload)).await;
+                    let sent =
+                        tokio::time::timeout(deadline, session.sender.send(chunk.payload)).await;
                     if !sent.is_ok_and(|result| result.is_ok()) {
-                        client.remove_session(frame.id);
-                        let _ = client.writer.try_send(mux::encode_end(frame.id, true));
+                        client.fail_session(frame.id);
+                        // 结束帧也要有界等待：写队列也满时，显式断开载体，
+                        // 让 Portal 立刻看到隧道结束，而不是留住半条会话。
+                        let end = mux::encode_end(frame.id, true);
+                        if tokio::time::timeout(deadline, client.writer.send(end))
+                            .await
+                            .is_err()
+                        {
+                            client.close();
+                        }
                     }
                 }
                 None => {
@@ -514,11 +566,7 @@ async fn handle_frame(frame: mux::Frame, client: &Arc<ClientInner>) -> bool {
             true
         }
         Status::End => {
-            client
-                .sessions
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(&frame.id);
+            client.remove_session(frame.id);
             client.remove_udp(frame.id);
             true
         }
@@ -587,6 +635,10 @@ struct SessionStream {
     buffer: Vec<u8>,
     offset: usize,
     shutdown: bool,
+    /// 会话被异常终止（背压丢弃/载体断开）时为真。
+    failed: Arc<AtomicBool>,
+    queue_timeout_ms: u64,
+    shutdown_since: Option<std::time::Instant>,
 }
 
 impl SessionStream {
@@ -633,6 +685,14 @@ impl AsyncRead for SessionStream {
             this.offset = 0;
             match this.incoming.poll_recv(cx) {
                 Poll::Ready(Some(payload)) => this.buffer = payload,
+                Poll::Ready(None) if this.failed.load(Ordering::Acquire) => {
+                    // 已交付的字节先给出，再报错：对端看到的是「连接被终止」，
+                    // 不是一段被静默截断的完整数据。
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "反向会话因背压或载体断开被终止",
+                    )));
+                }
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
                 Poll::Pending => return Poll::Pending,
             }
@@ -679,21 +739,36 @@ impl AsyncWrite for SessionStream {
         if this.shutdown {
             return Poll::Ready(Ok(()));
         }
-        // End 帧必须排进写队列后才算关闭；队列满时返回 Pending，而不是
-        // `try_send` 失败后当作已通知（Portal 会一直留着对端连接）。
+        // End 帧必须排进写队列后才算关闭；队列满时等待，超过
+        // queue_timeout_ms 仍发不出去就返回 BrokenPipe（Portal 会一直留着
+        // 对端连接，不能假装已经通知）。
+        let since = *this
+            .shutdown_since
+            .get_or_insert_with(std::time::Instant::now);
+        let deadline = Duration::from_millis(this.queue_timeout_ms);
         let delivered = {
             let id = this.id;
             let sender = this.sender();
             match sender.poll_reserve(cx) {
                 Poll::Ready(Ok(())) => sender.send_item(mux::encode_end(id, false)).is_ok(),
-                Poll::Ready(Err(_)) => true,
+                Poll::Ready(Err(_)) => false,
+                Poll::Pending if since.elapsed() >= deadline => false,
                 Poll::Pending => return Poll::Pending,
             }
         };
-        let _ = delivered;
         this.shutdown = true;
+        if !delivered {
+            this.failed.store(true, Ordering::Release);
+        }
         this.release();
-        Poll::Ready(Ok(()))
+        if delivered {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "反向隧道无法发送结束帧",
+            )))
+        }
     }
 }
 
@@ -937,16 +1012,44 @@ mod runtime_tests {
         writer: mpsc::Sender<Vec<u8>>,
         sender: mpsc::Sender<Vec<u8>>,
         timeout_ms: u64,
-    ) -> Arc<ClientInner> {
-        Arc::new(ClientInner {
+    ) -> (Arc<ClientInner>, Arc<AtomicBool>) {
+        let failed = Arc::new(AtomicBool::new(false));
+        let client = Arc::new(ClientInner {
             writer,
-            sessions: StdMutex::new(HashMap::from([(7u16, sender)])),
+            sessions: StdMutex::new(HashMap::from([(
+                7u16,
+                Session {
+                    sender,
+                    failed: failed.clone(),
+                },
+            )])),
             udp_sessions: StdMutex::new(HashMap::new()),
             next: AtomicU16::new(1),
             queue_timeout_ms: timeout_ms,
             closed: StdMutex::new(false),
             closed_notify: Notify::new(),
-        })
+        });
+        (client, failed)
+    }
+
+    fn session_stream(
+        client: &Arc<ClientInner>,
+        incoming: mpsc::Receiver<Vec<u8>>,
+        failed: Arc<AtomicBool>,
+        timeout_ms: u64,
+    ) -> SessionStream {
+        SessionStream {
+            id: 7,
+            client: client.clone(),
+            incoming,
+            outgoing: None,
+            buffer: Vec::new(),
+            offset: 0,
+            shutdown: false,
+            failed,
+            queue_timeout_ms: timeout_ms,
+            shutdown_since: None,
+        }
     }
 
     async fn keep_frame(payload: &[u8]) -> mux::Frame {
@@ -967,7 +1070,7 @@ mod runtime_tests {
         let (sender, _rx) = mpsc::channel::<Vec<u8>>(1);
         sender.send(vec![0]).await.unwrap(); // 队列已满
         let (writer, mut frames) = mpsc::channel::<Vec<u8>>(8);
-        let client = client_with(writer, sender, 10);
+        let (client, failed) = client_with(writer, sender, 10);
 
         assert!(handle_frame(keep_frame(&[2]).await, &client).await);
 
@@ -979,10 +1082,40 @@ mod runtime_tests {
                 .is_empty(),
             "投递失败后会话必须被移除"
         );
+        assert!(failed.load(Ordering::Acquire), "会话必须被标记为异常终止");
         let end = frames.recv().await.expect("必须发出 End");
         assert_eq!(end[2..4], 7u16.to_be_bytes(), "End 必须带上会话 id");
         assert_eq!(end[4], 0x03, "帧类型应为 End");
         assert_eq!(end[5], 0x02, "必须以 error 标记，不能静默截断");
+    }
+
+    /// 会话队列与写队列**同时**满时：既投不进分片，也发不出 End。
+    ///
+    /// 改前读端会先拿到已排队的字节、然后收到正常 EOF——调用者只看到
+    /// 「连接正常结束、数据少了一段」。现在必须返回错误，并且因为通知
+    /// 不了 Portal，载体本身要被显式断开。
+    #[tokio::test]
+    async fn double_full_queues_end_with_an_error_not_a_clean_eof() {
+        let (sender, incoming) = mpsc::channel::<Vec<u8>>(1);
+        sender.send(vec![1]).await.unwrap(); // 会话队列已满
+        let (writer, _frames) = mpsc::channel::<Vec<u8>>(1);
+        writer.send(vec![0xff]).await.unwrap(); // 写队列也满
+        let (client, failed) = client_with(writer, sender, 10);
+        let mut stream = session_stream(&client, incoming, failed.clone(), 10);
+
+        assert!(handle_frame(keep_frame(&[2]).await, &client).await);
+
+        assert!(failed.load(Ordering::Acquire), "会话必须被标记为异常终止");
+        let mut out = Vec::new();
+        let error = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut out)
+            .await
+            .expect_err("截断必须返回错误");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe, "{error}");
+        assert_eq!(out, vec![1], "已经交付的字节要保留");
+        assert!(
+            client.is_closed(),
+            "End 帧发不出去时必须断开载体，不能让 Portal 留住半条会话"
+        );
     }
 
     /// 消费者只是慢、还没超时，分片必须排队送达而不是被丢弃。
@@ -991,7 +1124,7 @@ mod runtime_tests {
         let (sender, mut rx) = mpsc::channel::<Vec<u8>>(1);
         sender.send(vec![0]).await.unwrap();
         let (writer, _frames) = mpsc::channel::<Vec<u8>>(8);
-        let client = client_with(writer, sender, 3_000);
+        let (client, _failed) = client_with(writer, sender, 3_000);
 
         let handle = tokio::spawn({
             let client = client.clone();

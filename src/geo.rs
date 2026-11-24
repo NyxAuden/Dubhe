@@ -670,11 +670,19 @@ fn parse_rule_set(path: &Path, budget: &mut Budget) -> Result<RuleSetData> {
         collect_domains(object, "domain_keyword", &mut data.domains)?;
         // 正则保留原文（大小写与首尾空白都可能是语义的一部分）。
         collect_domains(object, "domain_regex", &mut data.domains)?;
-        if let Some(list) = object.get("ip_cidr").and_then(serde_json::Value::as_array) {
-            for item in list {
-                let text = item
-                    .as_str()
-                    .with_context(|| format!("rule-set 的 rules[{index}].ip_cidr 必须是字符串"))?;
+        // sing-box 的 `ip_cidr` 是 `Listable[string]`：字符串与数组都合法。
+        if let Some(value) = object.get("ip_cidr") {
+            let items: Vec<&serde_json::Value> = match value {
+                serde_json::Value::String(_) => vec![value],
+                serde_json::Value::Array(items) => items.iter().collect(),
+                other => bail!(
+                    "rule-set 的 rules[{index}].ip_cidr 必须是字符串或字符串数组，实际 {other}"
+                ),
+            };
+            for item in items {
+                let text = item.as_str().with_context(|| {
+                    format!("rule-set 的 rules[{index}].ip_cidr 必须是字符串，实际 {item}")
+                })?;
                 data.ips.push(parse_cidr_text(text)?);
             }
         }
@@ -1007,6 +1015,39 @@ mod tests {
         );
         assert_eq!(parsed.ips.len(), 2);
         assert_eq!(parsed.ips[0].prefix, 24);
+    }
+
+    /// sing-box 允许 `ip_cidr` 写成单个字符串；此前只认数组，规则集被判为空。
+    #[test]
+    fn accepts_scalar_ip_cidr_and_rejects_wrong_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scalar.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 3,
+                "rules": [{"ip_cidr": "192.0.2.0/24"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let parsed = parse_rule_set(&path, &mut Budget::default()).unwrap();
+        assert_eq!(parsed.ips.len(), 1);
+        assert_eq!(parsed.ips[0].prefix, 24);
+
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": 3,
+                "rules": [{"ip_cidr": 42}, {"domain": "ok.test"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let error = parse_rule_set(&path, &mut Budget::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ip_cidr"), "{error}");
     }
 
     #[test]

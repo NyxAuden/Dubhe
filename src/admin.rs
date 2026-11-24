@@ -175,10 +175,36 @@ async fn handle(
         ("POST", _) if route.starts_with("/stats/users/limits") => {
             // 从**原始** `request.path` 取查询串：`route` 已把 `?...` 去掉。
             let (inbound, user) = query_filters(request.path);
-            let quota =
-                query_value(request.path, "quota_bytes").and_then(|value| value.parse().ok());
-            let expires =
-                query_value(request.path, "expires_at_ms").and_then(|value| value.parse().ok());
+            // 两个参数各自可选，但**给了就必须能解析**：此前分别 `.ok()`，
+            // 一个写错、另一个合法时仍返回 200 并静默忽略错误字段。
+            let quota = match parse_optional(request.path, "quota_bytes") {
+                Ok(value) => value,
+                Err(error) => {
+                    return respond(
+                        &mut stream,
+                        deadline,
+                        400,
+                        "Bad Request",
+                        "",
+                        error.as_bytes(),
+                    )
+                    .await;
+                }
+            };
+            let expires = match parse_optional(request.path, "expires_at_ms") {
+                Ok(value) => value,
+                Err(error) => {
+                    return respond(
+                        &mut stream,
+                        deadline,
+                        400,
+                        "Bad Request",
+                        "",
+                        error.as_bytes(),
+                    )
+                    .await;
+                }
+            };
             if quota.is_none() && expires.is_none() {
                 return respond(
                     &mut stream,
@@ -237,6 +263,17 @@ struct Request<'a> {
 /// 从 `?a=b&c=d` 形式的路径里取查询串。
 fn query_of(path: &str) -> Option<&str> {
     path.split_once('?').map(|(_, query)| query)
+}
+
+/// 查询参数可选；出现但不是合法 `u64` 时返回字段级错误，由调用方回 400。
+fn parse_optional(path: &str, name: &str) -> Result<Option<u64>, String> {
+    match query_value(path, name) {
+        None => Ok(None),
+        Some(value) => value
+            .parse()
+            .map(Some)
+            .map_err(|_| format!(r#"{{"error":"invalid {name}"}}"#)),
+    }
 }
 
 fn query_value(path: &str, key: &str) -> Option<String> {

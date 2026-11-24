@@ -6,6 +6,10 @@
 
 - 独立入口：`vless-grpc`、`vmess-grpc`、`trojan-grpc`。旧 `vless`/`vmess`/`trojan` 入口行为不变。
 - `grpc.path` 必填，1..1024个ASCII可见字符，必须以 `/` 开头，不得包含 `#`/`?`。示例：`/GunService/Tun`。
+- `dubhe convert` 把 Xray 的 `serviceName` 换算成完整路径：老式 `GunService` →
+  `/GunService/Tun`、`/GunService/TunMulti`；新式 `/svc/单|多` → `/svc/单`、`/svc/多`
+  （只在最后一个 `/` 之后解析 `|`）。同一条路径同时注册两种流（Xray 允许）无法在
+  dubhe 里区分，转换会失败。
 - `grpc.multi_path` 可选，规则同上；配置后该路径使用 MultiHunk（多个 `data` 项按顺序拼接），`grpc.path` 仍使用单 Hunk。
 - VLESS gRPC 不接受 `flow`（Vision/REALITY 不组合）；命令 3/`v1.mux.cool` 进入完整 Mux，TCP 会话始终允许，`xudp`（默认开启）控制 Mux 内的 UDP 会话，见 [Mux 说明](mux.md)。
 - VMess gRPC 必须提供真实 TLS 证书/私钥，或配置 `reality` 作为安全层；明文入口不提供（VMess 只信真实 TLS/REALITY）。

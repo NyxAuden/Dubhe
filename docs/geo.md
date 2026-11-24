@@ -179,8 +179,8 @@
 
 `dubhe convert` 会把 `geosite:` 保留到 `domains`、`geoip:` 保留到 `ip_cidrs`，
 并提示需要配置对应的 `geo` 数据文件；`geoip:private` 映射为 `ip_is_private`。
-`ext:`（第三方 dat）无法转换，会以提示方式跳过；如果一条规则的条件全被跳过
-（会退化成无条件规则），转换直接失败，不输出该规则。
+`ext:`（第三方 dat）没有等价字段，转换直接失败——丢弃它会让规则少匹配一批
+地址，流量改走默认出口。
 
 Xray 同一个 `domain` 数组内的各类前缀是**并集**，而 dubhe 的 `domains` 与
 `domain_suffix` / `domain_keyword` / `domain_regex` 之间是**交集**。`convert`

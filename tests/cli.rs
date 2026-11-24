@@ -117,6 +117,73 @@ impl CliProcess {
 /// 并行跑全套测试时实测出现过一次 `AddrInUse`：端口刚被释放、或被并发的
 /// 客户端连接占成 TIME_WAIT。这里只重试一小段时间，**退出码与非 ready 断言
 /// 不变**，监听泄漏仍会让测试失败。
+/// 某个目标没有可用节点时，`export` 不能产出一份「纯直连」的客户端配置。
+///
+/// 之前的实现只检查公共节点列表：一条 gRPC 自定义路径节点在 Xray 可用、
+/// sing-box/Mihomo 不可用，`--to all` 仍退出 0 并写出后两者的纯直连配置。
+#[cfg(unix)]
+#[tokio::test]
+async fn export_refuses_a_target_with_no_usable_node() {
+    let certificate = Certificate::new();
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("server.json");
+    let mut configuration = socks_config();
+    configuration["inbounds"] = json!([{
+        "type": "vless-grpc", "tag": "g", "listen": "127.0.0.1:8443",
+        "users": [{"name": "a", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
+        "grpc": {"path": "/svc/custom"},
+        "certificate": certificate.dir.path().join("cert.pem"),
+        "private_key": certificate.dir.path().join("key.pem")
+    }]);
+    fs::write(&config_path, configuration.to_string()).unwrap();
+
+    let export_dir = directory.path().join("all");
+    let status = Command::new(BINARY)
+        .args([
+            "export",
+            "-c",
+            config_path.to_str().unwrap(),
+            "--host",
+            "example.com",
+            "-o",
+            export_dir.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success(), "--to all 有目标不可导出时必须失败");
+    assert!(
+        !export_dir.exists(),
+        "失败时不能留下半套文件：{:?}",
+        fs::read_dir(&export_dir).map(|entries| entries.count())
+    );
+
+    // 同一个节点导出到 Xray 仍然可行（自定义路径只有它能表达）。
+    let xray_dir = directory.path().join("xray");
+    let status = Command::new(BINARY)
+        .args([
+            "export",
+            "--to",
+            "xray",
+            "-c",
+            config_path.to_str().unwrap(),
+            "--host",
+            "example.com",
+            "-o",
+            xray_dir.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "Xray 目标应可导出");
+    let value: Value =
+        serde_json::from_str(&fs::read_to_string(xray_dir.join("xray-client.json")).unwrap())
+            .unwrap();
+    assert_eq!(value["outbounds"][0]["tag"], "g");
+}
+
 fn bind_released(address: std::net::SocketAddr) -> StdListener {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
@@ -176,6 +243,10 @@ async fn export_and_convert_outputs_are_owner_only() {
     )
     .unwrap();
     let convert_output = directory.path().join("converted.json");
+    // 已存在的旧文件：覆盖后必须收紧到 0600，且是一次完整替换
+    // （临时文件 + rename），目录里不能留下 .tmp。
+    fs::write(&convert_output, "old").unwrap();
+    fs::set_permissions(&convert_output, fs::Permissions::from_mode(0o644)).unwrap();
     let status = Command::new(BINARY)
         .args([
             "convert",
@@ -193,7 +264,7 @@ async fn export_and_convert_outputs_are_owner_only() {
     for path in [
         export_dir.join("xray-client.json"),
         export_dir.join("sing-box-client.json"),
-        convert_output,
+        convert_output.clone(),
     ] {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -203,6 +274,17 @@ async fn export_and_convert_outputs_are_owner_only() {
             path.display()
         );
     }
+    // 覆盖写入了完整 JSON，而不是旧内容或半份配置。
+    let converted: Value =
+        serde_json::from_str(&fs::read_to_string(&convert_output).unwrap()).unwrap();
+    assert_eq!(converted["version"], 1);
+    let leftovers: Vec<_> = fs::read_dir(directory.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "不应留下临时文件：{leftovers:?}");
 }
 
 fn reserve_port() -> std::net::SocketAddr {

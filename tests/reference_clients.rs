@@ -1987,6 +1987,24 @@ async fn real_interop(name: &str, protocol: Protocol) -> Result<()> {
     // 而不是让它去解析一份自己不认识的出站配置。
     if let Some(reason) = protocol.unsupported_reason(name) {
         eprintln!("跳过：{} {}；{}", name, protocol.mode(), reason);
+        // 仍然写出机器可读结果：`passed` 只表示「该用例没有失败」，
+        // 不支持不能算进互通覆盖数。
+        let root = project().join(".test-artifacts");
+        fs::create_dir_all(&root)?;
+        let artifacts = tempfile::Builder::new()
+            .prefix(&format!("interop-{name}-{}-unsupported-", protocol.mode()))
+            .tempdir_in(&root)?
+            .keep();
+        private_write(
+            &artifacts.join("result.json"),
+            &serde_json::to_vec_pretty(&json!({
+                "client": name,
+                "protocol": protocol.name(),
+                "mode": protocol.mode(),
+                "status": "unsupported",
+                "reason": reason,
+            }))?,
+        )?;
         return Ok(());
     }
     let client = reference_client(name)?;
@@ -2010,10 +2028,18 @@ async fn real_interop(name: &str, protocol: Protocol) -> Result<()> {
     .context("真实客户端互通测试超过 60 秒")
     .and_then(|result| result);
     let mut report = match &result {
-        Ok(scenarios) => json!({"client": name, "version": client.version,
-            "protocol": protocol.name(), "mode": protocol.mode(), "status": "passed",
-            "certificate_verification": "custom trust with localhost verification; unrelated certificate rejected",
-            "scenarios": scenarios}),
+        Ok(scenarios) => {
+            // 只声明真正跑过的检查：REALITY/Snell 没有常规证书校验场景。
+            let certificate_verification = if scenarios.get("untrusted-certificate").is_some() {
+                "custom trust with localhost verification; unrelated certificate rejected"
+            } else {
+                "not_applicable"
+            };
+            json!({"client": name, "version": client.version,
+                "protocol": protocol.name(), "mode": protocol.mode(), "status": "passed",
+                "certificate_verification": certificate_verification,
+                "scenarios": scenarios})
+        }
         Err(error) => json!({"client": name, "version": client.version,
             "protocol": protocol.name(), "mode": protocol.mode(), "status": "failed", "error": format!("{error:#}")}),
     };

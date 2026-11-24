@@ -147,16 +147,19 @@ Xray 输出按 v26 结构生成：
 行为约定：
 
 - 转换结果会再走一遍本项目校验，**不可能输出无法启动的配置**。
-- `geosite:`/`geoip:`/`ext:` 规则集、`fallback`、`balancerTag`、XHTTP 的
-  `downloadSettings`、`sockopt.dialerProxy` 链式代理会写进报告或直接报错，
-  不会静默丢弃。
+- `geosite:`/`geoip:` 引用会保留在 `domains`/`ip_cidrs` 并提示配置数据文件；
+  `ext:` 规则集、`fallback`、`balancerTag`、XHTTP 的 `downloadSettings`、
+  `sockopt.dialerProxy` 链式代理、TCP header 伪装、证书固定与客户端证书
+  直接报错，不会静默丢弃（完整清单见 `docs/migration.md`）。
 - 默认出口跟随 Xray：**配置里第一个出站**。按 tag 名猜 `proxy`/`direct` 会让
   `[{tag:"node"},{tag:"direct"}]` 这样的配置变成默认直连。
 - 同一个 `domain` 数组内的 `domain:`/`keyword:`/`regexp:`/`full:` 是并集，
   转换后拆成多条同出站的相邻规则，保持并集语义。
-- gRPC 的 `serviceName` 是服务名，客户端实际请求 `/<service>/Tun`；
-  `convert` 会自动补流名，`export` 会去掉流名。multiMode 与自定义多段路径
-  只有 Xray 目标能表达。
+- gRPC 的 `serviceName` 是服务名，客户端实际请求 `/<service>/Tun`；`convert`
+  按 Xray 的规则补流名（新式 `/<service>/单流|多流` 只在最后一个 `/` 之后解析），
+  `export` 写各客户端能用的形式：Xray / Mihomo / Anywhere 用完整路径，
+  sing-box 用 `/<service>/Tun` 里的服务名。双路径服务导出成单流客户端即可用；
+  单段路径与含 `%` 的路径按目标报不可导出。
 - SOCKS/HTTP 出站的 `streamSettings.security = "tls"` 会保留；
   Shadowsocks 出站不支持 TLS，遇到直接报错而不是降成明文。
 - 带 TLS 的出站必须用 `--ca-file` 指定信任锚 PEM；本项目不隐式信任系统根证书。

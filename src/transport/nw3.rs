@@ -33,8 +33,10 @@ pub(crate) fn portal_url(
     match (certificate, private_key) {
         (Some(certificate), Some(private_key)) => {
             push_query(&mut query, "tls", "2");
-            push_query(&mut query, "crt", &certificate.to_string_lossy());
-            push_query(&mut query, "key", &private_key.to_string_lossy());
+            // 证书与私钥是**原始文件路径**：文件名里的字面 `%20` 必须变成
+            // `%2520`，否则会被 Nowhere 解码成空格，打开一个不存在的文件。
+            push_raw_query(&mut query, "crt", &certificate.to_string_lossy());
+            push_raw_query(&mut query, "key", &private_key.to_string_lossy());
         }
         _ => push_query(&mut query, "tls", "1"),
     }
@@ -84,6 +86,25 @@ fn push_query(query: &mut String, name: &str, value: &str) {
             query.push_str(&format!("%{byte:02X}"));
         }
         index += 1;
+    }
+}
+
+/// 追加一个「原始文本」查询参数：`%` 一律编码成 `%25`。
+///
+/// 用于文件路径等本来就是字面值的参数；SOCKS 端点的既有 `%XX` 转义仍走
+/// [`push_query`]。
+fn push_raw_query(query: &mut String, name: &str, value: &str) {
+    if !query.is_empty() {
+        query.push('&');
+    }
+    query.push_str(name);
+    query.push('=');
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/' | b':') {
+            query.push(char::from(*byte));
+        } else {
+            query.push_str(&format!("%{byte:02X}"));
+        }
     }
 }
 
@@ -330,6 +351,30 @@ mod tests {
         let debug = format!("{out:?}");
         assert_eq!(debug, "socks");
         assert!(!debug.contains("alice") && !debug.contains("s3cret"));
+    }
+
+    /// 文件名里的字面 `%20` 必须编码成 `%2520`：Nowhere 只解码一次，
+    /// 此前会把它当成空格，`run` 时打开一个不存在的路径。
+    #[test]
+    fn literal_percent_in_certificate_paths_survives_decoding() {
+        let url = direct_portal_url(
+            false,
+            Some(Path::new("/etc/ssl/cert%20literal.pem")),
+            Some(Path::new("/etc/ssl/key+plus.pem")),
+        );
+        assert!(
+            url.as_str().contains("crt=/etc/ssl/cert%2520literal.pem"),
+            "{url}"
+        );
+        let query = query(&url);
+        assert_eq!(
+            query.get("crt").map(String::as_str),
+            Some("/etc/ssl/cert%20literal.pem")
+        );
+        assert_eq!(
+            query.get("key").map(String::as_str),
+            Some("/etc/ssl/key+plus.pem")
+        );
     }
 
     #[test]

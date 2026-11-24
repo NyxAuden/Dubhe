@@ -59,6 +59,42 @@
 - **`dubhe convert` 把 domain 并集转成交集**：Xray 同一个 `domain` 数组内
   `domain:`/`keyword:`/`regexp:`/`full:`/`geosite:` 是并集，而它们在本项目里是
   不同字段、彼此取交集。现在按种类拆成多条同出站的相邻规则，语义仍是并集。
+- **`convert` 把裸域名当成精确域名**：Xray 的 `domain:["example.com"]` 是
+  **子串匹配**（`Domain_Substr`，实测也命中 `notexample.com`），此前写成
+  `domains`（精确）会漏掉子域名，把本该走代理的流量送到默认出口。现在写入
+  `domain_keyword`；`dotless:` 按 Xray 的同一条正则翻译成 `domain_regex`。
+- **`convert` 静默丢弃规则条件**：`!ip`、`ext:` 这类无法表达的条件此前只写
+  进报告，剩下的 `port` 仍会输出——规则从「该域名的 443」扩大成「所有 443」，
+  后面的规则再也匹配不到。现在任一条件被丢弃就失败，不输出可能扩大范围的规则。
+- **`convert` 丢掉 TLS 的证书固定与客户端证书**：`pinnedPeerCertSha256`、
+  `verifyPeerCertByName`、mTLS 证书、`minVersion: 1.3` 都是在收紧信任条件，
+  丢弃等于放宽。现在直接报错；`allowInsecure`/`alpn`/`fingerprint` 只写进报告。
+- **`export` 在「某个目标没有可用节点」时仍生成纯直连配置**：此前只检查公共
+  节点列表，一条只有 Xray 能表达的节点会让 sing-box/Mihomo 得到
+  `route.final=direct` / `MATCH,DIRECT`，断服后依然能上网。现在按目标拒绝导出，
+  `--to all` 先在内存里渲染全部结果，任一目标失败就不写任何文件。
+- **反向 Mux 截断被当成正常 EOF**：队列满且 End 帧也发不出去时，Bridge 侧读端
+  先返回已排队字节、再返回 `Ok(EOF)`。现在会话带终止原因，读端返回
+  `BrokenPipe`；通知不了 Portal 时显式断开载体。`poll_shutdown` 遇到永久满队列
+  会在 `dial_timeout_ms` 后返回错误，不再无限等待。
+- **gRPC 的新式 `serviceName` 解析错位**：`/svc/a|b` 此前被拆成 `/svc/a` 与
+  `/b`（丢了服务前缀）。现在按 Xray 的规则在最后一个 `/` 处切分；同一路径
+  注册单流与多流时直接报错。导出侧改成 Xray/Mihomo/Anywhere 写完整路径、
+  sing-box 写 `/<service>/Tun` 的服务名，双路径服务导出成单流客户端即可用。
+- **NW3 证书路径里的字面 `%20` 被当成空格**：证书/私钥参数现在按原始文本编码
+  （`%` → `%25`），SOCKS 端点的既有 `%XX` 行为不变。
+- **sing-box 规则集的标量 `ip_cidr` 被忽略**：`"ip_cidr": "192.0.2.0/24"` 与
+  `[...]` 现在等价；字段类型错误会报该字段，而不是让整个规则集被判为空。
+- **管理 API 接受部分无效的限额更新**：`quota_bytes=oops&expires_at_ms=123`
+  此前返回 200 并静默忽略错误字段，现在返回 400 且两个字段都不生效。
+- **导出/转换的覆盖写不是原子的**：先写同目录 0600 临时文件再 `rename`，
+  中途失败保留旧文件，已有 0644 文件不会在写入期间短暂可见。
+- **导出节点名与辅助名冲突**：节点 tag 叫 `direct`（Xray/sing-box）或 `PROXY`
+  （Mihomo）时，辅助出站与代理组会自动改名，`xray run -test` 不再报
+  `existing tag found`。
+- **互通报告声明了没跑过的检查**：`certificate_verification` 按实际场景派生
+  （REALITY/Snell 为 `not_applicable`），不支持的组合写出
+  `status: "unsupported"`，不再计入互通覆盖数。
 - **`dubhe export` 的 Xray / sing-box 客户端默认直连**：Xray 导出把
   `freedom` 放在首个出站，sing-box 写死 `route.final: "direct"`，两者都会
   在节点离线时照常访问目标，用户很难察觉。现在默认出口指向第一个可用节点，
