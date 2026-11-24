@@ -592,8 +592,8 @@ async fn xudp_ws_and_wss_global_id_takeover_moves_sink_and_ends_old_session() {
         response(&mut one).await;
         let shared = recv_udp(&destination, b"one").await;
 
-        // 同一 GlobalID（不同用户/连接）复用关联并把回程 sink 迁到后到连接。
-        let mut bytes = header(0x22, 3, &[], &[]);
+        // 同一账户、同一 GlobalID（两条连接）复用关联并把回程 sink 迁到后到连接。
+        let mut bytes = header(0x11, 3, &[], &[]);
         bytes.extend(xframe_gid(
             0,
             1,

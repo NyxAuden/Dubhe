@@ -75,6 +75,45 @@ curl -fsS -H "Authorization: Bearer $(cat /etc/dubhe/api.token)" \
 
 `/metrics` 是 Prometheus 文本格式，当前包含进程存活、构建版本、连接/TCP/UDP/gRPC/XHTTP 活动量、上下行业务字节、丢弃和拒绝计数。它不包含目标地址、凭据或业务载荷。`/stats` 为 JSON，`/connections` 和 `DELETE /connections/{id}` 用于活动 TCP 连接查看与关闭；管理 API 只支持回环监听。
 
+### 管理 API 一览
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/healthz` | 存活探针，固定返回 `{"status":"ok"}`；**不表示新配置已生效** |
+| GET | `/stats` | 全局计数快照（JSON） |
+| GET | `/stats/users` | 按入口+用户计数，含 `quota_bytes` / `expires_at_ms` |
+| POST | `/stats/users/reset` | 清零计数；`?inbound=` / `?user=` 缩小范围，**省略即清全部** |
+| POST | `/stats/users/limits` | 设置准入配额/到期；显式给 `inbound` + `user` 时会先建条目 |
+| GET | `/metrics` | Prometheus 文本；只读，其他方法返回 405 |
+| GET | `/connections` | 活动 TCP 连接列表（含目标元数据） |
+| DELETE | `/connections/{id}` | 关闭单条连接 |
+| DELETE | `/connections` | 关闭全部连接 |
+
+响应语义：
+
+- `{"updated":0}` 表示**没有匹配的计数条目**。只给 `user=` 或只给 `inbound=`
+  时不会新建条目；两项都给才会新建。
+- 配额与到期是**准入控制**：只拒绝新连接，不断开已建立连接；计数与限额都不
+  持久化，重启后归零。
+- `/connections` 的条目有目标地址；这个 token 因此等同于「可读取用户访问了
+  哪里」。只应放在面板后端，不要下发到浏览器。
+
+### 重载契约（面板接入必须知道）
+
+`SIGHUP` 有三条不同路径，结果不能都显示成「已生效」：
+
+| 情况 | 行为 | 已建立连接 |
+|---|---|---|
+| 配置内容与磁盘一致 | 只做证书轮换（`reload_tls`） | 保持原证书 |
+| `inbounds`/`limits`/`api`/`nw3_egress`/`reverse_bridges` **未变** | 原子替换路由、DNS、嗅探、出站（`reload_hot`） | 继续用握手时的旧快照 |
+| 上述任一变化、存在 UDP 监听或反向 Portal | 停止旧实例后重新绑定（`reload_stop` → `bind`） | **全部断开** |
+
+- 校验失败（`check` 或解析失败）时**旧实例继续运行**，新配置不生效。
+- 重新绑定时若新配置绑定失败，会尝试重新绑定旧配置；面板不能假设「返回成功」
+  就等于「新配置在跑」。
+- 目前没有「哪一版配置已生效」的机器可读接口；要确认生效，请用**业务结果**
+  （新连接是否按新路由/新用户工作）验证，不要用 `/healthz` 的 200。
+
 ## 日志
 
 默认 JSON 日志写 stderr，由 journald 收集和轮转：

@@ -9,7 +9,7 @@ use common::{Echo, Running};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::UdpSocket,
+    net::{TcpStream, UdpSocket},
     time::{Duration, sleep},
 };
 
@@ -45,6 +45,8 @@ fn portal_config(cert: Option<&common::Certificate>, vision: bool) -> Value {
             "default": "portal",
             "rules": [{"domains": ["v1.rvs.cool"], "outbound": "portal"}]
         },
+        // 路由回落是旧兼容行为，默认关闭；这是它的专用用例。
+        "reverse_route_fallback": true,
         "limits": {"shutdown_timeout_ms": 100, "handshake_timeout_ms": 3000}
     })
 }
@@ -260,4 +262,44 @@ fn bridge_configuration_requires_an_existing_vless_outbound() {
             .and_then(|config| config.validate().map(|()| config))
             .is_err()
     );
+}
+
+/// 未声明 `users[].reverse.tag` 的账户默认不能成为 Portal 载体。
+///
+/// 否则任何已认证账户只要把命令 4 的固定域名路由到 reverse 出站，就能注册
+/// 一条反向隧道。
+#[tokio::test]
+async fn undeclared_user_cannot_register_portal_without_fallback() {
+    let mut value = portal_config(None, false);
+    // 关掉兼容开关：未声明账户连命令 4 都不能用。
+    value["reverse_route_fallback"] = json!(false);
+    let portal = Running::start(value).await;
+    let bridge = Running::start(bridge_config(portal.address, None, false)).await;
+    // 给足重连时间：Bridge 会反复尝试并失败。
+    sleep(Duration::from_millis(700)).await;
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let users = portal.addresses[1];
+    // SOCKS 层可能拒绝（code=1，无可用隧道）或建连后立即 EOF；两者都
+    // 表明业务没有经反向隧道中继。
+    let mut client = TcpStream::connect(users).await.unwrap();
+    client.write_all(&[5, 1, 0]).await.unwrap();
+    let mut reply = [0u8; 2];
+    client.read_exact(&mut reply).await.unwrap();
+    let mut request = vec![5, 1, 0];
+    request.extend(common::address(echo.address));
+    client.write_all(&request).await.unwrap();
+    let mut head = [0u8; 2];
+    let read = tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut head)).await;
+    if read.is_ok() && read.as_ref().unwrap().is_ok() && head[1] == 0 {
+        client.write_all(b"must-not-relay").await.unwrap();
+        let mut buffer = [0u8; 14];
+        let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buffer)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Err(_)),
+            "没有隧道时不得有业务回显: {read:?}"
+        );
+    }
+    drop(client);
+    portal.shutdown().await;
+    bridge.shutdown().await;
 }

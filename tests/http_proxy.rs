@@ -276,3 +276,38 @@ async fn tls_mixed_supports_http_and_socks_connect() {
     socks.read_exact(&mut echoed).await.unwrap();
     assert_eq!(&echoed, b"mixed-tls");
 }
+
+#[tokio::test]
+async fn mixed_and_https_close_silent_handshakes() {
+    // 认证前的等待必须有绝对期限：不发送任何字节的连接不能长期占住握手槽。
+    let mut value = config("mixed", json!([]));
+    value["limits"] = json!({"handshake_timeout_ms": 300, "shutdown_timeout_ms": 300});
+    let running = Running::start(value).await;
+    let mut silent = TcpStream::connect(running.address).await.unwrap();
+    let started = std::time::Instant::now();
+    let mut buffer = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), silent.read(&mut buffer))
+        .await
+        .expect("Mixed 静默连接必须在上限内被关闭，而不是一直挂起");
+    assert!(matches!(read, Ok(0) | Err(_)), "预期关闭，得到 {read:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    drop(silent);
+    running.shutdown().await;
+
+    let cert = common::Certificate::new();
+    let mut value = config("http", json!([]));
+    value["limits"] = json!({"handshake_timeout_ms": 300, "shutdown_timeout_ms": 300});
+    value["inbounds"][0]["certificate"] = json!(cert.dir.path().join("cert.pem"));
+    value["inbounds"][0]["private_key"] = json!(cert.dir.path().join("key.pem"));
+    let running = Running::start(value).await;
+    // 连上但不发 TLS ClientHello。
+    let mut silent = TcpStream::connect(running.address).await.unwrap();
+    let started = std::time::Instant::now();
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), silent.read(&mut buffer))
+        .await
+        .expect("HTTPS 静默连接必须在上限内被关闭，而不是一直挂起");
+    assert!(matches!(read, Ok(0) | Err(_)), "预期关闭，得到 {read:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    drop(silent);
+    running.shutdown().await;
+}

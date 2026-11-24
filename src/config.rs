@@ -80,6 +80,13 @@ pub struct Config {
     /// Xray 反向 Mux 的 Bridge 角色：主动连接 Portal，并在隧道上运行 Mux 服务端。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reverse_bridges: Vec<ReverseBridge>,
+    /// 允许未声明 `users[].reverse.tag` 的账户按路由匹配成为 Portal 载体。
+    ///
+    /// 默认关闭：Xray 语义下只有显式声明的账户才能建立反向隧道。旧配置若
+    /// 依赖「命令 4 的固定域名被路由到 reverse 出站」，需要显式打开此开关；
+    /// 打开后任何已认证账户都能注册为载体，只适合受控部署。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reverse_route_fallback: bool,
 }
 
 /// 反向 Mux Bridge：引用一个已配置的 VLESS 出站作为到 Portal 的连接。

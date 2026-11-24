@@ -184,7 +184,7 @@ pub(crate) async fn serve_generic<S: DetourStream + 'static>(
     drop(handshake);
     let identity = prepared.identity(stream.user_key())?;
     let user = prepared.user_name(identity);
-    let stream = ctx.stats.count_user(tag, user.as_deref(), stream);
+    let stream = ctx.stats.admit_counter(tag, user.as_deref(), stream)?;
     if let Some(version) = crate::udp::uot_version(&target) {
         return crate::udp::uot(stream, ctx, tag.to_owned(), version, user.as_deref()).await;
     }

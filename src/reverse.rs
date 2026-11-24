@@ -1052,6 +1052,7 @@ mod runtime_tests {
                         {{"inbounds": ["socks"], "outbound": "portal"}}
                     ]
                 }},
+                "reverse_route_fallback": true,
                 "limits": {{"shutdown_timeout_ms": 100, "handshake_timeout_ms": 3000}}
             }}"#
         ))

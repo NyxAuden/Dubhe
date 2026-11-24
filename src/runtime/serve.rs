@@ -18,10 +18,17 @@ pub(super) fn serve_reverse<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // 优先用 `users[].reverse.tag` 声明的归属（Xray 写法）；
-    // 未声明时回退到路由匹配，兼容既有 `reverse_bridges` 配置。
+    // 优先用 `users[].reverse.tag` 声明的归属（Xray 写法）。
+    // 未声明时默认拒绝：否则任何已认证账户只要命中 reverse 路由就能成为
+    // Portal 载体。旧行为需显式打开 `reverse_route_fallback`。
     let tag = match declared {
         Some(tag) => std::sync::Arc::<str>::from(tag),
+        None if !ctx.reverse_route_fallback => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "该账户未声明 reverse.tag，不能建立反向隧道",
+            ));
+        }
         None => {
             let target = Target {
                 host: Host::Domain(REVERSE_TARGET.to_owned()),
@@ -141,7 +148,7 @@ pub(super) async fn serve_controlled_vless<
         let (stream, route, dial) =
             crate::transport::sniff::sniff_route(&ctx, tag, stream, &target).await;
         let upstream = ctx.connect_routed(tag, &route, &dial).await?;
-        let stream = ctx.stats.count_user(tag, user.as_deref(), stream);
+        let stream = ctx.stats.admit_counter(tag, user.as_deref(), stream)?;
         return forward::relay(stream, upstream, ctx.stats.clone()).await;
     }
     match accepted.accepted {
@@ -155,7 +162,7 @@ pub(super) async fn serve_controlled_vless<
             timeout(deadline, vless::reply(&mut stream))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "应答超时"))??;
-            let stream = ctx.stats.count_user(tag, user.as_deref(), stream);
+            let stream = ctx.stats.admit_counter(tag, user.as_deref(), stream)?;
             forward::relay(stream, target, ctx.stats.clone()).await
         }
         vless::Accepted::Single(request) => {
@@ -272,7 +279,7 @@ pub(super) async fn serve_plain_vision_vless_impl<
         let (stream, route, dial) =
             crate::transport::sniff::sniff_route(&ctx, tag, stream, &target).await;
         let upstream = ctx.connect_routed(tag, &route, &dial).await?;
-        let stream = ctx.stats.count_user(tag, user.as_deref(), stream);
+        let stream = ctx.stats.admit_counter(tag, user.as_deref(), stream)?;
         return forward::relay(stream, upstream, ctx.stats.clone()).await;
     }
     match accepted.accepted {
@@ -286,7 +293,7 @@ pub(super) async fn serve_plain_vision_vless_impl<
             timeout(deadline, vless::reply(&mut stream))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "应答超时"))??;
-            let stream = ctx.stats.count_user(tag, user.as_deref(), stream);
+            let stream = ctx.stats.admit_counter(tag, user.as_deref(), stream)?;
             forward::relay(stream, target, ctx.stats.clone()).await
         }
         vless::Accepted::Single(request) => {
@@ -433,7 +440,7 @@ pub(crate) async fn serve_vmess_scoped<
 ) -> io::Result<()> {
     // VMess 认证已完成：之后所有客户端字节归到该用户，Mux 子流共用承载。
     let user = accepted.user.clone();
-    let mut stream = ctx.stats.count_user(tag, Some(user.as_str()), stream);
+    let mut stream = ctx.stats.admit_counter(tag, Some(user.as_str()), stream)?;
     // 命令 3 与「命令 1 + v1.mux.cool」都进入复用层。
     let mux = matches!(&accepted.mode, vmess::Mode::Mux)
         || matches!(
@@ -662,9 +669,10 @@ pub(crate) async fn serve_plain_vless_scoped<
         vless::Accepted::Mux { .. } | vless::Accepted::Reverse { .. }
     );
     let mut stream = if is_mux {
+        // Mux 子流按账户准入：外层只统计承载帧。
         ctx.stats.count_user(tag, None, stream)
     } else {
-        ctx.stats.count_user(tag, user.as_deref(), stream)
+        ctx.stats.admit_counter(tag, user.as_deref(), stream)?
     };
     if let vless::Accepted::Reverse { tag: declared, .. } = &accepted {
         let declared = declared.clone();
@@ -763,7 +771,9 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let target = &request.target;
-    let stream = ctx.stats.count_user(tag, request.user.as_deref(), stream);
+    let stream = ctx
+        .stats
+        .admit_counter(tag, request.user.as_deref(), stream)?;
     let (stream, route, dial) =
         crate::transport::sniff::sniff_route(&ctx, tag, stream, target).await;
     let target = ctx.connect_routed(tag, &route, &dial).await?;
@@ -810,7 +820,7 @@ pub(super) async fn serve_socks5(
     let user = request.user.clone();
     match request.command {
         Command::Connect => {
-            let stream = ctx.stats.count_user(tag, user.as_deref(), stream);
+            let stream = ctx.stats.admit_counter(tag, user.as_deref(), stream)?;
             serve_socks5_connect(stream, tag, ctx, deadline, request.target).await
         }
         Command::UdpAssociate => {
@@ -997,7 +1007,9 @@ where
 {
     match tls {
         Some(tls) => {
-            let accepted = tls.accept(stream).await?;
+            let accepted = timeout(deadline, tls.accept(stream))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTPS 握手超时"))??;
             let alpn = accepted.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
             if alpn.as_deref() == Some(b"h2") {
                 return serve_http_h2(accepted, tag, users, ctx, deadline, handshake).await;
@@ -1024,7 +1036,7 @@ where
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP 代理握手超时"))??;
     drop(handshake);
     let user = accepted.request.user.clone();
-    let mut stream = ctx.stats.count_user(tag, user.as_deref(), stream);
+    let mut stream = ctx.stats.admit_counter(tag, user.as_deref(), stream)?;
     let target = match ctx.connect(tag, &accepted.request.target).await {
         Ok(target) => target,
         Err(error) => {

@@ -39,6 +39,21 @@ Portal 侧（接收 Bridge 拨入）推荐 Xray 写法，可以直接照搬：
 `users[].reverse.tag` 在**配置解析阶段**校验：tag 格式必须有效、必须指向存在的
 出站、且该出站的 kind 必须是 `reverse`。写错会立即报错，不会拖到运行期。
 
+**未声明 `reverse.tag` 的账户默认不能建立反向隧道**（返回 `PermissionDenied`）。
+这是 Xray 的语义：Portal 载体的归属必须由账户显式声明，否则任何已认证账户只要
+命中指向 `reverse` 出站的路由，就能注册成载体。
+
+旧配置若依赖「命令 4 的固定域名 `v1.rvs.cool` 被路由到 `reverse` 出站」来定
+归属，需要显式打开顶层开关：
+
+```json
+{ "reverse_route_fallback": true }
+```
+
+打开后回落行为与从前一致，但**任何已认证账户都能注册载体**，只应在这种受控
+部署里使用。该开关默认关闭，且不持久化到运行期以外的任何地方（它就是普通配置
+字段）。
+
 Bridge 侧仍用顶层 `reverse_bridges`（Xray 的对应写法是给 `vless` 出站加
 `settings.reverse.tag`）。
 

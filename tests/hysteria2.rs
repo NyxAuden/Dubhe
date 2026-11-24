@@ -1078,6 +1078,28 @@ async fn masquerade_file_serves_directory_content() {
     running.shutdown().await;
 }
 
+/// 站点目录里的符号链接不能把伪装文件服务扩展到目录之外。
+#[tokio::test]
+async fn masquerade_file_rejects_symlink_outside_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, b"outside-root").unwrap();
+    std::os::unix::fs::symlink(&secret, directory.path().join("link.txt")).unwrap();
+    let cert = common::Certificate::new();
+    let mut value = config(&cert);
+    value["inbounds"][0]["masquerade"] = json!({
+        "type": "file",
+        "directory": directory.path().to_string_lossy()
+    });
+    let running = Running::start(value).await;
+
+    let (status, body) = masquerade_request(&running, &cert, "/link.txt").await;
+    assert_eq!(status, 404, "符号链接逃逸必须被拒绝，正文: {body:?}");
+    assert_ne!(body, b"outside-root");
+    running.shutdown().await;
+}
+
 /// Hysteria2 的首包嗅探：客户端把 ClientHello 与 TCPRequest 一起发出时，
 /// 服务端应能读到 SNI 并据此选路。
 ///

@@ -313,7 +313,7 @@ async fn handle(
         )
         .await
     } else {
-        let tunnel = ctx.stats.count_user(tag, user.as_deref(), tunnel);
+        let tunnel = ctx.stats.admit_counter(tag, user.as_deref(), tunnel)?;
         crate::forward::relay(tunnel, upstream.expect("非UoT已建目标"), ctx.stats.clone()).await
     };
     let sent = writer.await.map_err(error)?;

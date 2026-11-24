@@ -403,28 +403,42 @@ async fn handle_inner(
             serve_http(stream, tag, users, tls, ctx, deadline, handshake).await
         }
         Inbound::Mixed { tag, users, .. } => {
-            Box::pin(async move {
-                if let Some(tls) = tls {
-                    let mut stream: Box<dyn tls::Io> = Box::new(tls.accept(stream).await?);
+            // 认证前的等待必须共用同一个绝对期限：TLS 握手和首字节探测
+            // 都不能无限挂起，否则一条不说话的连接就能长期占住握手槽。
+            let absolute = tokio::time::Instant::now() + deadline;
+            let (stream, socks5): (Box<dyn tls::Io>, bool) = match tls {
+                Some(tls) => {
+                    let mut stream: Box<dyn tls::Io> = Box::new(
+                        tokio::time::timeout_at(absolute, tls.accept(stream))
+                            .await
+                            .map_err(|_| {
+                                io::Error::new(io::ErrorKind::TimedOut, "Mixed TLS 握手超时")
+                            })??,
+                    );
                     let mut first = [0u8; 1];
-                    stream.read_exact(&mut first).await?;
+                    tokio::time::timeout_at(absolute, stream.read_exact(&mut first))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "Mixed 首字节超时")
+                        })??;
                     let stream = crate::transport::xhttp::PrefixReader::new(first.to_vec(), stream);
-                    if first[0] == 5 {
-                        serve_socks5_stream(stream, tag, users, ctx, deadline, handshake).await
-                    } else {
-                        serve_http(stream, tag, users, None, ctx, deadline, handshake).await
-                    }
-                } else {
-                    let mut first = [0u8; 1];
-                    stream.peek(&mut first).await?;
-                    if first[0] == 5 {
-                        serve_socks5(stream, tag, users, ctx, deadline, handshake).await
-                    } else {
-                        serve_http(stream, tag, users, None, ctx, deadline, handshake).await
-                    }
+                    (Box::new(stream), first[0] == 5)
                 }
-            })
-            .await
+                None => {
+                    let mut first = [0u8; 1];
+                    tokio::time::timeout_at(absolute, stream.peek(&mut first))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "Mixed 首字节超时")
+                        })??;
+                    (Box::new(stream), first[0] == 5)
+                }
+            };
+            if socks5 {
+                serve_socks5_stream(stream, tag, users, ctx, deadline, handshake).await
+            } else {
+                serve_http(stream, tag, users, None, ctx, deadline, handshake).await
+            }
         }
         Inbound::Trojan {
             tag,

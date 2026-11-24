@@ -128,6 +128,7 @@ impl Fixture {
             connections: Arc::new(crate::connections::Registry::default()),
             reverse: Arc::new(crate::reverse::Registry::default()),
             reverse_bridges: Vec::new(),
+            reverse_route_fallback: false,
         };
         Self {
             prepared: Arc::new(Prepared {

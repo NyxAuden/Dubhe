@@ -90,6 +90,31 @@ impl Packet {
         })
     }
 }
+/// 二级队列（SS / Snell / TUIC / Hysteria2 的按目标上行）的排队载荷。
+///
+/// 这些队列只按包数限长，而单包可达 `limits.max_udp_payload`；不随包持有
+/// 字节额度时，一个关联就能囤积「包数 × 最大载荷」的内存，绕过
+/// `limits.udp_queue_bytes`。额度在出队并写完上游后才归还。
+pub(crate) struct QueuedUplink {
+    pub payload: Vec<u8>,
+    _budget: OwnedSemaphorePermit,
+}
+
+impl QueuedUplink {
+    /// 额度不足就丢弃该包，与其它 UDP 路径的失败关闭一致。
+    pub(crate) fn reserve(ctx: &Context, payload: Vec<u8>) -> Option<Self> {
+        let budget = ctx
+            .udp_bytes
+            .clone()
+            .try_acquire_many_owned(u32::try_from(payload.len().max(1)).ok()?)
+            .ok()?;
+        Some(Self {
+            payload,
+            _budget: budget,
+        })
+    }
+}
+
 /// 单目标 UDP 代理适配；复用现有 Association 的路由、字节预算与上游中继。
 /// 用于 WireGuard 等并非 VLESS/Trojan 帧的入口，不另建直连旁路。
 pub(crate) struct RoutedDatagram {
@@ -2146,6 +2171,26 @@ mod tests {
     fn context(bytes: usize, packets: usize) -> Arc<Context> {
         let value = serde_json::json!({"version":1,"inbounds":[{"type":"socks5","tag":"socks","listen":"127.0.0.1:0"}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"default":"direct"},"limits":{"udp_queue_bytes":bytes,"udp_queue_packets":packets}});
         Arc::new(Context::new(&Config::from_json(&value.to_string()).unwrap()).unwrap())
+    }
+    /// 二级队列必须随包持有字节额度：包数上限乘最大载荷可以远超
+    /// `udp_queue_bytes`，否则一条关联就能囤积几十 MiB。
+    #[tokio::test]
+    async fn secondary_queue_payloads_hold_byte_budget_until_sent() {
+        let ctx = context(8, 64);
+        let (tx, mut rx) = mpsc::channel::<QueuedUplink>(64);
+        let first = QueuedUplink::reserve(&ctx, vec![1; 4]).unwrap();
+        assert_eq!(ctx.udp_bytes.available_permits(), 4);
+        tx.try_send(first).unwrap();
+        assert_eq!(ctx.udp_bytes.available_permits(), 4, "排队期间额度不得归还");
+        // 剩余额度不足 8 字节：更大的包必须被拒绝，而不是无限堆积。
+        assert!(QueuedUplink::reserve(&ctx, vec![2; 8]).is_none());
+        assert!(QueuedUplink::reserve(&ctx, vec![2; 5]).is_none());
+        drop(rx.recv().await.unwrap());
+        assert_eq!(
+            ctx.udp_bytes.available_permits(),
+            8,
+            "出队并释放后才归还额度"
+        );
     }
     #[tokio::test]
     async fn byte_budget_empty_packets_and_full_queue_release_permits() {

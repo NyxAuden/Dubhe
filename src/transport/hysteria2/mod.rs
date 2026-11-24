@@ -620,12 +620,19 @@ async fn read_masquerade_file(directory: &Path, path: &str) -> io::Result<(&'sta
             if std::fs::metadata(&file)?.is_dir() {
                 file.push("index.html");
             }
-            let metadata = std::fs::metadata(&file)?;
+            // 只挡 `..` 不够：站点目录里的符号链接可以指向任意路径。
+            // 打开前按真实路径规范化，必须仍在站点根目录之下。
+            let root = std::fs::canonicalize(directory)?;
+            let resolved = std::fs::canonicalize(&file)?;
+            if !resolved.starts_with(&root) {
+                return Err(invalid("masquerade 文件在站点目录之外"));
+            }
+            let metadata = std::fs::metadata(&resolved)?;
             if !metadata.is_file() || metadata.len() > MAX_MASQUERADE_FILE {
                 return Err(invalid("masquerade 文件无效"));
             }
-            let body = std::fs::read(&file)?;
-            Ok((file, body))
+            let body = std::fs::read(&resolved)?;
+            Ok((resolved, body))
         })
         .await
         .map_err(|_| io::Error::other("masquerade 读取任务失败"))??;
@@ -797,7 +804,9 @@ async fn handle_stream(
                 .await
                 .map_err(|_| timed_out())??;
             // 后续字节直接双向中继；已读首包由 `Prefixed` 原样回放。
-            let stream = ctx.stats.count_user(tag, user, tokio::io::join(recv, send));
+            let stream = ctx
+                .stats
+                .admit_counter(tag, user, tokio::io::join(recv, send))?;
             forward::relay(stream, upstream, ctx.stats.clone()).await?;
         }
         Err(_) => {
@@ -1028,7 +1037,9 @@ async fn udp_session(
 /// 共用一个 `RoutedUdp`，由它负责上游关联与回程。
 enum UdpMapping {
     Direct(Arc<UdpSocket>),
-    Proxied { outgoing: mpsc::Sender<Vec<u8>> },
+    Proxied {
+        outgoing: mpsc::Sender<crate::udp::QueuedUplink>,
+    },
 }
 
 impl UdpMapping {
@@ -1053,7 +1064,7 @@ async fn forward_to(
     // 先选路。`udp_selected` 会拒绝 reject 规则、HTTP 出站与链式出站；
     // 选到代理时走共享 UDP 关联（与 SOCKS5/VLESS 等路径同一套实现），
     // 否则保持原有的直连快路径。
-    let proxied = ctx.udp_selected(tag, &packet.target).await?.proxy.is_some();
+    let proxied = ctx.udp_selected(tag, &packet.target).await?.udp_proxied()?;
     let payload_limit = ctx.limits.max_udp_payload.min(wire::MAX_UDP_PAYLOAD);
     if packet.payload.len() > payload_limit {
         return Err(invalid("Hysteria2 UDP 载荷过长"));
@@ -1078,7 +1089,7 @@ async fn forward_to(
                 crate::session::Host::Domain(domain) => domain.clone(),
             };
             let target_port = packet.target.port;
-            let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+            let (tx, mut rx) = mpsc::channel::<crate::udp::QueuedUplink>(64);
             let outlet =
                 crate::udp::RoutedUdp::new(ctx.clone(), tag.to_owned(), packet.target.clone())
                     .await?;
@@ -1096,8 +1107,8 @@ async fn forward_to(
                     tokio::select! {
                         biased;
                         outgoing = rx.recv() => {
-                            let Some(payload) = outgoing else { break };
-                            if outlet.send(&payload).await.is_err() {
+                            let Some(packet) = outgoing else { break };
+                            if outlet.send(&packet.payload).await.is_err() {
                                 break;
                             }
                         }
@@ -1150,8 +1161,14 @@ async fn forward_to(
         let Some(UdpMapping::Proxied { outgoing }) = mappings.get(&packet.target) else {
             return Err(io::Error::other("UDP 映射类型不一致"));
         };
+        let Some(queued) = crate::udp::QueuedUplink::reserve(ctx, packet.payload.clone()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "UDP 队列字节额度不足",
+            ));
+        };
         outgoing
-            .send(packet.payload.clone())
+            .send(queued)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "UDP 代理映射已失效"))?;
         *lock(activity) = Instant::now();

@@ -356,6 +356,22 @@ impl Stats {
         quota_bytes: Option<u64>,
         expires_at_ms: Option<u64>,
     ) -> usize {
+        // 显式指定入口与用户时先建条目：否则新用户第一次连接前设置限额会
+        // 静默返回 updated: 0，限额根本没被保存，准入自然也不生效。
+        let target = match (inbound, user) {
+            (Some(inbound), Some(user)) => {
+                let key = (inbound.to_owned(), user.to_owned());
+                let counter = self
+                    .users
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .entry(key)
+                    .or_default()
+                    .clone();
+                Some(counter)
+            }
+            _ => None,
+        };
         let users = self.users.read().unwrap_or_else(|error| error.into_inner());
         let mut count = 0;
         for ((entry_inbound, entry_user), counter) in users.iter() {
@@ -372,6 +388,17 @@ impl Stats {
                 counter.set_expires_at(expires);
             }
             count += 1;
+        }
+        if count == 0
+            && let Some(counter) = target
+        {
+            if let Some(quota) = quota_bytes {
+                counter.set_quota(quota);
+            }
+            if let Some(expires) = expires_at_ms {
+                counter.set_expires_at(expires);
+            }
+            count = 1;
         }
         count
     }
@@ -402,6 +429,30 @@ impl Stats {
             inner,
             counters: user.map(|user| self.user_counter(inbound, user)),
         }
+    }
+
+    /// 准入版本：配额用尽或已到期时拒绝**新连接**，返回 `PermissionDenied`。
+    ///
+    /// 单独一个方法而不是让 `count_user` 返回 `Result`：UDP/Mux 等路径在
+    /// 认证后还有自己的错误语义，混在一起会改变既有行为。这里只给每个
+    /// 已认证业务的入口用，语义与 Xray/sing-box 的准入控制一致——既有连接
+    /// 不因配额变化被强制中断。
+    pub fn admit_counter<S>(
+        self: &Arc<Self>,
+        inbound: &str,
+        user: Option<&str>,
+        inner: S,
+    ) -> io::Result<UserCounted<S>> {
+        if let Some(user) = user
+            && !self.admit_user(inbound, Some(user))
+        {
+            self.reject();
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "账户配额已用尽或已到期",
+            ));
+        }
+        Ok(self.count_user(inbound, user, inner))
     }
 
     pub fn drop_packet(&self) {

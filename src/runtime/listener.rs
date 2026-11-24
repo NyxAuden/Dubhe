@@ -230,7 +230,9 @@ impl Detour {
             Self::Mixed { tag, users } => {
                 use tokio::io::AsyncReadExt;
                 let mut first = [0u8; 1];
-                stream.read_exact(&mut first).await?;
+                timeout(deadline, stream.read_exact(&mut first))
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Mixed 首字节超时"))??;
                 let stream = crate::transport::xhttp::PrefixReader::new(first.to_vec(), stream);
                 if first[0] == 5 {
                     serve_socks5_detoured(stream, &tag, &users, ctx, deadline, handshake).await

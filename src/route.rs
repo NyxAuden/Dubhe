@@ -476,6 +476,21 @@ pub struct Selected {
     pub(crate) matched: bool,
 }
 
+impl Selected {
+    /// UDP 快路径（dokodemo / TUIC / Hysteria2 / Snell / Shadowsocks）只实现
+    /// 直连与共享代理中继。`reverse` 是独立上游，`proxy` 为空但绝不是直连；
+    /// 在这些路径里必须失败关闭，不能把反向目标当成本地上游发出去。
+    pub(crate) fn udp_proxied(&self) -> std::io::Result<bool> {
+        if self.reverse.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "该 UDP 路径不支持 reverse 出站",
+            ));
+        }
+        Ok(self.proxy.is_some())
+    }
+}
+
 impl Router {
     pub fn new(config: &Config) -> Result<Self> {
         // 也校验由库调用方直接构造或修改的配置，保证默认出站一定存在。
@@ -2652,5 +2667,57 @@ mod domain_regex_tests {
         ))
         .expect_err("非法正则必须拒绝");
         assert!(format!("{error}").contains("domain_regex"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod udp_reverse_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `reverse` 出站的 `proxy` 为空，但它是独立上游，不是直连。
+    ///
+    /// 此前 dokodemo / TUIC / Hysteria2 / Snell / Shadowsocks 的 UDP 快路径
+    /// 都用 `proxy.is_some()` 判断是否走代理，把 reverse 当成本地直连，
+    /// 结果是反向目标被当普通目标发出去。
+    #[test]
+    fn reverse_is_not_direct_in_udp_fast_paths() {
+        let config = Config::from_json(
+            &json!({
+                "version": 1,
+                "inbounds": [{"type": "socks5", "tag": "socks", "listen": "127.0.0.1:0"}],
+                "outbounds": [
+                    {"type": "direct", "tag": "direct"},
+                    {"type": "reverse", "tag": "portal", "domain": "v1.rvs.cool"}
+                ],
+                "route": {"default": "direct", "rules": [
+                    {"domains": ["portal.test"], "outbound": "portal"}
+                ]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let router = Router::new(&config).unwrap();
+        let target = Target {
+            host: Host::Domain("portal.test".to_owned()),
+            port: 1234,
+        };
+        let selected = router.select_outbound("socks", Network::Udp, &target);
+        assert!(selected.proxy.is_none());
+        assert_eq!(
+            selected.udp_proxied().unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported,
+            "UDP 快路径必须对 reverse 失败关闭，不能静默直连"
+        );
+
+        let direct = router.select_outbound(
+            "socks",
+            Network::Udp,
+            &Target {
+                host: Host::Ip("127.0.0.1".parse().unwrap()),
+                port: 1234,
+            },
+        );
+        assert!(!direct.udp_proxied().unwrap());
     }
 }

@@ -159,7 +159,7 @@ struct ModernSocket {
 
 /// 单个代理目标的发件箱与读任务。
 struct ProxiedTarget {
-    outgoing: mpsc::Sender<Vec<u8>>,
+    outgoing: mpsc::Sender<crate::udp::QueuedUplink>,
     task: AbortHandle,
 }
 
@@ -245,7 +245,7 @@ impl Dispatcher {
             let outlet =
                 crate::udp::RoutedUdp::new(self.ctx.clone(), self.tag.clone(), target.clone())
                     .await?;
-            let (outgoing, mut rx) = mpsc::channel::<Vec<u8>>(64);
+            let (outgoing, mut rx) = mpsc::channel::<crate::udp::QueuedUplink>(64);
             let ctx = self.ctx.clone();
             let modern_tx = self.modern_tx.clone();
             let reply_target = target_to_address(target);
@@ -257,8 +257,8 @@ impl Dispatcher {
                     tokio::select! {
                         biased;
                         packet = rx.recv() => {
-                            let Some(payload) = packet else { break };
-                            if outlet.send(&payload).await.is_err() {
+                            let Some(packet) = packet else { break };
+                            if outlet.send(&packet.payload).await.is_err() {
                                 break;
                             }
                         }
@@ -299,9 +299,12 @@ impl Dispatcher {
         let Some(entry) = self.proxied.get(&proxy_key) else {
             return Err(io::Error::other("UDP 代理映射缺失"));
         };
+        let Some(queued) = crate::udp::QueuedUplink::reserve(&self.ctx, payload.to_vec()) else {
+            return Err(io::ErrorKind::WouldBlock.into());
+        };
         entry
             .outgoing
-            .send(payload.to_vec())
+            .send(queued)
             .await
             .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
         self.ctx
@@ -380,7 +383,7 @@ impl Dispatcher {
         // 2022（modern）分支支持代理；2017（legacy）分支保持原样
         // （回程需要关联自己的加密上下文，`Packet` 又是 `udp` 模块私有）。
         let selected = self.ctx.udp_selected(&self.tag, &target).await?;
-        let proxied = selected.proxy.is_some();
+        let proxied = selected.udp_proxied()?;
         if let Some(salt) = legacy_salt {
             // 2017 不支持代理：链式部署下这一支 fail-closed，绝不静默直连。
             if proxied {

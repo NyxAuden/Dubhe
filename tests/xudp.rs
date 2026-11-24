@@ -202,8 +202,9 @@ async fn global_id_takeover_moves_sink_and_old_session_gets_error() {
     let server = Running::start(config(&cert)).await;
     let target_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = target_socket.local_addr().unwrap();
+    // 续接只在同一账户内成立；跨账户隔离由下面单独的用例覆盖。
     let mut one = connect(&cert, &server, 0x11).await;
-    let mut two = connect(&cert, &server, 0x22).await;
+    let mut two = connect(&cert, &server, 0x11).await;
     send(
         &mut one,
         &frame_gid(0, 1, Some(target(addr)), [0x22; 8], Some(b"one")),
@@ -212,7 +213,7 @@ async fn global_id_takeover_moves_sink_and_old_session_gets_error() {
     let mut buf = [0; 64];
     let (n, peer_shared) = target_socket.recv_from(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"one");
-    // GlobalID 在同一服务实例内去重：同一值被另一条连接使用时迁移 sink，而不是隔离。
+    // 同一账户、同一入口、同一 GlobalID：迁移 sink，而不是隔离。
     send(
         &mut two,
         &frame_gid(0, 1, Some(target(addr)), [0x22; 8], Some(b"two")),
@@ -601,5 +602,47 @@ async fn mux_user_bytes_equal_business_payload() {
     );
 
     drop(s);
+    server.shutdown().await;
+}
+
+/// 同一 GlobalID 在不同账户之间必须隔离：不能复用对方的 UDP 关联，
+/// 也不能把回包投到对方的连接上。
+#[tokio::test]
+async fn global_id_is_not_shared_across_accounts() {
+    let cert = Certificate::new();
+    let server = Running::start(config(&cert)).await;
+    let target_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = target_socket.local_addr().unwrap();
+    let mut one = connect(&cert, &server, 0x11).await;
+    let mut two = connect(&cert, &server, 0x22).await;
+    let mut buf = [0; 64];
+
+    send(
+        &mut one,
+        &frame_gid(0, 1, Some(target(addr)), [0x77; 8], Some(b"alice")),
+    )
+    .await;
+    let (n, peer_one) = target_socket.recv_from(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"alice");
+
+    // 另一个账户声明同一个 GlobalID：必须得到不同的 UDP 关联。
+    send(
+        &mut two,
+        &frame_gid(0, 1, Some(target(addr)), [0x77; 8], Some(b"bob")),
+    )
+    .await;
+    let (n, peer_two) = target_socket.recv_from(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"bob");
+    assert_ne!(peer_two, peer_one, "不同账户不得共用同一个 GlobalID 关联");
+
+    // 回包各归各的连接。
+    target_socket.send_to(b"for-bob", peer_two).await.unwrap();
+    expect(&mut two, 0, addr, b"for-bob").await;
+    target_socket.send_to(b"for-alice", peer_one).await.unwrap();
+    expect(&mut one, 0, addr, b"for-alice").await;
+
+    send(&mut one, &frame(0, 3, None, false, None)).await;
+    send(&mut two, &frame(0, 3, None, false, None)).await;
+    associations(&server, 0).await;
     server.shutdown().await;
 }

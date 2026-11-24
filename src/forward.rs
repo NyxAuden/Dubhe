@@ -88,6 +88,8 @@ pub struct Context {
         std::collections::HashMap<String, Arc<crate::transport::vless_encryption::Prepared>>,
     /// 反向 Bridge：本地 tag、到 Portal 的已编译 VLESS 出站与重连间隔。
     pub(crate) reverse_bridges: Vec<(String, Arc<ProxyOutbound>, Duration)>,
+    /// 未声明 `reverse.tag` 的账户是否可按路由匹配建立反向隧道。
+    pub(crate) reverse_route_fallback: bool,
 }
 
 /// 流式入站首包嗅探策略的运行期副本。
@@ -223,6 +225,7 @@ impl Context {
             reverse: Arc::new(crate::reverse::Registry::new(config)?),
             vless_encryption: prepare_vless_encryption(config)?,
             reverse_bridges,
+            reverse_route_fallback: config.reverse_route_fallback,
         })
     }
 
@@ -252,6 +255,7 @@ impl Context {
             reverse: Arc::new(crate::reverse::Registry::new(config)?),
             vless_encryption: prepare_vless_encryption(config)?,
             reverse_bridges,
+            reverse_route_fallback: config.reverse_route_fallback,
         })
     }
 

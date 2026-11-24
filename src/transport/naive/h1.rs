@@ -56,7 +56,7 @@ where
         if let Some(version) = uot {
             crate::udp::uot(app, ctx, tag.to_owned(), version, user.as_deref()).await
         } else {
-            let app = ctx.stats.count_user(tag, user.as_deref(), app);
+            let app = ctx.stats.admit_counter(tag, user.as_deref(), app)?;
             crate::forward::relay(app, upstream.expect("非UoT已建目标"), ctx.stats.clone()).await
         }
     })

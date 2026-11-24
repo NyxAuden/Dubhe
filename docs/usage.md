@@ -295,13 +295,20 @@ JSON 日志写到 stderr，后台队列最多 1024 条，满时允许丢日志�
 | `POST /stats/users/reset` | 清零计数并把 `since_ms` 移到当前时刻；`?inbound=` / `?user=` 可缩小范围 |
 | `POST /stats/users/limits` | 设置软配额与到期：`?quota_bytes=` / `?expires_at_ms=`（unix 毫秒） |
 
-**当前边界（不要当成已实现）**：
+**配额准入**：
 
-- `quota_bytes` / `expires_at_ms` 目前**只被记录和返回，不会拒绝新连接**。
-  内核已经具备判定函数（`UserCounters::admits_new_connection`），但统一的拨号
-  入口 `forward::selected` 拿不到用户身份，接上需要给 18 个 `count_user`
-  调用点加参数。在接上之前，配额只能由外部面板读取 `GET /stats/users` 后自行
-  处置。
+- `quota_bytes` / `expires_at_ms` 是**准入控制**：配额用尽或到期后拒绝该账户的
+  **新连接**（返回 `PermissionDenied`），**不断开已建立的连接**。这与
+  Xray/sing-box 把处置权留给面板的做法一致。
+- 检查点在每个已认证业务的入口（`Stats::admit_counter` / `admit_user`），覆盖
+  VLESS/Trojan/VMess/SOCKS5/HTTP/Mixed、AnyTLS、Hysteria2、TUIC、Sniff-TLS、
+  Shadowsocks、Mux 子流。未认证路径和没有用户名的路径（WireGuard、单密钥
+  Shadowsocks）不参与准入。
+- 限额只对**已经出现过的用户**建条目；`POST /stats/users/limits` 在显式给出
+  `inbound` 与 `user` 时会先建条目，因此在用户首次连接前设置限额仍然生效。
+  只给 `user=` 或只给 `inbound=` 时只更新已存在的匹配条目。
+- 计数不持久化，重启归零；配额与到期时间同样不持久化，重启后清空。生产环境
+  应由面板在启动/重载后重新下发。
 - 清零与并发累加之间有极小竞态（`store` 与 `fetch_add` 之间到达的字节可能
   丢失），与 Xray `StatsService` 的语义一致：重置是运维动作，不追求逐字节精确。
 - 计数不持久化，重启归零。

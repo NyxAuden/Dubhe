@@ -141,6 +141,7 @@ where
         inbound_budget,
         out_budget,
         user_counter,
+        user_id: user.map(str::to_owned),
     };
 
     let mut last_activity = Instant::now();
@@ -589,6 +590,8 @@ struct Mux {
     out_budget: Arc<Semaphore>,
     /// 上层握手已认证的用户；用于给每条子流归因业务字节。
     user_counter: Option<Arc<crate::telemetry::UserCounters>>,
+    /// 已认证用户名；GlobalID 续接必须按账户隔离。
+    user_id: Option<String>,
 }
 
 impl Mux {
@@ -818,11 +821,16 @@ impl Mux {
                 return Ok(());
             }
         };
-        let association = match global_id.filter(|value| *value != [0u8; 8]) {
-            Some(global_id) => match acquire_global(
+        // 没有可验证账户身份时不做跨连接续接：客户端标识不能当凭据用。
+        let association = match (
+            global_id.filter(|value| *value != [0u8; 8]),
+            self.user_id.as_deref(),
+        ) {
+            (Some(global_id), Some(user)) => match acquire_global(
                 global_id,
                 self.ctx.clone(),
-                self.inbound.clone(),
+                &self.inbound,
+                user,
                 next_token(),
                 generation,
             ) {
@@ -834,7 +842,7 @@ impl Mux {
                     return Ok(());
                 }
             },
-            None => UdpAssociation::new(self.ctx.clone(), self.inbound.clone(), next_token()),
+            _ => UdpAssociation::new(self.ctx.clone(), self.inbound.clone(), next_token()),
         };
         association.set_sink(self.events.clone(), generation, self.inbound_budget.clone());
         let gauge = self.ctx.stats.enter(Gauge::Udp);
@@ -1170,8 +1178,8 @@ struct UdpInner {
     ctx: Arc<Context>,
     inbound: String,
     key: u64,
-    /// 由 GlobalID 建立的关联才进入宽限期登记表。
-    global_id: Option<[u8; 8]>,
+    /// 由 GlobalID 建立的关联才进入宽限期登记表；键含实例、入口与账户。
+    global_key: Option<GlobalKey>,
     mappings: tokio::sync::Mutex<HashMap<Target, UdpMapping>>,
     /// 单上游 SOCKS5 UDP 中继；与直连映射互斥使用。
     relay: tokio::sync::Mutex<Option<MuxRelay>>,
@@ -1201,12 +1209,12 @@ struct UdpMapping {
 }
 
 impl UdpInner {
-    fn new(ctx: Arc<Context>, inbound: String, key: u64, global_id: Option<[u8; 8]>) -> Self {
+    fn new(ctx: Arc<Context>, inbound: String, key: u64, global_key: Option<GlobalKey>) -> Self {
         Self {
             ctx,
             inbound,
             key,
-            global_id,
+            global_key,
             mappings: tokio::sync::Mutex::new(HashMap::new()),
             relay: tokio::sync::Mutex::new(None),
             tasks: StdMutex::new(JoinSet::new()),
@@ -1251,8 +1259,8 @@ impl UdpInner {
         // GlobalID 关联按 Xray 语义保留映射与套接字进入宽限期，供同一
         // GlobalID 的新会话续接；非 GlobalID 关联没有登记表持有，随
         // `Session` 释放时由 `UdpInner::drop` 中止任务并关闭套接字。
-        if let Some(global_id) = self.global_id {
-            release_global(&self.ctx, global_id, owner);
+        if let Some(global_key) = &self.global_key {
+            release_global(global_key.clone(), owner);
         }
     }
 
@@ -1570,7 +1578,7 @@ struct GlobalEntry {
 /// 接管前一个实例的 UDP 套接字、路由与统计。地址复用安全：宽限期内的条目
 /// 持有 `Arc<UdpInner>`（进而持有 `Arc<Context>`），地址不可能被复用；
 /// Active 条目一旦弱引用失效，下一次登记会先清除它。
-type GlobalKey = (usize, [u8; 8]);
+type GlobalKey = (usize, String, String, [u8; 8]);
 
 static GLOBAL_IDS: OnceLock<StdMutex<HashMap<GlobalKey, GlobalEntry>>> = OnceLock::new();
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -1596,7 +1604,7 @@ pub(crate) fn release_instance(ctx: &Context) {
     let mut global = global_ids()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    global.retain(|(id, _), _| *id != instance);
+    global.retain(|(id, ..), _| *id != instance);
 }
 
 /// 清理失效条目：会话消失的 Active 条目与到期的 Expiring 条目。
@@ -1613,7 +1621,8 @@ fn purge_globals(global: &mut HashMap<GlobalKey, GlobalEntry>, now: Instant) {
 fn acquire_global(
     global_id: [u8; 8],
     ctx: Arc<Context>,
-    inbound: String,
+    inbound: &str,
+    user: &str,
     key: u64,
     owner: u64,
 ) -> Option<UdpAssociation> {
@@ -1621,7 +1630,7 @@ fn acquire_global(
         return None;
     }
     let instance = context_instance(&ctx);
-    let global_key = (instance, global_id);
+    let global_key = (instance, inbound.to_owned(), user.to_owned(), global_id);
     let now = Instant::now();
     let mut global = global_ids()
         .lock()
@@ -1652,10 +1661,15 @@ fn acquire_global(
         }
     }
 
-    if global.keys().filter(|(id, _)| *id == instance).count() >= MAX_GLOBAL_IDS {
+    if global.keys().filter(|(id, ..)| *id == instance).count() >= MAX_GLOBAL_IDS {
         return None;
     }
-    let inner = Arc::new(UdpInner::new(ctx, inbound, key, Some(global_id)));
+    let inner = Arc::new(UdpInner::new(
+        ctx,
+        inbound.to_owned(),
+        key,
+        Some(global_key.clone()),
+    ));
     global.insert(
         global_key,
         GlobalEntry {
@@ -1669,8 +1683,7 @@ fn acquire_global(
 }
 
 /// 最后一个会话结束后，把关联转入宽限期并安排在到期时清理。
-fn release_global(ctx: &Context, global_id: [u8; 8], owner: u64) {
-    let global_key = (context_instance(ctx), global_id);
+fn release_global(global_key: GlobalKey, owner: u64) {
     let expire = Instant::now() + GLOBAL_GRACE;
     let mut global = global_ids()
         .lock()
@@ -1725,5 +1738,51 @@ fn release_global(ctx: &Context, global_id: [u8; 8], owner: u64) {
                 global.remove(&global_key);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod global_id_isolation_tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// 同一 GlobalID 只能续接**同一账户、同一入口**的关联。
+    ///
+    /// 此前键只有 (实例, GlobalID)：两个已认证用户碰撞同一个标识时，
+    /// 后一个用户会接管前一个的 UDP 关联与回包接收方。
+    #[test]
+    fn continuation_is_scoped_to_account_and_inbound() {
+        let config = Config::from_json(
+            r#"{
+                "version": 1,
+                "inbounds": [{"type": "socks5", "tag": "in", "listen": "127.0.0.1:0"}],
+                "outbounds": [{"type": "direct", "tag": "direct"}],
+                "route": {"default": "direct"}
+            }"#,
+        )
+        .unwrap();
+        let ctx = Arc::new(Context::new(&config).unwrap());
+        let id = [0x42; 8];
+
+        let alice = acquire_global(id, ctx.clone(), "in", "alice", 1, 1).unwrap();
+        let bob = acquire_global(id, ctx.clone(), "in", "bob", 2, 2).unwrap();
+        assert!(
+            !Arc::ptr_eq(&alice.inner, &bob.inner),
+            "不同账户不能共用同一个 GlobalID 关联"
+        );
+
+        let alice_again = acquire_global(id, ctx.clone(), "in", "alice", 3, 3).unwrap();
+        assert!(
+            Arc::ptr_eq(&alice.inner, &alice_again.inner),
+            "同一账户的续接必须复用原关联"
+        );
+
+        let other_inbound = acquire_global(id, ctx.clone(), "other", "alice", 4, 4).unwrap();
+        assert!(
+            !Arc::ptr_eq(&alice.inner, &other_inbound.inner),
+            "不同入口不能共用同一个 GlobalID 关联"
+        );
+
+        release_instance(&ctx);
     }
 }

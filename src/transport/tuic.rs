@@ -904,7 +904,7 @@ async fn handle_bi_stream(
             return;
         }
     };
-    let recv = crate::transport::sniff::Prefixed::new(prefix, recv);
+    // 准入在包装/移走句柄之前判定：拒绝时必须能重置 QUIC 流。
     let user = match &*auth.borrow() {
         AuthState::Authenticated(index) => shared
             .options
@@ -913,6 +913,12 @@ async fn handle_bi_stream(
             .map(|credential| credential.name.clone()),
         _ => None,
     };
+    if !shared.ctx.stats.admit_user(&shared.tag, user.as_deref()) {
+        let _ = recv.stop(VarInt::from_u32(0));
+        let _ = send.reset(VarInt::from_u32(0));
+        return;
+    }
+    let recv = crate::transport::sniff::Prefixed::new(prefix, recv);
     let stream =
         shared
             .ctx
@@ -1089,7 +1095,10 @@ async fn udp_session_loop(mut receiver: mpsc::Receiver<UdpPacket>, info: Arc<Udp
                 // 并允许代理出站；`allowed` 只允许直连，会让 TUIC 的 UDP 在
                 // 链式部署下直接失败。
                 let proxied = match info.shared.udp_selected(&info.tag, &target).await {
-                    Ok(selected) => selected.proxy.is_some(),
+                    Ok(selected) => match selected.udp_proxied() {
+                        Ok(proxied) => proxied,
+                        Err(_) => continue,
+                    },
                     Err(_) => {
                         // 路由拒绝已在 Context 分类并计入 rejected，这里不重复计数。
                         continue;
@@ -1119,7 +1128,7 @@ async fn udp_session_loop(mut receiver: mpsc::Receiver<UdpPacket>, info: Arc<Udp
                             info.shared.stats.drop_packet();
                             continue;
                         };
-                        let (outgoing, rx) = mpsc::channel::<Vec<u8>>(64);
+                        let (outgoing, rx) = mpsc::channel::<crate::udp::QueuedUplink>(64);
                         let task = spawn_proxied_reply_reader(target.clone(), outlet, rx, info.clone());
                         targets.insert(
                             target.clone(),
@@ -1130,7 +1139,13 @@ async fn udp_session_loop(mut receiver: mpsc::Receiver<UdpPacket>, info: Arc<Udp
                         info.shared.stats.drop_packet();
                         continue;
                     };
-                    match outgoing.send(packet.payload.clone()).await {
+                    let Some(queued) =
+                        crate::udp::QueuedUplink::reserve(&info.shared, packet.payload.clone())
+                    else {
+                        info.shared.stats.drop_packet();
+                        continue;
+                    };
+                    match outgoing.send(queued).await {
                         Ok(()) => {
                             info.shared
                                 .stats
@@ -1270,7 +1285,7 @@ fn wire_address_of(target: &Target) -> wire::WireAddress {
 enum UdpTarget {
     Direct(SocketAddr),
     Proxied {
-        outgoing: mpsc::Sender<Vec<u8>>,
+        outgoing: mpsc::Sender<crate::udp::QueuedUplink>,
         /// 会话结束时 abort，避免任务挂在 `RoutedUdp::recv` 上。
         task: JoinHandle<()>,
     },
@@ -1298,7 +1313,7 @@ impl Drop for UdpTarget {
 fn spawn_proxied_reply_reader(
     target: Target,
     mut outlet: crate::udp::RoutedUdp,
-    mut outgoing: mpsc::Receiver<Vec<u8>>,
+    mut outgoing: mpsc::Receiver<crate::udp::QueuedUplink>,
     info: Arc<UdpSessionInfo>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1308,8 +1323,8 @@ fn spawn_proxied_reply_reader(
                 biased;
                 _ = info.cancel.cancelled() => return,
                 packet = outgoing.recv() => {
-                    let Some(payload) = packet else { return };
-                    if outlet.send(&payload).await.is_err() {
+                    let Some(packet) = packet else { return };
+                    if outlet.send(&packet.payload).await.is_err() {
                         return;
                     }
                 }

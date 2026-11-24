@@ -168,8 +168,17 @@ pub(crate) async fn serve_udp(
 
     // 固定目标只选路一次；拒绝或不可承载的 UDP 出站不产生目标流量。
     let destination = match ctx.udp_selected(&tag, &target).await {
-        Ok(selected) => match selected.proxy {
-            None => match ctx.dns.resolve(&target).await {
+        Ok(selected) => match selected.udp_proxied() {
+            Err(error) => {
+                tracing::warn!(
+                    event = "dokodemo_udp",
+                    inbound = %tag,
+                    error = %error,
+                    "路由拒绝或该 UDP 出站不受支持，失败关闭"
+                );
+                None
+            }
+            Ok(false) => match ctx.dns.resolve(&target).await {
                 Ok(addresses) => addresses.first().copied().map(Destination::Direct),
                 Err(error) => {
                     tracing::warn!(
@@ -181,7 +190,9 @@ pub(crate) async fn serve_udp(
                     None
                 }
             },
-            Some(proxy) => Some(Destination::Proxy((*proxy).clone())),
+            Ok(true) => selected
+                .proxy
+                .map(|proxy| Destination::Proxy((*proxy).clone())),
         },
         Err(error) => {
             tracing::warn!(

@@ -734,7 +734,7 @@ enum Mapping {
         last_used: Arc<Mutex<Instant>>,
     },
     Proxied {
-        outgoing: mpsc::Sender<Vec<u8>>,
+        outgoing: mpsc::Sender<crate::udp::QueuedUplink>,
         last_used: Arc<Mutex<Instant>>,
         task: AbortHandle,
     },
@@ -801,7 +801,7 @@ impl UdpAssociation {
     ) -> io::Result<()> {
         // 先选路：`udp_selected` 允许代理出站，`allowed` 只允许直连。
         // reject 规则、HTTP 出站与链式出站都会在这里被拒绝。
-        let proxied = ctx.udp_selected(inbound, &target).await?.proxy.is_some();
+        let proxied = ctx.udp_selected(inbound, &target).await?.udp_proxied()?;
         if payload.len() > ctx.limits.max_udp_payload {
             return Err(invalid("Snell UDP 载荷超过上限"));
         }
@@ -833,7 +833,7 @@ impl UdpAssociation {
                 let outlet =
                     crate::udp::RoutedUdp::new(ctx.clone(), inbound.to_owned(), target.clone())
                         .await?;
-                let (outgoing, rx) = mpsc::channel::<Vec<u8>>(64);
+                let (outgoing, rx) = mpsc::channel::<crate::udp::QueuedUplink>(64);
                 let last_used = Arc::new(Mutex::new(Instant::now()));
                 let reader_ctx = ctx.clone();
                 let reader_replies = replies.clone();
@@ -846,8 +846,8 @@ impl UdpAssociation {
                         tokio::select! {
                             biased;
                             packet = rx.recv() => {
-                                let Some(payload) = packet else { break };
-                                if outlet.send(&payload).await.is_err() {
+                                let Some(packet) = packet else { break };
+                                if outlet.send(&packet.payload).await.is_err() {
                                     break;
                                 }
                             }
@@ -895,8 +895,11 @@ impl UdpAssociation {
             let Some(Mapping::Proxied { outgoing, .. }) = self.mappings.get(&target) else {
                 return Err(io::Error::other("Snell UDP 映射类型不一致"));
             };
+            let Some(queued) = crate::udp::QueuedUplink::reserve(ctx, payload.to_vec()) else {
+                return Err(io::ErrorKind::WouldBlock.into());
+            };
             outgoing
-                .send(payload.to_vec())
+                .send(queued)
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Snell UDP 代理映射失效"))?;
             return Ok(());
