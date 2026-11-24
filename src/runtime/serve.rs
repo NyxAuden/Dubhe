@@ -653,7 +653,19 @@ pub(crate) async fn serve_plain_vless_scoped<
         vless::Accepted::Single(request) => request.user.clone(),
         vless::Accepted::Mux { user } | vless::Accepted::Reverse { user, .. } => Some(user.clone()),
     };
-    let mut stream = ctx.stats.count_user(tag, user.as_deref(), stream);
+    // Mux / 反向 Mux 的字节由**子流**按用户归因（`mux::serve` 内部对每条子流
+    // 计数）。若在这里也包装一层 `UserCounted`，同一个字节会被算两次——
+    // 实测 5 字节业务配 Mux 后 `/stats/users` 记成 26/20（多出的是 Mux 帧头）。
+    // 因此只有非 Mux 的单流路径才包装外层。
+    let is_mux = matches!(
+        accepted,
+        vless::Accepted::Mux { .. } | vless::Accepted::Reverse { .. }
+    );
+    let mut stream = if is_mux {
+        ctx.stats.count_user(tag, None, stream)
+    } else {
+        ctx.stats.count_user(tag, user.as_deref(), stream)
+    };
     if let vless::Accepted::Reverse { tag: declared, .. } = &accepted {
         let declared = declared.clone();
         timeout(deadline, vless::reply(&mut stream))

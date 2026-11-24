@@ -556,3 +556,50 @@ async fn ipv6_xudp_when_available() {
     expect(&mut s, 65535, echo.address, b"v6").await;
     server.shutdown().await;
 }
+
+/// Mux 子流的用户字节必须**等于**业务字节，不能因为外层承载也计数而翻倍。
+///
+/// 独立审查实测：5 字节业务配 Mux 后 `/stats` 为 5/5，而 `/stats/users`
+/// 为 26/20——多出来的是 Mux 帧头，被外层 `UserCounted` 与子流各算一次。
+#[tokio::test]
+async fn mux_user_bytes_equal_business_payload() {
+    let cert = Certificate::new();
+    let server = Running::start(config(&cert)).await;
+    let tcp = Echo::tcp("127.0.0.1", false).await;
+    // identity 0x11 对应 users[0]（name = "one"）。
+    let mut s = connect(&cert, &server, 0x11).await;
+
+    let payload = b"hello";
+    send(
+        &mut s,
+        &tcp_frame(1, 1, Some(target(tcp.address)), Some(payload)),
+    )
+    .await;
+    expect_tcp(&mut s, 1, payload).await;
+    send(&mut s, &tcp_frame(1, 2, None, None)).await;
+    // 等统计落账：子流结束时才可能补计。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let users = server.stats.user_snapshots();
+    let one = users
+        .iter()
+        .find(|u| u.user == "one")
+        .expect("one 应有条目");
+    assert_eq!(
+        one.uplink,
+        payload.len() as u64,
+        "上行必须等于业务字节（{}），实际 {}：说明外层承载也计了数",
+        payload.len(),
+        one.uplink
+    );
+    assert_eq!(
+        one.downlink,
+        payload.len() as u64,
+        "下行必须等于业务字节（{}），实际 {}",
+        payload.len(),
+        one.downlink
+    );
+
+    drop(s);
+    server.shutdown().await;
+}
