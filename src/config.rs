@@ -127,7 +127,7 @@ pub struct SniffingPolicy {
 }
 
 /// 管理/统计 API 配置。
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     /// 只允许回环地址，避免明文 Bearer token 暴露到网络。
@@ -139,6 +139,24 @@ pub struct ApiConfig {
     /// 与 `token` 二选一，且修改文件内容后需要重启服务。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_file: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for ApiConfig {
+    /// token 是写权限凭据，诊断输出里只保留是否配置。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiConfig")
+            .field("listen", &self.listen)
+            .field(
+                "token",
+                &if self.token.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("token_file", &self.token_file)
+            .finish()
+    }
 }
 
 impl ApiConfig {
@@ -324,7 +342,7 @@ fn parse_dns_address(
 ///
 /// 出口服务不读取本内核的 route/outbounds，也不计入本内核统计；它把 Portal
 /// 分配的目标连接直接拨出，与 NW3 Portal 入站的既有边界一致。
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Nw3Egress {
     pub tag: String,
@@ -357,6 +375,24 @@ pub struct Nw3Egress {
     /// 目标到源限速（Mbps）；0 或省略表示不限制。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etar: Option<u32>,
+}
+impl std::fmt::Debug for Nw3Egress {
+    /// `key` 是出口共享密钥，诊断输出里必须脱敏。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Nw3Egress")
+            .field("tag", &self.tag)
+            .field("endpoint", &self.endpoint)
+            .field("key", &"<redacted>")
+            .field("sni", &self.sni)
+            .field("pin", &self.pin)
+            .field("morph", &self.morph)
+            .field("dial", &self.dial)
+            .field("dial4", &self.dial4)
+            .field("dial6", &self.dial6)
+            .field("rate", &self.rate)
+            .field("etar", &self.etar)
+            .finish()
+    }
 }
 
 /// NW3 Portal 的出口选择。

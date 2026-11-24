@@ -33,13 +33,23 @@ fn nw3_relay_for(
     out: &crate::config::Nw3Out,
     tag: &str,
     addresses: &HashMap<String, SocketAddr>,
+    auth: &HashMap<String, (String, String)>,
 ) -> Option<String> {
     if !matches!(out, crate::config::Nw3Out::Direct) {
         return None;
     }
-    addresses
-        .get(&format!("{NW3_RELAY_PREFIX}{tag}"))
-        .map(|address| address.to_string())
+    let key = format!("{NW3_RELAY_PREFIX}{tag}");
+    let address = addresses.get(&key)?;
+    // 内部 relay 只供本进程使用：带随机凭据，避免同机其它进程直接借用。
+    let (user, password) = auth.get(&key)?;
+    Some(format!("{user}:{password}@{address}"))
+}
+
+/// 生成内部 relay 的随机凭据；十六进制，无需 URL 转义。
+fn relay_credential(bytes: usize) -> String {
+    let mut buffer = vec![0u8; bytes];
+    aws_lc_rs::rand::fill(&mut buffer).expect("系统随机源不可用");
+    buffer.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// 为 NW3 注入的内部入口 tag。它不会出现在配置、导出或热重载指纹里。
@@ -289,14 +299,22 @@ impl Server {
                 _ => None,
             })
             .collect();
+        let mut relay_auth: HashMap<String, (String, String)> = HashMap::new();
         for (_, relay_tag) in relays.iter().rev() {
             // 放在最前：NW3 分支要能查到它实际绑定的端口（listen 端口为 0）。
+            // 随机凭据只存在于本进程内存，构造的 `out` URL 不会写日志。
+            let user = relay_credential(16);
+            let password = relay_credential(24);
+            relay_auth.insert(relay_tag.clone(), (user.clone(), password.clone()));
             inbounds.insert(
                 0,
                 Inbound::Socks5 {
                     tag: relay_tag.clone(),
                     listen: "127.0.0.1:0".parse().expect("静态回环地址"),
-                    users: Vec::new(),
+                    users: vec![crate::config::User {
+                        name: user,
+                        password,
+                    }],
                     allow_insecure: false,
                 },
             );
@@ -512,7 +530,7 @@ impl Server {
                 // 只有 `out=direct` 的 Portal 才走内部 relay。`egress` 与用户
                 // 显式配置的 SOCKS 上游必须保持原样——早期实现无条件覆盖，
                 // 导致同进程里的 Egress Portal 也被指向回环，出口语义被改。
-                let relay = nw3_relay_for(out, tag, &addresses);
+                let relay = nw3_relay_for(out, tag, &addresses, &relay_auth);
                 let portal = transport::nw3::prepare_with_out(inbound, relay.as_deref())?;
                 addresses.insert(tag.clone(), *listen);
                 portals.push((tag.clone(), portal));
@@ -1338,11 +1356,24 @@ mod nw3_relay_tests {
         map
     }
 
+    fn auth(tag: &str) -> HashMap<String, (String, String)> {
+        HashMap::from([(
+            format!("{NW3_RELAY_PREFIX}{tag}"),
+            ("user".to_owned(), "pass".to_owned()),
+        )])
+    }
+
     /// `out=direct` 必须改走内部 relay：否则 NW3 流量绕过 route/limits/stats。
     #[test]
     fn direct_uses_the_internal_relay() {
-        let relay = nw3_relay_for(&Nw3Out::Direct, "nw3-in", &addresses("nw3-in"));
-        assert_eq!(relay.as_deref(), Some("127.0.0.1:12345"));
+        let relay = nw3_relay_for(
+            &Nw3Out::Direct,
+            "nw3-in",
+            &addresses("nw3-in"),
+            &auth("nw3-in"),
+        );
+        // 内部 relay 带随机凭据，地址相同但必须带 user:pass。
+        assert_eq!(relay.as_deref(), Some("user:pass@127.0.0.1:12345"));
     }
 
     /// `out=egress` 与显式 SOCKS 上游**不得**被改写。
@@ -1352,8 +1383,17 @@ mod nw3_relay_tests {
     #[test]
     fn egress_and_explicit_socks_keep_their_out() {
         let all = addresses("nw3-in");
-        assert!(nw3_relay_for(&Nw3Out::Egress, "nw3-in", &all).is_none());
-        assert!(nw3_relay_for(&Nw3Out::Socks("10.0.0.1:1080".into()), "nw3-in", &all).is_none());
+        let auth = auth("nw3-in");
+        assert!(nw3_relay_for(&Nw3Out::Egress, "nw3-in", &all, &auth).is_none());
+        assert!(
+            nw3_relay_for(
+                &Nw3Out::Socks("10.0.0.1:1080".into()),
+                "nw3-in",
+                &all,
+                &auth
+            )
+            .is_none()
+        );
     }
 
     /// relay 只按自己的 tag 取地址：两个 direct Portal 不互相串用。
@@ -1364,15 +1404,25 @@ mod nw3_relay_tests {
             format!("{NW3_RELAY_PREFIX}second"),
             "127.0.0.1:23456".parse().unwrap(),
         );
+        let auth = HashMap::from([
+            (
+                format!("{NW3_RELAY_PREFIX}first"),
+                ("u1".to_owned(), "p1".to_owned()),
+            ),
+            (
+                format!("{NW3_RELAY_PREFIX}second"),
+                ("u2".to_owned(), "p2".to_owned()),
+            ),
+        ]);
         assert_eq!(
-            nw3_relay_for(&Nw3Out::Direct, "first", &all).as_deref(),
-            Some("127.0.0.1:12345")
+            nw3_relay_for(&Nw3Out::Direct, "first", &all, &auth).as_deref(),
+            Some("u1:p1@127.0.0.1:12345")
         );
         assert_eq!(
-            nw3_relay_for(&Nw3Out::Direct, "second", &all).as_deref(),
-            Some("127.0.0.1:23456")
+            nw3_relay_for(&Nw3Out::Direct, "second", &all, &auth).as_deref(),
+            Some("u2:p2@127.0.0.1:23456")
         );
         // 没有对应 relay 的 tag 返回 None，而不是借用别人的地址。
-        assert!(nw3_relay_for(&Nw3Out::Direct, "third", &all).is_none());
+        assert!(nw3_relay_for(&Nw3Out::Direct, "third", &all, &auth).is_none());
     }
 }

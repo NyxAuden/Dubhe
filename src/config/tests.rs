@@ -1910,3 +1910,29 @@ fn hysteria2_gecko_packet_size_matches_upstream_constraints() {
         Config::from_json(&text).expect_err("越界取值必须拒绝");
     }
 }
+
+/// 配置的 Debug 输出不得包含管理 token 与 NW3 Egress 密钥。
+#[test]
+fn debug_output_redacts_api_token_and_nw3_key() {
+    let config = Config::from_json(
+        r#"{
+            "version": 1,
+            "inbounds": [{"type": "socks5", "tag": "s", "listen": "127.0.0.1:0"}],
+            "outbounds": [{"type": "direct", "tag": "d"}],
+            "route": {"default": "d"},
+            "api": {"listen": "127.0.0.1:9090", "token": "TOKEN-MARKER-0123456789"},
+            "nw3_egress": {
+                "tag": "e", "endpoint": "example.com:443",
+                "key": "0123456789abcdef0123456789abcdef"
+            }
+        }"#,
+    )
+    .unwrap();
+    let text = format!("{config:?}");
+    assert!(!text.contains("TOKEN-MARKER-0123456789"), "{text}");
+    assert!(!text.contains("0123456789abcdef0123456789abcdef"), "{text}");
+    assert!(text.contains("<redacted>"), "{text}");
+    // 序列化仍保留真实值，否则配置无法再写出。
+    let json = serde_json::to_string(&config).unwrap();
+    assert!(json.contains("TOKEN-MARKER-0123456789"));
+}

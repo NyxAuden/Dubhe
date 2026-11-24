@@ -227,18 +227,42 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
         let name = path.file_name().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "输出路径缺少文件名")
         })?;
-        let temp = path.with_file_name(format!(
-            ".{}.{}.tmp",
-            name.to_string_lossy(),
-            std::process::id()
-        ));
-        let written = (|| -> std::io::Result<()> {
-            let mut file = std::fs::OpenOptions::new()
+        // 独占创建：固定名字 + create(true) 会跟随已有对象（包括链接），
+        // 在共享可写目录里可能覆盖别人的文件。用 pid + 纳秒做候选，撞上就换。
+        let mut temp = path.to_path_buf();
+        let mut file = None;
+        for _ in 0..16 {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default();
+            temp = path.with_file_name(format!(
+                ".{}.{}.{}.tmp",
+                name.to_string_lossy(),
+                std::process::id(),
+                stamp
+            ));
+            match std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
-                .open(&temp)?;
+                .open(&temp)
+            {
+                Ok(opened) => {
+                    file = Some(opened);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let Some(mut file) = file else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "无法创建独占临时文件",
+            ));
+        };
+        let written = (|| -> std::io::Result<()> {
             file.write_all(text.as_bytes())?;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             file.sync_all()?;
