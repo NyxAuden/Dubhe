@@ -78,8 +78,9 @@ pub(crate) fn tls_server_name(input: &[u8]) -> Sniffed {
 }
 
 fn client_hello(body: &[u8]) -> Sniffed {
-    // version(2) + random(32)
-    if body.len() < 34 {
+    // version(2) + random(32) + session_id_len(1)：正好 34 字节时下一个
+    // 字段还不存在，必须先要求 >34，不能先检查 <34 再索引。
+    if body.len() <= 34 {
         return Sniffed::Invalid;
     }
     let mut offset = 34;
@@ -628,6 +629,29 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 截断在 ClientHello 字段边界上必须返回 Invalid，不能 panic。
+    #[test]
+    fn truncated_client_hello_fields_are_not_panics() {
+        // record = handshake_type(1) + length(3) + body(34: version+random)
+        let mut body = vec![0u8; 34];
+        body[0] = 0x03;
+        body[1] = 0x03;
+        let mut record = vec![0x01, 0x00, 0x00, body.len() as u8];
+        record.extend_from_slice(&body);
+        let mut input = vec![0x16, 0x03, 0x01, 0x00, record.len() as u8];
+        input.extend_from_slice(&record);
+        assert_eq!(tls_server_name(&input), Sniffed::Invalid);
+
+        // 更短的 body 也不能 panic。
+        for cut in 0..body.len() {
+            let mut record = vec![0x01, 0x00, 0x00, cut as u8];
+            record.extend_from_slice(&body[..cut]);
+            let mut input = vec![0x16, 0x03, 0x01, 0x00, record.len() as u8];
+            input.extend_from_slice(&record);
+            let _ = tls_server_name(&input);
+        }
+    }
 
     fn client_hello(server_name: &str) -> Vec<u8> {
         let mut entry = Vec::new();

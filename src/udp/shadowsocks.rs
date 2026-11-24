@@ -206,12 +206,12 @@ struct Dispatcher {
     modern_tx: mpsc::Sender<ModernReply>,
     readers: JoinSet<()>,
     generation: u64,
-    /// 走代理出站的目标。key 是**原始目标**（与直连的 IP 集合分开：
+    /// 走代理出站的目标。key 是**会话 + 原始目标**（与直连的 IP 集合分开：
     /// 代理路径拿不到真实源地址，回程报头用原目标）。
     ///
-    /// 直连路径完全不变（共享 socket + `try_send_to` + `allowed` 集合），
-    /// 只有选到代理时才用这里的 outlet，高 pps 场景不引入额外排队。
-    proxied: HashMap<Target, ProxiedTarget>,
+    /// 必须按会话隔离：只按目标做键会让两个合法用户共用一份 outlet，
+    /// 后一个用户的回包被前一个用户的密钥加密并投递。
+    proxied: HashMap<(SessionKey, Target), ProxiedTarget>,
 }
 
 impl Dispatcher {
@@ -232,13 +232,13 @@ impl Dispatcher {
     /// 不会悄悄直连）。
     async fn send_proxied(
         &mut self,
-        source: SocketAddr,
         target: &Target,
         payload: &[u8],
         session: (SessionKey, u64),
+        traffic: Option<Arc<crate::telemetry::UserCounters>>,
     ) -> io::Result<()> {
-        let _ = source;
-        if !self.proxied.contains_key(target) {
+        let proxy_key = (session.0, target.clone());
+        if !self.proxied.contains_key(&proxy_key) {
             if self.proxied.len() >= self.ctx.limits.max_udp_targets {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
@@ -289,14 +289,14 @@ impl Dispatcher {
                 }
             }));
             self.proxied.insert(
-                target.clone(),
+                proxy_key.clone(),
                 ProxiedTarget {
                     outgoing,
                     task: handle.abort_handle(),
                 },
             );
         }
-        let Some(entry) = self.proxied.get(target) else {
+        let Some(entry) = self.proxied.get(&proxy_key) else {
             return Err(io::Error::other("UDP 代理映射缺失"));
         };
         entry
@@ -308,6 +308,9 @@ impl Dispatcher {
             .stats
             .uplink
             .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        if let Some(traffic) = &traffic {
+            traffic.add(true, payload.len());
+        }
         Ok(())
     }
 
@@ -339,6 +342,10 @@ impl Dispatcher {
                 true
             }
         });
+        // 会话过期/关闭后，它名下的代理出口必须一起回收，否则目标名额
+        // 与上游套接字会一直挂着。
+        let alive: std::collections::HashSet<SessionKey> = self.modern.keys().copied().collect();
+        self.proxied.retain(|(key, _), _| alive.contains(key));
         while self.readers.try_join_next().is_some() {}
     }
 
@@ -487,33 +494,32 @@ impl Dispatcher {
                     },
                 );
             }
+            // 重放窗口、会话存活与端点更新对直连/代理两条路径一致；
+            // 此前代理分支先 return，重放包会被再次转发。
+            let (generation, traffic) = {
+                let session = self.modern.get_mut(&key).expect("会话已准备");
+                let Some(transport) = &session.transport else {
+                    return Err(io::Error::other("UDP会话已终止"));
+                };
+                if transport.task.is_finished() || !session.window.accept(control.packet_id) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "UDP会话已关闭或重放",
+                    ));
+                }
+                session.endpoint = packet.source;
+                session.last_used = Instant::now();
+                (session.generation, session.traffic.clone())
+            };
             if proxied {
-                let generation = self
-                    .modern
-                    .get(&key)
-                    .map(|session| session.generation)
-                    .ok_or_else(|| io::Error::other("UDP会话已终止"))?;
-                self.send_proxied(
-                    packet.source,
-                    &target,
-                    &packet.wire[..length],
-                    (key, generation),
-                )
-                .await?;
+                self.send_proxied(&target, &packet.wire[..length], (key, generation), traffic)
+                    .await?;
                 return Ok(());
             }
             let session = self.modern.get_mut(&key).expect("会话已准备");
             let Some(transport) = &session.transport else {
                 return Err(io::Error::other("UDP会话已终止"));
             };
-            if transport.task.is_finished() || !session.window.accept(control.packet_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "UDP会话已关闭或重放",
-                ));
-            }
-            session.endpoint = packet.source;
-            session.last_used = Instant::now();
             let addresses = self.ctx.dns.resolve(&target).await?;
             let destination = normalize(addresses[0]);
             {

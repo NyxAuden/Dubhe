@@ -163,7 +163,9 @@ pub(super) async fn accept_loop(
         // 持续 accept 就绪时也要回收完成任务，避免偏置 select 饿死 join 分支。
         while let Some(result) = connections.try_join_next() {
             if result.is_err() {
-                failure = Some(io::Error::other("连接任务异常"));
+                // 单条连接任务 panic 只损失这一条连接。此前会升级成整站
+                // failure 并取消全局 stop，一个坏包能打挂所有协议。
+                tracing::error!(event = "connection_task_panicked", inbound = config.tag());
             }
         }
         if failure.is_some() {
@@ -327,7 +329,12 @@ pub(super) async fn accept_loop(
                 }));
             }
             result = connections.join_next(), if !connections.is_empty() => {
-                if result.is_some_and(|r| r.is_err()) { failure = Some(io::Error::other("连接任务异常")); break; }
+                if result.is_some_and(|r| r.is_err()) {
+                    tracing::error!(
+                        event = "connection_task_panicked",
+                        inbound = config.tag()
+                    );
+                }
             }
         }
     }
@@ -337,7 +344,7 @@ pub(super) async fn accept_loop(
     }
     while let Some(result) = connections.join_next().await {
         if result.is_err() {
-            failure = Some(io::Error::other("连接任务异常"));
+            tracing::error!(event = "connection_task_panicked", inbound = config.tag());
         }
     }
     match failure {
