@@ -57,9 +57,11 @@
 - **管理 API 此前会丢弃任何带查询串的请求**：`src/admin.rs` 的 `parse()` 里有
   `if path.contains('?') { return None }`，导致 `/stats/users/reset?inbound=x`
   这类请求直接 400。现按「不含查询串的路径」路由，查询参数单独解析。
-- **Mux.Cool 子流现在按用户归因**：`mux::serve` / `serve_scoped` 增加 `user`
-  参数，子流业务字节计入 `/stats/users`。顺带修正 **mux 只计上行、完全不计
-  下行**的问题——此前 mux 流量的下行业务字节连全局计数都没进。
+- **Mux.Cool 子流按用户归因（部分覆盖）**：`mux::serve` / `serve_scoped` 增加
+  `user` 参数。实测只有 **VLESS 命令 3 的 TCP 子流**是等值的（传 5 字节记 5）；
+  命令 3 的 UDP 子流漏上行、命令 1 `v1.mux.cool` 仍双向重复计数、开嗅探时漏
+  首包、反向 Mux 不产生按用户条目。完整清单见 `docs/usage.md` 的
+  「已知不一致」，**该接口目前不能作为计费账本**。
 - 新增 `POST /stats/users/reset`（可 `?inbound=` / `?user=` 缩小范围）与
   `POST /stats/users/limits`（`?quota_bytes=` / `?expires_at_ms=`）。
   **配额目前只记录不强制**：判定函数已就位，但统一拨号入口拿不到用户身份，

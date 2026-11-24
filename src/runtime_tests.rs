@@ -893,6 +893,27 @@ async fn blocked_udp_dns_bounds_head_of_line_queue_and_force_joins_all_children(
     .unwrap();
 }
 
+/// 有界重试绑定：只用于「刚停机、端口正在释放」的验证。
+async fn bind_tcp_retrying(address: std::net::SocketAddr) -> TcpListener {
+    for _ in 0..50 {
+        if let Ok(listener) = TcpListener::bind(address).await {
+            return listener;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("TCP 端口在期限内未释放: {address}");
+}
+
+async fn bind_udp_retrying(address: std::net::SocketAddr) -> UdpSocket {
+    for _ in 0..50 {
+        if let Ok(socket) = UdpSocket::bind(address).await {
+            return socket;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("UDP 端口在期限内未释放: {address}");
+}
+
 #[tokio::test]
 async fn stop_forces_live_tcp_slow_reader_and_native_udp_then_rebinds_session_socket() {
     use ::shadowsocks::{
@@ -988,10 +1009,13 @@ async fn stop_forces_live_tcp_slow_reader_and_native_udp_then_rebinds_session_so
             ctx.limits.udp_queue_bytes
         );
         assert!(ctx.children.is_empty());
-        let _mapping = UdpSocket::bind(mapping).await.unwrap();
+        // 停机返回后端口可能还被内核占着一小会儿（macOS 上实测到
+        // `AddrInUse`）。这是「重新绑定同一地址」的时序，不是泄漏：
+        // 给一个有界重试窗口，而不是把偶发失败当断言。
+        let _mapping = bind_udp_retrying(mapping).await;
         for address in addresses.values() {
-            let _tcp = TcpListener::bind(address).await.unwrap();
-            let _udp = UdpSocket::bind(address).await.unwrap();
+            let _tcp = bind_tcp_retrying(*address).await;
+            let _udp = bind_udp_retrying(*address).await;
         }
         drop((tcp, peer, udp));
     })

@@ -248,15 +248,31 @@ JSON 日志写到 stderr，后台队列最多 1024 条，满时允许丢日志�
 
 可选管理/统计 API：`"api": {"listen": "127.0.0.1:9090", "token": "<至少16字节可见ASCII>"}`，或使用 `"token_file": "/etc/dubhe/api.token"` 从文件读取（文件必须为 0600，权限不安全时启动失败；token 与 token_file 二选一）。监听必须是回环地址，所有请求必须携带 `Authorization: Bearer <token>`；提供 `GET /healthz`、`GET /stats`（`telemetry::Snapshot` JSON）、`GET /stats/users`（按入口与用户的累计上下行字节）、`GET /metrics`（Prometheus 文本格式：活动连接/TCP/UDP/gRPC/XHTTP、上下行业务字节、丢弃与拒绝计数）、`GET /connections`（活动 TCP 连接列表：`id`/`inbound`/`outbound`/`network`/`host`/`port`/`started_ms`/`upload`/`download`，字节数为成功读写的业务载荷）、`DELETE /connections/{id}` 与 `DELETE /connections`（关闭单条/全部，返回 204）。连接在建立上游成功时登记，`Upstream` 丢弃时自动移除；只覆盖 TCP，不含 UDP 关联与 urltest 探测。列表包含目标地址，因此 API 只能回环监听并保持 token 机密。每个请求后关闭连接，不支持请求体与 HTTP/2，token 不写入日志；token 文件修改后需要重启进程。
 
-`/stats/users` 的归因范围：
+`/stats/users` 的归因范围。
 
-- TCP：SOCKS5 CONNECT、HTTP/Mixed、Naive H1/H2/H3、VLESS（含 Vision、Mux 与反向 Mux）、
-  VMess（含 Mux）、Trojan、Shadowsocks、Snell、AnyTLS、TUIC、Hysteria2
+**先说结论：这个接口目前不能作为计费账本。** 下列清单里有几处已知不一致
+（2026-11-24 由独立审查实测），计费场景请先在目标协议上验证。
+
+可靠归因（实测等值：传 N 字节，用户计数即 N）：
+
+- TCP 单流：SOCKS5 CONNECT、HTTP/Mixed、Naive H1/H2/H3、VLESS（含 Vision）、
+  VMess、Trojan、Shadowsocks、Snell、AnyTLS、TUIC、Hysteria2
+- Mux.Cool：**仅 VLESS 命令 3 的 TCP 子流**
 - UDP：SOCKS5、VLESS、Trojan、UoT、Snell、Shadowsocks（仅 EIH 多用户会话）、
   Hysteria2 原生 DATAGRAM、TUIC 原生 DATAGRAM
 
-读入客户端计上行、写出客户端计下行，只算业务载荷。**未归因**：WireGuard（只有 peer 公钥，没有用户名）、Shadowsocks 单密钥
-（没有用户身份）。这些路径只进全局计数；需要按用户计费时不要把本接口当成完整账本。
+已知不一致（**不要据此计费**）：
+
+| 路径 | 现象 |
+|---|---|
+| VLESS 命令 3 的 **UDP** 子流 | 业务 5 字节，用户只记下行 0/5（漏上行） |
+| VLESS 命令 1 `v1.mux.cool` | 外层承载与子流各计一次（5 字节记成 26/20） |
+| VLESS 命令 3 + 入口嗅探 | 嗅探回放的首包只进全局数，用户记 0/5 |
+| **反向 Mux**（`reverse_bridges` / Portal） | 全局计数正确，但**不产生按用户条目** |
+| VMess + Mux | 静态核对发现同样先包装外层再交子流，未做线测 |
+
+**未归因**：WireGuard（只有 peer 公钥，没有用户名）、Shadowsocks 单密钥
+（没有用户身份）。这些路径只进全局计数。
 
 ### 用户计数的清零与配额
 
