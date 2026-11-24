@@ -113,7 +113,7 @@ async fn wait_listening(address: SocketAddr) -> Result<()> {
 /// 并发测试的 TCP 连接当作源端口占用，造成「释放后再绑定」的 `AddrInUse`。
 /// 这里在范围之外顺序探测，并由调用方保证进程内不重复。
 fn pick_port() -> SocketAddr {
-    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(20000);
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(25000);
     // 本文件独占 25000–27499 段。`reserve_port` 的 HashSet 只能在**当前测试二进制**
     // 内去重，cargo 并行跑多个测试二进制时互相看不见；此前四个文件共用
     // 20000–29999，实测出现过 `入口 X 绑定失败: AddrInUse`。

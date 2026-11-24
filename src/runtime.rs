@@ -752,7 +752,11 @@ impl Server {
                     .entry(imported.public_key)
                     .and_modify(|window| *window = (*window).max(reality.max_time_diff_ms))
                     .or_insert(reality.max_time_diff_ms);
-                reality_pending.push((index, reality.clone(), imported));
+                // 记录的是**即将 push 进 `listeners` 的下标**，不是入口枚举的
+                // 下标。NW3/WireGuard 等入口在到达这里之前就 `continue` 了，
+                // 用全入口下标会在稍后索引 `listeners` 时越界（实测
+                // `NW3 + REALITY` 的合法配置 `check` 通过、`run` panic）。
+                reality_pending.push((listeners.len(), reality.clone(), imported));
             }
             let xhttp = match inbound {
                 Inbound::VlessXhttp { xhttp, .. }
