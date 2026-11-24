@@ -70,6 +70,8 @@ struct ClientInner {
     next: AtomicU16,
     /// 单帧投递到本地会话的等待上限；超时即显式结束该会话。
     queue_timeout_ms: u64,
+    /// 本实例停机信号：Bridge 仍在线时也要结束载体任务。
+    shutdown: CancellationToken,
     closed: StdMutex<bool>,
     /// 隧道关闭时唤醒心跳任务，避免停机等待下一次 5 秒心跳。
     closed_notify: Notify,
@@ -305,6 +307,7 @@ impl Registry {
             udp_sessions: StdMutex::new(HashMap::new()),
             next: AtomicU16::new(1),
             queue_timeout_ms: ctx.limits.dial_timeout_ms,
+            shutdown: ctx.shutdown.clone(),
             closed: StdMutex::new(false),
             closed_notify: Notify::new(),
         });
@@ -318,6 +321,7 @@ impl Registry {
                 }
                 let frame = tokio::select! {
                     biased;
+                    _ = writer_inner.shutdown.cancelled() => break,
                     _ = writer_inner.closed_notify.notified() => break,
                     frame = rx.recv() => frame,
                 };
@@ -333,7 +337,13 @@ impl Registry {
         let budget = Arc::new(Semaphore::new(256 * 1024));
         let reader_inner = inner.clone();
         ctx.children.spawn(tracker.track_future(async move {
-            while let Ok(Some(frame)) = mux::read_frame(&mut read, &budget).await {
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    _ = reader_inner.shutdown.cancelled() => break,
+                    frame = mux::read_frame(&mut read, &budget) => frame,
+                };
+                let Ok(Some(frame)) = frame else { break };
                 if !handle_frame(frame, &reader_inner).await {
                     break;
                 }
@@ -600,6 +610,7 @@ async fn heartbeat_loop(client: Arc<ClientInner>) {
         }
         tokio::select! {
             biased;
+            _ = client.shutdown.cancelled() => return,
             _ = client.closed_notify.notified() => return,
             _ = interval.tick() => {}
         }
@@ -1026,6 +1037,7 @@ mod runtime_tests {
             udp_sessions: StdMutex::new(HashMap::new()),
             next: AtomicU16::new(1),
             queue_timeout_ms: timeout_ms,
+            shutdown: CancellationToken::new(),
             closed: StdMutex::new(false),
             closed_notify: Notify::new(),
         });

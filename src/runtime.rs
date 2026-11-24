@@ -1304,6 +1304,9 @@ impl Server {
         crate::mux::release_instance(&self.context);
         // 关闭出站池的等待/空闲资源，不能让children屏障等到协议空闲期限。
         self.context.outbound_stop.cancel();
+        // 反向 Portal 的载体任务不依赖出站池：单独唤醒它们，否则 Bridge
+        // 仍在线时读任务会一直等下一帧，停机挂在这里。
+        self.context.shutdown.cancel();
         // 父任务取消会触发 UDP JoinSet 析构；等待追踪器确认子任务真正释放资源。
         self.context.children.close();
         self.context.children.wait().await;

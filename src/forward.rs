@@ -76,6 +76,9 @@ pub struct Context {
     pub children: tokio_util::task::TaskTracker,
     /// 跨热重载共享的出站后台资源停机信号，先取消再等children。
     pub(crate) outbound_stop: CancellationToken,
+    /// 本实例的停机信号：反向 Portal 的载体任务必须能在这里被唤醒，
+    /// 不能只依赖对端断开。
+    pub(crate) shutdown: CancellationToken,
     pub(crate) sniff: Option<SniffPolicy>,
     pub(crate) connections: Arc<Registry>,
     /// `reverse` 出站的 portal 隧道注册表。
@@ -214,6 +217,7 @@ impl Context {
             udp_bytes: Arc::new(Semaphore::new(config.limits.udp_queue_bytes)),
             children: tokio_util::task::TaskTracker::new(),
             outbound_stop: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
             sniff: config.sniffing.as_ref().and_then(SniffPolicy::new),
             connections: Arc::new(Registry::default()),
             reverse: Arc::new(crate::reverse::Registry::new(config)?),
@@ -242,6 +246,7 @@ impl Context {
             udp_bytes: previous.udp_bytes.clone(),
             children: previous.children.clone(),
             outbound_stop: previous.outbound_stop.clone(),
+            shutdown: CancellationToken::new(),
             sniff: config.sniffing.as_ref().and_then(SniffPolicy::new),
             connections: previous.connections.clone(),
             reverse: Arc::new(crate::reverse::Registry::new(config)?),

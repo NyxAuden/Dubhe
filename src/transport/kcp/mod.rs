@@ -97,7 +97,16 @@ pub(crate) async fn serve(
             _ = stop.cancelled() => break,
             _ = force.cancelled() => break,
             received = socket.recv_from(&mut buffer) => {
-                let (length, source) = received?;
+                let (length, source) = match received {
+                    Ok(value) => value,
+                    Err(error) => {
+                        // 不能带着还在跑的会话任务直接返回：先取消并等它们
+                        // 释放（它们持有连接计数与字节 gauge），再返回原错误。
+                        tasks.abort_all();
+                        while tasks.join_next().await.is_some() {}
+                        return Err(error);
+                    }
+                };
                 let decoded = {
                     let mask = prepared.mask.lock().unwrap_or_else(|error| error.into_inner());
                     mask.decode(&buffer[..length])

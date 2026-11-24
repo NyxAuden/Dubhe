@@ -123,6 +123,7 @@ impl Fixture {
             vless_encryption: std::collections::HashMap::new(),
             children: tokio_util::task::TaskTracker::new(),
             outbound_stop: tokio_util::sync::CancellationToken::new(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             sniff: None,
             connections: Arc::new(crate::connections::Registry::default()),
             reverse: Arc::new(crate::reverse::Registry::default()),

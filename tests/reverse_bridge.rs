@@ -104,6 +104,45 @@ async fn bridge_relays_portal_traffic_over_plain_vless() {
     assert_reverse_relay(portal, bridge).await;
 }
 
+/// Portal 先停、Bridge 仍在线：Portal 必须自己停下来。
+///
+/// 载体读任务此前只等下一帧，Bridge 不关就永远等；停机因此挂到对端退出。
+#[tokio::test]
+async fn portal_shuts_down_while_bridge_stays_online() {
+    let portal = Running::start(portal_config(None, false)).await;
+    let bridge = Running::start(bridge_config(portal.address, None, false)).await;
+    sleep(Duration::from_millis(500)).await;
+
+    // 先完成一次业务回显：证明载体已注册、流已正常结束。
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let users = portal.addresses[1];
+    let (mut tunnel, _) = tokio::time::timeout(
+        Duration::from_secs(3),
+        common::socks(1, common::address(echo.address), users),
+    )
+    .await
+    .expect("Portal SOCKS 建连超时");
+    tunnel.write_all(b"portal-first").await.unwrap();
+    tunnel.flush().await.unwrap();
+    let mut echoed = [0u8; 12];
+    tunnel.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"portal-first");
+    drop(tunnel);
+
+    // 只停 Portal；Bridge 保持在线。
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(2), portal.shutdown())
+        .await
+        .expect("Bridge 仍在线时 Portal 也必须停下来");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "Portal 停机耗时过长：{:?}",
+        started.elapsed()
+    );
+
+    bridge.shutdown().await;
+}
+
 /// Portal 用户在 `users[].reverse.tag` 里声明归属（Xray 写法）。
 ///
 /// 关键点：这条配置**故意不给 `v1.rvs.cool` 配路由规则**，并让默认路由
