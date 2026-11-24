@@ -308,7 +308,8 @@ pub(crate) async fn serve(
                 let connection_ctx = ctx.clone();
                 let connection_stop = stop.clone();
                 let connection_force = force.clone();
-                connections.spawn(async move {
+                let tracker = ctx.children.clone();
+                connections.spawn(tracker.track_future(async move {
                     let _permit = permit;
                     if let Err(error) = handle_connection(
                         incoming,
@@ -327,7 +328,7 @@ pub(crate) async fn serve(
                             reason = ?error.kind()
                         );
                     }
-                });
+                }));
             }
         }
     }

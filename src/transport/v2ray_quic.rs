@@ -66,13 +66,16 @@ pub(crate) async fn serve(
                 let ctx = ctx.clone();
                 let stop = stop.clone();
                 let force = force.clone();
-                tasks.spawn(async move {
+                // 连接任务也可能在停机关闭后被暂停在「登记流」之前；登记父任务
+                // 才能保证 `children.wait()` 不会先于它结束。
+                let tracker = ctx.children.clone();
+                tasks.spawn(tracker.track_future(async move {
                     let _connection_permit = connection_permit;
                     let _handshake_permit = handshake_permit;
                     let wait = Duration::from_millis(ctx.limits.handshake_timeout_ms);
                     let Ok(Ok(connection)) = timeout(wait, incoming).await else { return };
                     let _ = serve_connection(connection, config, vmess, ctx, stop, force).await;
-                });
+                }));
             }
             Some(_) = tasks.join_next() => {}
         }

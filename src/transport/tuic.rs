@@ -346,7 +346,8 @@ pub(crate) async fn serve(
                 let ctx = ctx.clone();
                 let stop = stop.clone();
                 let force = force.clone();
-                connections.spawn(async move {
+                let tracker = ctx.children.clone();
+                connections.spawn(tracker.track_future(async move {
                     let _slot = slot;
                     let _gauge = ctx.stats.enter(Gauge::Connection);
                     // 先取得 0.5-RTT 连接句柄，让流接收循环能在握手完成前看到
@@ -388,7 +389,7 @@ pub(crate) async fn serve(
                     {
                         tracing::debug!(event = "tuic_connection_closed", reason = ?error.kind());
                     }
-                });
+                }));
             }
         }
     }
