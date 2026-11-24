@@ -279,3 +279,49 @@ async fn wrong_key_and_replayed_legacy_datagrams_do_not_reach_target() {
         server.shutdown().await;
     }
 }
+
+/// Shadowsocks 2022 的 UDP 经 SOCKS5 出站转发。
+///
+/// 修复前 `Dispatcher::process` 调用 `ctx.allowed()`，选到任何代理出站都返回
+/// `Unsupported`——链式部署下 SS 的 UDP 直接失败。
+///
+/// 覆盖范围说明：本实现只支持 2022（modern）模式。2017（legacy）的回程需要
+/// 关联自己的加密上下文，且 `Packet` 是 `udp` 模块私有，因此那一支保持
+/// fail-closed（选到代理时返回 Unsupported，不会悄悄直连）。
+#[tokio::test]
+async fn modern_udp_relays_through_a_socks5_outbound() {
+    // 落地机：SOCKS5 入口，出站直连。
+    let upstream = Running::start(json!({
+        "version": 1,
+        "inbounds": [{"type": "socks5", "tag": "up", "listen": "127.0.0.1:0"}],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {"default": "direct"},
+        "limits": {"shutdown_timeout_ms": 100, "handshake_timeout_ms": 3000}
+    }))
+    .await;
+
+    let echo = Echo::udp("127.0.0.1").await;
+    let (mut value, clients) = configuration("2022-blake3-aes-128-gcm", false);
+    value["outbounds"] = json!([
+        {"type": "direct", "tag": "direct"},
+        {"type": "socks5", "tag": "up", "endpoint": upstream.address.to_string()}
+    ]);
+    value["route"] = json!({"default": "up"});
+    let server = Running::start(value).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let payload = b"ss2022-via-socks";
+    let control = roundtrip(
+        &client,
+        server.address,
+        &clients[0],
+        echo.address,
+        1,
+        payload,
+    )
+    .await;
+    assert!(control.is_some(), "2022 应答应带控制块");
+
+    server.shutdown().await;
+    upstream.shutdown().await;
+}

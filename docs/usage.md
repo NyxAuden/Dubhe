@@ -215,7 +215,11 @@ UDP 字节预算约束排队载荷以及Shadowsocks原生入口的排队密文�
 
 支持代理出站的 UDP 入站：SOCKS5、VLESS（含 UoT）、Trojan、dokodemo-door、
 Mux.Cool、WireGuard，以及 2026-11-24 补齐的 **Hysteria2、TUIC、Snell、VMess**
-（命令 2 与 packetaddr 两种模式）。**Shadowsocks 入站仍未覆盖**。
+（命令 2 与 packetaddr 两种模式）与 **Shadowsocks 2022**。
+
+**Shadowsocks 2017 模式不支持代理出站**：它的回程需要关联自己的加密上下文，
+选到代理时 fail-closed 返回 `Unsupported`，不会悄悄直连。链式部署请使用
+2022 模式（`2022-blake3-*`）。
 
 每个走代理的目标会额外占用一个 `max_udp_associations` 名额（`RoutedUdp` 内部
 申请一个）。因此实际消耗是「UDP 会话数 + 代理目标数」，而不是单纯的会话数：

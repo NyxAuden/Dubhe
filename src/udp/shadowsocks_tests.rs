@@ -51,6 +51,7 @@ fn dispatcher() -> (
             modern_tx,
             readers: JoinSet::new(),
             generation: 0,
+            proxied: HashMap::new(),
         },
         legacy_rx,
         modern_rx,
@@ -140,7 +141,7 @@ async fn counter_exhaustion_keeps_tombstone_and_slot_for_at_least_sixty_seconds(
     let reply = ModernReply {
         session: key,
         generation,
-        target: destination,
+        target: Address::SocketAddress(destination),
         payload: b"blocked".to_vec(),
         _budget: dispatcher
             .ctx
@@ -202,7 +203,7 @@ async fn no_new_sessions_after_stop_and_old_generation_cannot_return_payload() {
     let reply = ModernReply {
         session: key,
         generation: generation + 1,
-        target: destination,
+        target: Address::SocketAddress(destination),
         payload: b"old".to_vec(),
         _budget: dispatcher
             .ctx
@@ -512,7 +513,7 @@ async fn failed_client_socket_send_does_not_count_plaintext_or_reuse_packet_id()
         let reply = ModernReply {
             session: key,
             generation,
-            target: destination,
+            target: Address::SocketAddress(destination),
             payload: b"not-sent".to_vec(),
             _budget: dispatcher
                 .ctx

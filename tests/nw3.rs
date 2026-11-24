@@ -19,6 +19,17 @@ use tokio::{
 
 const KEY: &str = "0123456789abcdef0123456789abcdef";
 
+/// Portal / Vector 的就绪等待上限。
+///
+/// 原来是 5 秒。全量测试并行跑 76 个二进制时（每个静态链接整份代码），
+/// Portal 起监听 + QUIC 端点 + 内部 SOCKS5 relay 的调度延迟会超过它，
+/// 造成与代码无关的间歇失败（实测 `t32` 一轮 4 个 NW3 用例因此变红，
+/// 单跑该文件 9 项全过）。这里只是「多久之内必须就绪」，不是性能断言。
+const READY: Duration = Duration::from_secs(20);
+
+/// 单次收发的等待上限。理由同上。
+const REPLY: Duration = Duration::from_secs(10);
+
 /// 取一个测试专用端口。
 ///
 /// 不用 `bind("127.0.0.1:0")`：Linux 的临时端口范围是 32768–60999，
@@ -128,7 +139,7 @@ async fn nw3_portal_relays_udp_with_vendored_vector_client() {
     let vector = nowhere::Vector::new(url.parse().unwrap(), nowhere::Logger).unwrap();
     let task = tokio::spawn(vector.run());
     let socks: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
-    let (_control, socket) = timeout(Duration::from_secs(5), async {
+    let (_control, socket) = timeout(READY, async {
         loop {
             match udp_associate(socks).await {
                 Ok(pair) => break pair,
@@ -141,7 +152,7 @@ async fn nw3_portal_relays_udp_with_vendored_vector_client() {
     let payload = b"nw3-udp";
     socket.send(&datagram(echo.address, payload)).await.unwrap();
     let mut buffer = [0u8; 8192];
-    let length = timeout(Duration::from_secs(3), socket.recv(&mut buffer))
+    let length = timeout(REPLY, socket.recv(&mut buffer))
         .await
         .expect("NW3 UDP 回包超时")
         .unwrap();
@@ -190,7 +201,7 @@ async fn nw3_portal_egress_relays_udp_with_vendored_vector_client() {
     let vector = nowhere::Vector::new(url.parse().unwrap(), nowhere::Logger).unwrap();
     let task = tokio::spawn(vector.run());
     let socks: SocketAddr = format!("127.0.0.1:{socks_port}").parse().unwrap();
-    let (_control, socket) = timeout(Duration::from_secs(5), async {
+    let (_control, socket) = timeout(READY, async {
         loop {
             match udp_associate(socks).await {
                 Ok(pair) => break pair,
@@ -203,7 +214,7 @@ async fn nw3_portal_egress_relays_udp_with_vendored_vector_client() {
     let payload = b"nw3-egress-udp";
     socket.send(&datagram(echo.address, payload)).await.unwrap();
     let mut buffer = [0u8; 8192];
-    let length = timeout(Duration::from_secs(3), socket.recv(&mut buffer))
+    let length = timeout(REPLY, socket.recv(&mut buffer))
         .await
         .expect("NW3 Egress UDP 回包超时")
         .unwrap();
@@ -248,7 +259,7 @@ async fn nw3_vector_udp_outbound_preserves_targets_and_empty_on_tls_and_quic() {
         ] {
             socket.send(&datagram(target, payload)).await.unwrap();
             let mut buffer = vec![0; 8192];
-            let length = timeout(Duration::from_secs(3), socket.recv(&mut buffer))
+            let length = timeout(REPLY, socket.recv(&mut buffer))
                 .await
                 .expect("NW3 出站 UDP 超时")
                 .unwrap();
@@ -364,7 +375,7 @@ async fn nw3_vector_outbound_relays_tcp_through_portal() {
     }))
     .await;
     let (mut tunnel, _) = timeout(
-        Duration::from_secs(3),
+        READY,
         common::socks(1, common::address(echo.address), downstream.address),
     )
     .await
@@ -414,7 +425,7 @@ async fn nw3_portal_egress_relays_tcp_with_vendored_vector_client() {
         pin(&cert)
     );
     let client = nowhere::VectorClient::new(url.parse().unwrap(), nowhere::Logger).unwrap();
-    let mut stream = timeout(Duration::from_secs(5), async {
+    let mut stream = timeout(READY, async {
         loop {
             match client.connect_tcp("127.0.0.1", echo.address.port()).await {
                 Ok(stream) => break stream,
@@ -427,7 +438,7 @@ async fn nw3_portal_egress_relays_tcp_with_vendored_vector_client() {
     stream.write_all(b"nw3-egress").await.unwrap();
     stream.flush().await.unwrap();
     let mut echoed = vec![0; b"nw3-egress".len()];
-    timeout(Duration::from_secs(3), stream.read_exact(&mut echoed))
+    timeout(REPLY, stream.read_exact(&mut echoed))
         .await
         .expect("NW3 Egress 回显超时")
         .unwrap();
@@ -463,7 +474,7 @@ async fn nw3_portal_relays_tcp_with_vendored_vector_client() {
         pin(&cert)
     );
     let client = nowhere::VectorClient::new(url.parse().unwrap(), nowhere::Logger).unwrap();
-    let mut stream = timeout(Duration::from_secs(5), async {
+    let mut stream = timeout(READY, async {
         loop {
             match client.connect_tcp("127.0.0.1", echo.address.port()).await {
                 Ok(stream) => break stream,
@@ -476,7 +487,7 @@ async fn nw3_portal_relays_tcp_with_vendored_vector_client() {
     stream.write_all(b"nw3-loopback").await.unwrap();
     stream.flush().await.unwrap();
     let mut echoed = vec![0; b"nw3-loopback".len()];
-    timeout(Duration::from_secs(3), stream.read_exact(&mut echoed))
+    timeout(REPLY, stream.read_exact(&mut echoed))
         .await
         .expect("NW3 回显超时")
         .unwrap();
@@ -530,7 +541,7 @@ async fn nw3_portal_out_direct_respects_kernel_routes() {
     let client = nowhere::VectorClient::new(url.parse().unwrap(), nowhere::Logger).unwrap();
 
     // 控制组：目标 IP 不在拒绝规则里，回显正常。
-    let mut allowed = timeout(Duration::from_secs(5), async {
+    let mut allowed = timeout(READY, async {
         loop {
             match client.connect_tcp("127.0.0.1", echo.address.port()).await {
                 Ok(stream) => break stream,
@@ -543,7 +554,7 @@ async fn nw3_portal_out_direct_respects_kernel_routes() {
     allowed.write_all(b"ok").await.unwrap();
     allowed.flush().await.unwrap();
     let mut echoed = [0u8; 2];
-    timeout(Duration::from_secs(3), allowed.read_exact(&mut echoed))
+    timeout(REPLY, allowed.read_exact(&mut echoed))
         .await
         .expect("NW3 回显超时")
         .unwrap();
@@ -561,7 +572,7 @@ async fn nw3_portal_out_direct_respects_kernel_routes() {
 
     // 命中 reject：`blocked.example` 能解析到回显服务，若 Portal 绕过内核
     // 就会直连成功；只有走内核才会被拒绝。
-    let denied = timeout(Duration::from_secs(5), async {
+    let denied = timeout(READY, async {
         match client
             .connect_tcp("blocked.example", echo.address.port())
             .await

@@ -157,6 +157,18 @@ struct ModernSocket {
     task: AbortHandle,
 }
 
+/// 单个代理目标的发件箱与读任务。
+struct ProxiedTarget {
+    outgoing: mpsc::Sender<Vec<u8>>,
+    task: AbortHandle,
+}
+
+impl Drop for ProxiedTarget {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 struct ModernSession {
     endpoint: SocketAddr,
     /// 该关联所属用户的累计字节；单密钥模式为 None。
@@ -175,7 +187,9 @@ struct ModernSession {
 struct ModernReply {
     session: SessionKey,
     generation: u64,
-    target: SocketAddr,
+    /// 回程地址。直连用 `recv_from` 的真实源地址；代理路径拿不到源地址，
+    /// 用原目标（可能是域名），因此这里用 `Address` 而非 `SocketAddr`。
+    target: Address,
     payload: Vec<u8>,
     _budget: OwnedSemaphorePermit,
 }
@@ -192,6 +206,12 @@ struct Dispatcher {
     modern_tx: mpsc::Sender<ModernReply>,
     readers: JoinSet<()>,
     generation: u64,
+    /// 走代理出站的目标。key 是**原始目标**（与直连的 IP 集合分开：
+    /// 代理路径拿不到真实源地址，回程报头用原目标）。
+    ///
+    /// 直连路径完全不变（共享 socket + `try_send_to` + `allowed` 集合），
+    /// 只有选到代理时才用这里的 outlet，高 pps 场景不引入额外排队。
+    proxied: HashMap<Target, ProxiedTarget>,
 }
 
 impl Dispatcher {
@@ -201,6 +221,94 @@ impl Dispatcher {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("UDP代次耗尽"))?;
         Ok(self.generation)
+    }
+
+    /// 2022 模式的代理出站发送。按目标复用一份 `RoutedUdp`，回程通过
+    /// `modern_tx` 汇入 `modern_reply`，由它加密并发回客户端。
+    ///
+    /// 2017（legacy）模式未覆盖：它的回程需要关联自己的加密上下文与
+    /// `Packet` 构造，且 `Packet` 是 `udp` 模块私有。legacy 路径仍走
+    /// `udp_selected` 的 fail-closed 分支（选到代理时返回 `Unsupported`，
+    /// 不会悄悄直连）。
+    async fn send_proxied(
+        &mut self,
+        source: SocketAddr,
+        target: &Target,
+        payload: &[u8],
+        session: (SessionKey, u64),
+    ) -> io::Result<()> {
+        let _ = source;
+        if !self.proxied.contains_key(target) {
+            if self.proxied.len() >= self.ctx.limits.max_udp_targets {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let outlet =
+                crate::udp::RoutedUdp::new(self.ctx.clone(), self.tag.clone(), target.clone())
+                    .await?;
+            let (outgoing, mut rx) = mpsc::channel::<Vec<u8>>(64);
+            let ctx = self.ctx.clone();
+            let modern_tx = self.modern_tx.clone();
+            let reply_target = target_to_address(target);
+            let (key, generation) = session;
+            let tracker = ctx.children.clone();
+            let handle = tokio::spawn(tracker.track_future(async move {
+                let mut outlet = outlet;
+                loop {
+                    tokio::select! {
+                        biased;
+                        packet = rx.recv() => {
+                            let Some(payload) = packet else { break };
+                            if outlet.send(&payload).await.is_err() {
+                                break;
+                            }
+                        }
+                        datagram = outlet.recv() => {
+                            let Ok(datagram) = datagram else { break };
+                            let len = datagram.payload.len();
+                            let Some(budget) = ctx
+                                .udp_bytes
+                                .clone()
+                                .try_acquire_many_owned(len.max(1) as u32)
+                                .ok()
+                            else {
+                                ctx.stats.drop_packet();
+                                continue;
+                            };
+                            let reply = ModernReply {
+                                session: key,
+                                generation,
+                                target: reply_target.clone(),
+                                payload: datagram.payload,
+                                _budget: budget,
+                            };
+                            if modern_tx.try_send(reply).is_err() {
+                                ctx.stats.drop_packet();
+                            }
+                        }
+                    }
+                }
+            }));
+            self.proxied.insert(
+                target.clone(),
+                ProxiedTarget {
+                    outgoing,
+                    task: handle.abort_handle(),
+                },
+            );
+        }
+        let Some(entry) = self.proxied.get(target) else {
+            return Err(io::Error::other("UDP 代理映射缺失"));
+        };
+        entry
+            .outgoing
+            .send(payload.to_vec())
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        self.ctx
+            .stats
+            .uplink
+            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        Ok(())
     }
 
     fn modern_idle(&self) -> Duration {
@@ -261,8 +369,19 @@ impl Dispatcher {
         if length > self.ctx.limits.max_udp_payload {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "UDP载荷过长"));
         }
-        self.ctx.allowed(&self.tag, Network::Udp, &target).await?;
+        // 选路：`udp_selected` 允许代理出站，`allowed` 只允许直连。
+        // 2022（modern）分支支持代理；2017（legacy）分支保持原样
+        // （回程需要关联自己的加密上下文，`Packet` 又是 `udp` 模块私有）。
+        let selected = self.ctx.udp_selected(&self.tag, &target).await?;
+        let proxied = selected.proxy.is_some();
         if let Some(salt) = legacy_salt {
+            // 2017 不支持代理：链式部署下这一支 fail-closed，绝不静默直连。
+            if proxied {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Shadowsocks 2017 模式的 UDP 不支持上游代理出站",
+                ));
+            }
             self.prepared.replay.admit(
                 Domain {
                     inbound: self.prepared.inbound,
@@ -368,6 +487,21 @@ impl Dispatcher {
                     },
                 );
             }
+            if proxied {
+                let generation = self
+                    .modern
+                    .get(&key)
+                    .map(|session| session.generation)
+                    .ok_or_else(|| io::Error::other("UDP会话已终止"))?;
+                self.send_proxied(
+                    packet.source,
+                    &target,
+                    &packet.wire[..length],
+                    (key, generation),
+                )
+                .await?;
+                return Ok(());
+            }
             let session = self.modern.get_mut(&key).expect("会话已准备");
             let Some(transport) = &session.transport else {
                 return Err(io::Error::other("UDP会话已终止"));
@@ -464,7 +598,7 @@ impl Dispatcher {
                     let reply = ModernReply {
                         session,
                         generation,
-                        target: source,
+                        target: Address::SocketAddress(source),
                         payload: buffer[..length].to_vec(),
                         _budget: budget,
                     };
@@ -537,7 +671,7 @@ impl Dispatcher {
             &self.crypto,
             self.prepared.keys.method,
             &session.key,
-            &Address::SocketAddress(packet.target),
+            &packet.target,
             &control,
             &packet.payload,
             &mut wire,
@@ -598,6 +732,14 @@ fn admitted_legacy_reply<W: AsRef<[u8]>>(
         }
     }
     Err(io::Error::other("UDP salt生成冲突"))
+}
+
+/// 把会话目标转成线格式地址（回程报头用）。
+fn target_to_address(target: &Target) -> Address {
+    match &target.host {
+        Host::Ip(ip) => Address::SocketAddress(SocketAddr::new(*ip, target.port)),
+        Host::Domain(domain) => Address::DomainNameAddress(domain.clone(), target.port),
+    }
 }
 
 fn target(address: Address) -> io::Result<Target> {
@@ -672,6 +814,7 @@ pub(crate) async fn serve(
         modern_tx,
         readers: JoinSet::new(),
         generation: 0,
+        proxied: HashMap::new(),
     };
     let dial = Duration::from_millis(ctx.limits.dial_timeout_ms);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
