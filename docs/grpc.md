@@ -6,6 +6,11 @@
 
 - 独立入口：`vless-grpc`、`vmess-grpc`、`trojan-grpc`。旧 `vless`/`vmess`/`trojan` 入口行为不变。
 - `grpc.path` 必填，1..1024个ASCII可见字符，必须以 `/` 开头，不得包含 `#`/`?`。示例：`/GunService/Tun`。
+- 导出用真客户端核对过的路径形式（2026-11-24，官方 Xray v26.10.31 / sing-box
+  v1.14.4 / Mihomo v1.19.33，监听端口逐一确认属于测试进程）：
+  `/GunService/Tun` 与 `/svc/TunMulti` 交给 Xray，`/GunService/Tun` 与
+  `/svc/a/b` 交给 Mihomo，双路径节点（`path` + `multi_path`）以单流客户端
+  交给 sing-box；`/svc/TunMulti` 导出到 sing-box 会明确拒绝。
 - `dubhe convert` 把 Xray 的 `serviceName` 换算成完整路径：老式 `GunService` →
   `/GunService/Tun`、`/GunService/TunMulti`；新式 `/svc/单|多` → `/svc/单`、`/svc/多`
   （只在最后一个 `/` 之后解析 `|`）。同一条路径同时注册两种流（Xray 允许）无法在
