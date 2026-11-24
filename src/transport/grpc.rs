@@ -850,7 +850,8 @@ fn accept_rpc(
     let inbound = inbound.clone();
     let vmess = vmess.clone();
     let ctx = ctx.clone();
-    rpcs.spawn(async move {
+    let tracker = ctx.children.clone();
+    rpcs.spawn(tracker.track_future(async move {
         run_rpc(
             request.into_body(),
             respond,
@@ -862,7 +863,7 @@ fn accept_rpc(
             scope,
         )
         .await;
-    });
+    }));
 }
 
 /// 准入检查：POST、完整路径、Content-Type、TE、scheme与无压缩。

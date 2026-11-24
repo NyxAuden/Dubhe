@@ -742,12 +742,13 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 let vmess = vmess.clone();
                 let ctx = ctx.clone();
                 let pool = pool.clone();
-                streams.spawn(async move {
+                let tracker = ctx.children.clone();
+                streams.spawn(tracker.track_future(async move {
                     if let Err(error) = handle_h2(request, respond, &config, &vmess, &ctx, &pool, absolute).await {
                         metrics_reject(&ctx);
                         let _ = error;
                     }
-                });
+                }));
             }
             Some(_) = streams.join_next() => {}
         }
@@ -2182,14 +2183,15 @@ pub(crate) async fn serve_quic(
                 let pool = pool.clone();
                 let stop = stop.clone();
                 let force = force.clone();
-                tasks.spawn(async move {
+                let tracker = ctx.children.clone();
+                tasks.spawn(tracker.track_future(async move {
                     let _permit = permit;
                     let wait = Duration::from_millis(ctx.limits.handshake_timeout_ms);
                     let accepted = timeout(wait, async move { incoming.await }).await;
                     let Ok(Ok(connection)) = accepted else { return };
                     drop(handshake);
                     let _ = serve_h3_connection(connection, config, vmess, ctx, pool, stop, force).await;
-                });
+                }));
             }
             Some(_) = tasks.join_next() => {}
         }
@@ -2259,14 +2261,15 @@ async fn serve_h3_connection(
                 let vmess = vmess.clone();
                 let ctx = ctx.clone();
                 let pool = pool.clone();
-                streams.spawn(async move {
+                let tracker = ctx.children.clone();
+                streams.spawn(tracker.track_future(async move {
                     if let Err(error) =
                         handle_h3(request, stream, &config, &vmess, &ctx, &pool, deadline).await
                     {
                         metrics_reject(&ctx);
                         let _ = error;
                     }
-                });
+                }));
             }
             Some(_) = streams.join_next() => {}
         }

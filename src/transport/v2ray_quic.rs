@@ -112,10 +112,11 @@ async fn serve_connection(
                 let config = config.clone();
                 let vmess = vmess.clone();
                 let ctx = ctx.clone();
-                streams.spawn(async move {
+                let tracker = ctx.children.clone();
+                streams.spawn(tracker.track_future(async move {
                     let stream = QuicStream { send, recv };
                     let _ = dispatch(stream, config, vmess, true, ctx, deadline, None).await;
-                });
+                }));
             }
             Some(_) = streams.join_next() => {}
         }

@@ -853,12 +853,13 @@ async fn bi_loop(shared: Arc<SessionShared>, auth: watch::Receiver<AuthState>) {
                 let Ok((send, recv)) = accepted else { break; };
                 let shared = shared.clone();
                 let auth = auth.clone();
-                tasks.spawn(async move {
+                let tracker = shared.ctx.children.clone();
+                tasks.spawn(tracker.track_future(async move {
                     if recv.is_0rtt() {
                         shared.note_early_stream();
                     }
                     handle_bi_stream(send, recv, shared, auth).await;
-                });
+                }));
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {}
         }

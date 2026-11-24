@@ -204,9 +204,12 @@ where
                 let ctx = ctx.clone();
                 let stream_deadline =
                     Instant::now() + Duration::from_millis(ctx.limits.handshake_timeout_ms);
-                streams.spawn(async move {
+                // 登记到 tracker：外层 force 会直接丢掉连接 future，函数末尾的
+                // drain 执行不到，只有 tracker 能保证停机等到流任务真正 drop。
+                let tracker = ctx.children.clone();
+                streams.spawn(tracker.track_future(async move {
                     let _ = dispatch(stream, config, vmess, true, ctx, stream_deadline, None).await;
-                });
+                }));
             }
             Some(_) = streams.join_next() => {}
         }

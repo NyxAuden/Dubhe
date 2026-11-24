@@ -1139,11 +1139,12 @@ where
                 let tag = tag.to_owned();
                 let ctx = ctx.clone();
                 let tunnel = ctx.stats.count_user(&tag, user.as_deref(), tunnel);
-                streams.spawn(async move {
+                let tracker = ctx.children.clone();
+                streams.spawn(tracker.track_future(async move {
                     if let Ok(upstream) = ctx.connect(&tag, &target).await {
                         let _ = forward::relay(tunnel, upstream, ctx.stats.clone()).await;
                     }
-                });
+                }));
             }
             Some(_) = streams.join_next() => {}
         }

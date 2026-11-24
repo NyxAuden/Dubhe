@@ -729,7 +729,8 @@ async fn run_connection(
                 let tag = options.tag.clone();
                 let stream_ctx = ctx.clone();
                 let stream_user = user.clone();
-                tasks.spawn(async move {
+                let tracker = ctx.children.clone();
+                tasks.spawn(tracker.track_future(async move {
                     let _permit = permit;
                     if let Err(error) =
                         handle_stream(send, recv, &tag, &stream_ctx, stream_user.as_deref()).await
@@ -739,7 +740,7 @@ async fn run_connection(
                             reason = ?error.kind()
                         );
                     }
-                });
+                }));
             }
         }
     }
