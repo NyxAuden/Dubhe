@@ -114,6 +114,18 @@ cargo build --locked --release
 其余含证书路径或凭据占位符，**必须先替换**才能加载——尤其 Trojan / VLESS
 等示例不能直接作为公网配置使用。SOCKS5 示例只监听 `127.0.0.1:1080`。
 
+**从发布包安装时**同样适用以上命令，只需把路径换成解包目录：
+
+```sh
+./dubhe version
+./dubhe check -c examples/socks5.json
+./dubhe run   -c examples/socks5.json
+```
+
+发布包内含 `NOTICE`、`LICENSE`、`THIRD-PARTY.md` 与 `licenses/`（vendor 下各
+组件的原始许可文本），以及 `examples/socks5.json` 与 `systemd/dubhe.service`。
+`NOTICE` 要求以二进制分发时随附这些文件，请勿在二次分发时移除。
+
 停机语义：Ctrl+C 或 SIGTERM 触发有期限排空；Unix 下 SIGHUP 在配置未变时只
 轮换 TCP/TLS 证书，不中断既有连接。
 

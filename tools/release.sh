@@ -31,8 +31,19 @@ cargo build --locked --release --bin dubhe
 mkdir -p "$DIST_DIR"
 
 cp "$BIN" "$DIST_DIR/"
-cp LICENSE THIRD-PARTY.md README.md "$DIST_DIR/"
+# NOTICE 的「分发义务」要求随二进制附带 NOTICE 本身与 vendor/ 下各组件
+# 的原始许可文本。
+cp LICENSE NOTICE THIRD-PARTY.md README.md "$DIST_DIR/"
 cp -R packaging/systemd "$DIST_DIR/" 2>/dev/null || true
+mkdir -p "$DIST_DIR/examples" "$DIST_DIR/licenses"
+cp examples/socks5.json "$DIST_DIR/examples/"
+for dir in vendor/*/; do
+    component="$(basename "$dir")"
+    for file in "$dir"LICENSE* "$dir"COPYING*; do
+        [ -f "$file" ] || continue
+        cp "$file" "$DIST_DIR/licenses/${component}-$(basename "$file")"
+    done
+done
 
 SBOM_FILE=""
 if command -v cargo-cyclonedx >/dev/null 2>&1; then
@@ -47,7 +58,7 @@ else
 fi
 
 tar -czf "$ARCHIVE" -C "$DIST_DIR" \
-    dubhe LICENSE THIRD-PARTY.md README.md systemd \
+    dubhe LICENSE NOTICE THIRD-PARTY.md README.md systemd examples licenses \
     ${SBOM_FILE:+"$SBOM_FILE"}
 
 if command -v sha256sum >/dev/null 2>&1; then

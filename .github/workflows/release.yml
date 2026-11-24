@@ -42,10 +42,24 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           name="dubhe-${version}-${{ matrix.asset }}"
-          mkdir -p "$name/systemd"
+          mkdir -p "$name/systemd" "$name/examples" "$name/licenses"
           cp target/release/dubhe "$name/"
-          cp LICENSE THIRD-PARTY.md README.md "$name/"
+          # NOTICE 的「分发义务」要求随二进制附带 NOTICE 本身与 vendor/ 下
+          # 各组件的原始许可文本；此前只复制 LICENSE/THIRD-PARTY/README，
+          # 不满足该义务。
+          cp LICENSE NOTICE THIRD-PARTY.md README.md "$name/"
           cp packaging/systemd/dubhe.service "$name/systemd/"
+          # 随包放一个只监听回环的示例：README 的快速开始引用了它，
+          # 缺了它会让解包后的 `check` 直接失败。
+          cp examples/socks5.json "$name/examples/"
+          # 保留 vendor 目录结构，避免不同组件的同名许可互相覆盖。
+          for dir in vendor/*/; do
+            component="$(basename "$dir")"
+            for file in "$dir"LICENSE* "$dir"COPYING*; do
+              [ -f "$file" ] || continue
+              cp "$file" "$name/licenses/${component}-$(basename "$file")"
+            done
+          done
           tar -czf "$name.tar.gz" "$name"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
