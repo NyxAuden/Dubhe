@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - "v*"
+  # 手动触发的唯一用途是「演练打包链路」：只构建并上传 artifact，
+  # **不发布**（`publish` job 有条件跳过）。第一次发版前应该先跑它，
+  # 下载三个平台的包、解包、校验、实际运行一次。
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -40,7 +44,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          # 手动触发时没有 tag，用 `Cargo.toml` 的版本并标注 -dispatch，
+          # 避免把演练产物误认成正式版本。
+          if [ "${{ github.event_name }}" = "push" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)-dispatch"
+          fi
           name="dubhe-${version}-${{ matrix.asset }}"
           mkdir -p "$name/systemd" "$name/examples" "$name/licenses"
           cp target/release/dubhe "$name/"
@@ -60,6 +70,15 @@ jobs:
               cp "$file" "$name/licenses/${component}-$(basename "$file")"
             done
           done
+          # 二进制自报版本取自 Cargo.toml；tag 与它不一致会让用户拿到
+          # 「包名 v0.2.0、程序自称 0.1.0」的产物。发版时强制对齐。
+          if [ "${{ github.event_name }}" = "push" ]; then
+            crate_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+            if [ "$crate_version" != "$version" ]; then
+              echo "::error::tag 版本 ${version} 与 Cargo.toml 的 ${crate_version} 不一致" >&2
+              exit 1
+            fi
+          fi
           tar -czf "$name.tar.gz" "$name"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
@@ -79,6 +98,8 @@ jobs:
   publish:
     name: publish
     needs: build
+    # 手动触发只演练打包，绝不发布；发布只由 tag 驱动。
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
