@@ -735,3 +735,66 @@ async fn v6_unsafe_raw_tcp_roundtrip() {
     echo.abort();
     running.shutdown().await;
 }
+
+/// Snell v5 的 UDP-over-stream 经 SOCKS5 出站转发。
+///
+/// 修复前 `UdpAssociation::send` 调用 `ctx.allowed()`，选到任何代理出站都返回
+/// `Unsupported`——链式部署下 Snell 的 UDP 直接失败，只有 TCP 能用。
+#[tokio::test]
+async fn v5_udp_over_stream_relays_through_a_socks5_outbound() {
+    // 落地机：SOCKS5 入口，出站直连。
+    let upstream = common::Running::start(json!({
+        "version": 1,
+        "inbounds": [{"type": "socks5", "tag": "up", "listen": "127.0.0.1:0"}],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {"default": "direct"},
+        "limits": {"shutdown_timeout_ms": 100, "handshake_timeout_ms": 3000}
+    }))
+    .await;
+
+    // 中转机：Snell v5 入口，全部经 SOCKS5 出站。
+    let (echo, echo_task) = udp_echo().await;
+    let mut value = snell_config(5, PSK, one_user());
+    value["outbounds"] = json!([
+        {"type": "direct", "tag": "direct"},
+        {"type": "socks5", "tag": "up", "endpoint": upstream.address.to_string()}
+    ]);
+    value["route"] = json!({"default": "up"});
+    let running = common::Running::start(value).await;
+    let mut stream = TcpStream::connect(running.address).await.unwrap();
+
+    let mut wire = Vec::new();
+    let mut writer = ClientWriter::new(PSK.as_bytes(), &mut wire);
+    writer.write_record(&udp_request(USERKEY), 0x155, &mut wire);
+    stream.write_all(&wire).await.unwrap();
+
+    let mut reader = ClientReader::new(&mut stream, PSK.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(read_one(&mut reader, &mut stream).await, Some(vec![0x00]));
+
+    let mut wire = Vec::new();
+    writer.write_record(&udp_packet(echo, b"snell-via-socks"), 0, &mut wire);
+    stream.write_all(&wire).await.unwrap();
+
+    let SocketAddr::V4(echo_v4) = echo else {
+        panic!("测试 UDP 回环必须是 IPv4");
+    };
+    let reply = timeout(Duration::from_secs(5), read_one(&mut reader, &mut stream))
+        .await
+        .expect("经 SOCKS5 出站的 UDP 应答超时")
+        .expect("UDP 应答记录缺失");
+    assert_eq!(reply.first(), Some(&0x04));
+    assert_eq!(&reply[1..5], &echo_v4.ip().octets()[..]);
+    assert_eq!(&reply[5..7], &echo_v4.port().to_be_bytes()[..]);
+    assert_eq!(&reply[7..], &b"snell-via-socks"[..]);
+
+    let mut wire = Vec::new();
+    writer.write_zero(&mut wire);
+    stream.write_all(&wire).await.unwrap();
+
+    drop(stream);
+    echo_task.abort();
+    running.shutdown().await;
+    upstream.shutdown().await;
+}

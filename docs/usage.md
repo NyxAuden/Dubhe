@@ -191,11 +191,11 @@ SOCKS5/Trojan/VLESS/VMess及Shadowsocks2017 UDP每目标映射使用独立connec
 | `max_grpc_streams`（全局） | 256 |
 | `max_grpc_streams_per_connection`（每连接） | 16 |
 | `max_xhttp_sessions` | 256 |
-| `max_udp_associations`（全局） | 256 |
+| `max_udp_associations`（全局） | 256；**见下方「UDP 代理出站的配额影响」** |
 | `max_replay_entries`（Shadowsocks全局精确salt记录） | 65536 |
 | `max_vmess_replay_entries`（VMess独立池，两类记录合计；一正常会话两条） | 65536 |
 | `max_reality_replay_entries`（REALITY独立精确CH池，同派生静态公钥跨入口共享） | 65536 |
-| `max_udp_targets`（每关联） | 64 |
+| `max_udp_targets`（每关联） | 64；直连与代理目标合计 |
 | `udp_queue_bytes`（全局排队载荷预算） | 262144 |
 | `udp_queue_packets`（每队列） | 64 |
 | `max_udp_payload` | 65507 |
@@ -210,6 +210,24 @@ SOCKS5/Trojan/VLESS/VMess及Shadowsocks2017 UDP每目标映射使用独立connec
 | `stats_interval_ms` | 30000 |
 
 UDP 字节预算约束排队载荷以及Shadowsocks原生入口的排队密文，不代表整个进程内存上限；活动读取缓冲、socket 内核缓冲、TLS 状态及映射还有各自开销。关联/映射上限必须结合实际内存与文件描述符预算配置。普通 UDP 队列满或预算不足丢弃新数据报并计数，不无界堆积。Mux.Cool 入站/出站各使用每连接 256 KiB 字节预算与有界队列；预算不足时背压而非无界缓存。每个 Mux UDP 会话占用一个全局 UDP 名额，目标映射按 `udp_idle_timeout_ms` 清理，但 UDP 会话本身不单独按空闲关闭；KeepAlive 不会延长目标映射。GlobalID 为单个 `Context` 实例内的去重键，后到连接接管时旧会话收到 `End+Error`；热重载后不跨实例续接。整条 Mux 连接连续 60 秒无会话且无帧活动才关闭。详见 [Mux 说明](mux.md)。
+
+### UDP 代理出站的配额影响
+
+支持代理出站的 UDP 入站：SOCKS5、VLESS（含 UoT）、Trojan、dokodemo-door、
+Mux.Cool、WireGuard，以及 2026-11-24 补齐的 **Hysteria2、TUIC、Snell、VMess**
+（命令 2 与 packetaddr 两种模式）。**Shadowsocks 入站仍未覆盖**。
+
+每个走代理的目标会额外占用一个 `max_udp_associations` 名额（`RoutedUdp` 内部
+申请一个）。因此实际消耗是「UDP 会话数 + 代理目标数」，而不是单纯的会话数：
+
+- 默认 `max_udp_associations=256`、`max_udp_targets=64`；
+- 4 个各开 64 个代理目标的会话即可吃满全局名额（4 × 64 = 256）。
+
+直连目标不额外占用。若链式部署下目标数较多，请上调 `max_udp_associations`。
+
+回程地址的语义差异：直连时回程报头用 `recv_from` 得到的**真实源地址**；代理时
+拿不到源地址（SOCKS5 只回 payload），只能用**原目标**。当目标域名解析到多个
+IP、或上游从不同 IP 回包时，两者会不同。这是 UDP 中继的固有限制。
 
 ## 日志与计量
 

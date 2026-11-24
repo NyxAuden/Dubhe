@@ -29,7 +29,7 @@ use tokio::{
 
 use crate::{
     forward,
-    session::{Host, Network, Target},
+    session::{Host, Target},
     telemetry::{Gauge, Stats},
 };
 
@@ -723,10 +723,39 @@ struct UdpReply {
     _budget: tokio::sync::OwnedSemaphorePermit,
 }
 
-struct Mapping {
-    socket: Arc<UdpSocket>,
-    task: AbortHandle,
-    last_used: Arc<Mutex<Instant>>,
+/// 单目标的出站方式。
+///
+/// 直连沿用原有「每目标一个 connected socket + 读任务」；代理出站每目标一个
+/// `RoutedUdp`，回程通过 `UdpReply` 汇入同一条记录流。
+enum Mapping {
+    Direct {
+        socket: Arc<UdpSocket>,
+        task: AbortHandle,
+        last_used: Arc<Mutex<Instant>>,
+    },
+    Proxied {
+        outgoing: mpsc::Sender<Vec<u8>>,
+        last_used: Arc<Mutex<Instant>>,
+        task: AbortHandle,
+    },
+}
+
+impl Mapping {
+    fn last_used(&self) -> &Arc<Mutex<Instant>> {
+        match self {
+            Self::Direct { last_used, .. } | Self::Proxied { last_used, .. } => last_used,
+        }
+    }
+
+    fn task(&self) -> &AbortHandle {
+        match self {
+            Self::Direct { task, .. } | Self::Proxied { task, .. } => task,
+        }
+    }
+
+    fn is_proxied(&self) -> bool {
+        matches!(self, Self::Proxied { .. })
+    }
 }
 
 struct UdpAssociation {
@@ -746,14 +775,14 @@ impl UdpAssociation {
         let ttl = Duration::from_millis(ctx.limits.udp_idle_timeout_ms);
         let now = Instant::now();
         self.mappings.retain(|_, mapping| {
-            let expired = mapping.task.is_finished()
+            let expired = mapping.task().is_finished()
                 || mapping
-                    .last_used
+                    .last_used()
                     .lock()
                     .map(|last| now.checked_duration_since(*last).unwrap_or_default() >= ttl)
                     .unwrap_or(true);
             if expired {
-                mapping.task.abort();
+                mapping.task().abort();
                 false
             } else {
                 true
@@ -770,11 +799,108 @@ impl UdpAssociation {
         inbound: &str,
         replies: &mpsc::Sender<UdpReply>,
     ) -> io::Result<()> {
-        ctx.allowed(inbound, Network::Udp, &target).await?;
+        // 先选路：`udp_selected` 允许代理出站，`allowed` 只允许直连。
+        // reject 规则、HTTP 出站与链式出站都会在这里被拒绝。
+        let proxied = ctx.udp_selected(inbound, &target).await?.proxy.is_some();
         if payload.len() > ctx.limits.max_udp_payload {
             return Err(invalid("Snell UDP 载荷超过上限"));
         }
         self.expire(ctx);
+
+        // 路由变化可能改变同一目标的出站方式；旧映射不再适用。
+        if self
+            .mappings
+            .get(&target)
+            .is_some_and(|mapping| mapping.is_proxied() != proxied)
+        {
+            self.mappings.remove(&target);
+        }
+
+        if proxied {
+            if !self.mappings.contains_key(&target) {
+                if self.mappings.len() >= ctx.limits.max_udp_targets {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "Snell UDP 目标数量超过上限",
+                    ));
+                }
+                // 回程报头只能表达 IP（`encode_udp_response_address` 接受
+                // `SocketAddr`），所以与直连分支一样先把域名解析一次。
+                let addresses = ctx.dns.resolve(&target).await?;
+                let address = *addresses.first().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "Snell UDP 无可用地址")
+                })?;
+                let outlet =
+                    crate::udp::RoutedUdp::new(ctx.clone(), inbound.to_owned(), target.clone())
+                        .await?;
+                let (outgoing, rx) = mpsc::channel::<Vec<u8>>(64);
+                let last_used = Arc::new(Mutex::new(Instant::now()));
+                let reader_ctx = ctx.clone();
+                let reader_replies = replies.clone();
+                let reader_last = last_used.clone();
+                let tracker = ctx.children.clone();
+                let handle = tokio::spawn(tracker.track_future(async move {
+                    let mut outlet = outlet;
+                    let mut rx = rx;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            packet = rx.recv() => {
+                                let Some(payload) = packet else { break };
+                                if outlet.send(&payload).await.is_err() {
+                                    break;
+                                }
+                            }
+                            datagram = outlet.recv() => {
+                                let Ok(datagram) = datagram else { break };
+                                let payload = datagram.payload;
+                                let Some(budget) = reader_ctx
+                                    .udp_bytes
+                                    .clone()
+                                    .try_acquire_many_owned(payload.len().max(1) as u32)
+                                    .ok()
+                                else {
+                                    reader_ctx.stats.drop_packet();
+                                    continue;
+                                };
+                                let reply = UdpReply {
+                                    address,
+                                    payload,
+                                    _budget: budget,
+                                };
+                                match reader_replies.try_send(reply) {
+                                    Ok(()) => {
+                                        if let Ok(mut last) = reader_last.lock() {
+                                            *last = Instant::now();
+                                        }
+                                    }
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        reader_ctx.stats.drop_packet();
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                }
+                            }
+                        }
+                    }
+                }));
+                self.mappings.insert(
+                    target.clone(),
+                    Mapping::Proxied {
+                        outgoing,
+                        last_used,
+                        task: handle.abort_handle(),
+                    },
+                );
+            }
+            let Some(Mapping::Proxied { outgoing, .. }) = self.mappings.get(&target) else {
+                return Err(io::Error::other("Snell UDP 映射类型不一致"));
+            };
+            outgoing
+                .send(payload.to_vec())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Snell UDP 代理映射失效"))?;
+            return Ok(());
+        }
 
         if !self.mappings.contains_key(&target) {
             if self.mappings.len() >= ctx.limits.max_udp_targets {
@@ -843,7 +969,7 @@ impl UdpAssociation {
 
             self.mappings.insert(
                 target.clone(),
-                Mapping {
+                Mapping::Direct {
                     socket,
                     task,
                     last_used,
@@ -853,16 +979,19 @@ impl UdpAssociation {
 
         let mapping = self
             .mappings
-            .get_mut(&target)
+            .get(&target)
             .ok_or_else(|| io::Error::other("Snell UDP 映射缺失"))?;
-        let sent = mapping.socket.send(payload).await?;
+        let Mapping::Direct { socket, .. } = mapping else {
+            return Err(io::Error::other("Snell UDP 映射类型不一致"));
+        };
+        let sent = socket.send(payload).await?;
         if sent != payload.len() {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
                 "Snell UDP 发送不完整",
             ));
         }
-        if let Ok(mut last) = mapping.last_used.lock() {
+        if let Ok(mut last) = mapping.last_used().lock() {
             *last = Instant::now();
         }
         ctx.stats.uplink.fetch_add(sent as u64, Ordering::Relaxed);
