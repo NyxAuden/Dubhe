@@ -125,7 +125,13 @@ async fn serve_connection(
         while streams.join_next().await.is_some() {}
     })
     .await;
+    // 上面的宽限 drain 可能超时；abort 之后仍需等到任务真正被 drop，
+    // 否则它们持有的 `Gauge::Tcp` 会晚于连接任务结束。
     streams.abort_all();
+    let _ = timeout_at(Instant::now() + shutdown, async {
+        while streams.join_next().await.is_some() {}
+    })
+    .await;
     connection.close(quinn::VarInt::from_u32(0), b"");
     Ok(())
 }

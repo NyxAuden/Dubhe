@@ -1148,6 +1148,9 @@ where
             Some(_) = streams.join_next() => {}
         }
     }
+    // abort 只是请求取消：任务要等运行时下一次调度才被 drop。流任务持有
+    // `Gauge::Tcp`，这里不 drain 就会让停机快照看到已断开的「幽灵连接」。
     streams.abort_all();
+    while streams.join_next().await.is_some() {}
     Ok(())
 }
