@@ -152,6 +152,11 @@ impl ExportReport {
     fn skip(&mut self, target: &str, tag: &str, reason: &str) {
         self.notes.push(format!("[{target}] 跳过 {tag}：{reason}"));
     }
+
+    /// 记录一条不针对具体节点的提示。
+    fn note(&mut self, message: &str) {
+        self.notes.push(message.to_owned());
+    }
 }
 
 /// 支持的目标格式。
@@ -1097,12 +1102,30 @@ pub fn export(target: Target, nodes: &[Node], report: &mut ExportReport) -> Resu
 
 /// Xray 客户端配置：`outbounds` 里每个节点一个 vnext/server。
 fn export_xray(nodes: &[Node], report: &mut ExportReport) -> Value {
-    let mut outbounds = vec![json!({"tag": "direct", "protocol": "freedom"})];
+    // Xray 用**第一个出站**作为默认路由。此前的实现把 `freedom` 放在首位，
+    // 于是导出配置名义上带着节点、实际全部直连——实测客户端启动成功、
+    // 目标也访问成功，反而最难察觉流量没走服务器。
+    let mut converted = Vec::new();
     for node in nodes {
         match xray_outbound(node) {
-            Ok(value) => outbounds.push(value),
+            Ok(value) => converted.push(value),
             Err(reason) => report.skip(Target::Xray.name(), &node.tag, &reason),
         }
+    }
+    let primary = converted
+        .first()
+        .and_then(|value| value.get("tag"))
+        .cloned()
+        .unwrap_or_else(|| json!("direct"));
+    let mut outbounds = converted;
+    if outbounds.is_empty() {
+        // 没有任何可用节点时，不要产出「看起来能用、其实全直连」的配置。
+        report.note("Xray 导出没有可用节点；生成的客户端将直连，不经过服务器");
+    }
+    outbounds.push(json!({"tag": "direct", "protocol": "freedom"}));
+    let mut route = json!({"domainStrategy": "AsIs"});
+    if primary != json!("direct") {
+        route["rules"] = json!([]);
     }
     json!({
         "log": {"loglevel": "warning"},
@@ -1113,7 +1136,8 @@ fn export_xray(nodes: &[Node], report: &mut ExportReport) -> Value {
             "protocol": "socks",
             "settings": {"udp": true}
         }],
-        "outbounds": outbounds
+        "outbounds": outbounds,
+        "routing": route
     })
 }
 
@@ -1352,13 +1376,25 @@ fn xray_outbound(node: &Node) -> std::result::Result<Value, String> {
 
 /// sing-box 客户端配置。
 fn export_sing_box(nodes: &[Node], report: &mut ExportReport) -> Value {
-    let mut outbounds = vec![json!({"type": "direct", "tag": "direct"})];
+    // `route.final` 决定默认出站。此前写死 `"direct"`，客户端因此绕过代理
+    // ——与 Xray 侧同一个缺陷。改为指向第一个可用节点。
+    let mut converted = Vec::new();
     for node in nodes {
         match sing_box_outbound(node) {
-            Ok(value) => outbounds.push(value),
+            Ok(value) => converted.push(value),
             Err(reason) => report.skip(Target::SingBox.name(), &node.tag, &reason),
         }
     }
+    let final_tag = converted
+        .first()
+        .and_then(|value| value.get("tag"))
+        .cloned()
+        .unwrap_or_else(|| json!("direct"));
+    if converted.is_empty() {
+        report.note("sing-box 导出没有可用节点；生成的客户端将直连，不经过服务器");
+    }
+    let mut outbounds = converted;
+    outbounds.push(json!({"type": "direct", "tag": "direct"}));
     json!({
         "log": {"level": "warn"},
         "inbounds": [{
@@ -1368,7 +1404,7 @@ fn export_sing_box(nodes: &[Node], report: &mut ExportReport) -> Value {
             "listen_port": 1080
         }],
         "outbounds": outbounds,
-        "route": {"final": "direct"}
+        "route": {"final": final_tag}
     })
 }
 
@@ -2301,9 +2337,9 @@ mod transport_matrix_tests {
         for kind in ["ws", "grpc"] {
             let node = node_for(kind);
             let (xray, _) = get(Target::Xray, &node);
-            assert_eq!(xray["outbounds"][1]["streamSettings"]["network"], kind);
+            assert_eq!(xray["outbounds"][0]["streamSettings"]["network"], kind);
             let (sing, _) = get(Target::SingBox, &node);
-            assert_eq!(sing["outbounds"][1]["transport"]["type"], kind);
+            assert_eq!(sing["outbounds"][0]["transport"]["type"], kind);
             let (mihomo, _) = get(Target::Mihomo, &node);
             assert_eq!(mihomo["proxies"][0]["network"], kind);
             let (anywhere, _) = get(Target::Anywhere, &node);
@@ -2318,7 +2354,7 @@ mod transport_matrix_tests {
         node.host = "192.168.1.10".to_owned();
 
         let (xray, _) = get(Target::Xray, &node);
-        assert_eq!(xray["outbounds"][1]["streamSettings"]["network"], "kcp");
+        assert_eq!(xray["outbounds"][0]["streamSettings"]["network"], "kcp");
 
         let (mihomo, _) = get(Target::Mihomo, &node);
         assert_eq!(mihomo["proxies"][0]["network"], "mkcp");
@@ -2373,7 +2409,7 @@ mod xray_shape_tests {
         }));
         let mut report = ExportReport::default();
         let value = export(Target::Xray, std::slice::from_ref(&node), &mut report).unwrap();
-        let outbound = &value["outbounds"][1];
+        let outbound = &value["outbounds"][0];
         let settings = &outbound["settings"];
         assert_eq!(settings["address"], "example.com");
         assert_eq!(settings["port"], 443);
@@ -2398,10 +2434,11 @@ mod xray_shape_tests {
         let mut report = ExportReport::default();
         let value = export(Target::Xray, &[trojan, ss], &mut report).unwrap();
         let outbounds = value["outbounds"].as_array().unwrap();
+        // 两个节点依次在 [0]、[1]；`direct` 在最后。
+        assert!(outbounds[0]["settings"].get("servers").is_none());
+        assert_eq!(outbounds[0]["settings"]["password"], "pw");
         assert!(outbounds[1]["settings"].get("servers").is_none());
-        assert_eq!(outbounds[1]["settings"]["password"], "pw");
-        assert!(outbounds[2]["settings"].get("servers").is_none());
-        assert_eq!(outbounds[2]["settings"]["method"], "aes-256-gcm");
+        assert_eq!(outbounds[1]["settings"]["method"], "aes-256-gcm");
     }
 
     #[test]
@@ -2414,7 +2451,7 @@ mod xray_shape_tests {
         }));
         let mut report = ExportReport::default();
         let value = export(Target::Xray, std::slice::from_ref(&node), &mut report).unwrap();
-        let ws = &value["outbounds"][1]["streamSettings"]["wsSettings"];
+        let ws = &value["outbounds"][0]["streamSettings"]["wsSettings"];
         assert_eq!(ws["path"], "/ws");
         assert_eq!(ws["host"], "cdn.example");
         assert!(ws.get("headers").is_none(), "{ws}");
@@ -2434,7 +2471,7 @@ mod xray_shape_tests {
         }));
         let mut report = ExportReport::default();
         let value = export(Target::Xray, std::slice::from_ref(&node), &mut report).unwrap();
-        let reality = &value["outbounds"][1]["streamSettings"]["realitySettings"];
+        let reality = &value["outbounds"][0]["streamSettings"]["realitySettings"];
         // 新版字段名是 password；publicKey 是旧名别名。
         assert!(reality.get("password").is_some(), "{reality}");
         assert_eq!(reality["fingerprint"], "chrome");
@@ -2572,7 +2609,7 @@ mod data_loss_tests {
         assert_eq!(nodes.len(), 1);
         let mut report = ExportReport::default();
         let value = export(Target::SingBox, &nodes, &mut report).unwrap();
-        let outbound = &value["outbounds"][1];
+        let outbound = &value["outbounds"][0];
         assert_eq!(outbound["obfs"]["type"], "salamander");
         assert_eq!(outbound["obfs"]["password"], "obfs-pw");
     }
@@ -2621,7 +2658,7 @@ mod data_loss_tests {
         }]));
         let mut report = ExportReport::default();
         let sing = export(Target::SingBox, &nodes, &mut report).unwrap();
-        assert_eq!(sing["outbounds"][1]["congestion_control"], "bbr");
+        assert_eq!(sing["outbounds"][0]["congestion_control"], "bbr");
         let mut report = ExportReport::default();
         let mihomo = export(Target::Mihomo, &nodes, &mut report).unwrap();
         assert_eq!(mihomo["proxies"][0]["congestion-controller"], "bbr");
@@ -2697,8 +2734,8 @@ mod remaining_fields_tests {
             "up_mbps": 50, "down_mbps": 200
         }));
         let sing = get(Target::SingBox, &node);
-        assert_eq!(sing["outbounds"][1]["up_mbps"], 50);
-        assert_eq!(sing["outbounds"][1]["down_mbps"], 200);
+        assert_eq!(sing["outbounds"][0]["up_mbps"], 50);
+        assert_eq!(sing["outbounds"][0]["down_mbps"], 200);
 
         let mihomo = get(Target::Mihomo, &node);
         assert_eq!(mihomo["proxies"][0]["up"], "50 Mbps");
@@ -2805,10 +2842,10 @@ mod coverage_gap_tests {
             "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"
         }));
         let (sing, _) = get(Target::SingBox, &node);
-        assert_eq!(sing["outbounds"][1]["type"], "naive");
-        assert_eq!(sing["outbounds"][1]["password"], "pw");
+        assert_eq!(sing["outbounds"][0]["type"], "naive");
+        assert_eq!(sing["outbounds"][0]["password"], "pw");
         // 服务端按 `用户名:密码` 校验；空用户名会被自己的 407 拒绝。
-        assert_eq!(sing["outbounds"][1]["username"], "a");
+        assert_eq!(sing["outbounds"][0]["username"], "a");
         // Mihomo v1.19.33 没有 naive 代理类型，必须报告而不是生成。
         let (mihomo, report) = get(Target::Mihomo, &node);
         assert_eq!(mihomo["proxies"].as_array().unwrap().len(), 0);
@@ -2834,7 +2871,7 @@ mod coverage_gap_tests {
         );
 
         let (sing, _) = get(Target::SingBox, &node);
-        assert_eq!(sing["outbounds"][1]["transport"]["type"], "http");
+        assert_eq!(sing["outbounds"][0]["transport"]["type"], "http");
 
         let (mihomo, _) = get(Target::Mihomo, &node);
         assert_eq!(mihomo["proxies"][0]["network"], "http");
@@ -2851,7 +2888,7 @@ mod coverage_gap_tests {
         }));
         // sing-box 有这个形状。
         let (sing, _) = get(Target::SingBox, &node);
-        assert_eq!(sing["outbounds"][1]["transport"]["type"], "quic");
+        assert_eq!(sing["outbounds"][0]["transport"]["type"], "quic");
 
         // Xray v26 已移除旧 QUIC；Mihomo 也没有。
         for target in [Target::Xray, Target::Mihomo] {
@@ -2881,9 +2918,9 @@ mod coverage_gap_tests {
         }));
         let (sing, _) = get(Target::SingBox, &node);
         // sing-box 没有 v5 客户端；官方文档称 v5 线格式与 v4 相同。
-        assert_eq!(sing["outbounds"][1]["type"], "snell");
-        assert_eq!(sing["outbounds"][1]["version"], 4);
-        assert_eq!(sing["outbounds"][1]["userkey"], "userkey-1");
+        assert_eq!(sing["outbounds"][0]["type"], "snell");
+        assert_eq!(sing["outbounds"][0]["version"], 4);
+        assert_eq!(sing["outbounds"][0]["userkey"], "userkey-1");
     }
 
     #[test]
@@ -2896,7 +2933,7 @@ mod coverage_gap_tests {
             "obfs": {"type": "salamander", "password": "obfs-pw"}
         }));
         let (xray, _) = get(Target::Xray, &node);
-        let outbound = &xray["outbounds"][1];
+        let outbound = &xray["outbounds"][0];
         assert_eq!(outbound["protocol"], "hysteria");
         assert_eq!(outbound["streamSettings"]["network"], "hysteria");
         assert_eq!(outbound["streamSettings"]["hysteriaSettings"]["auth"], "pw");
@@ -3074,15 +3111,15 @@ mod unrepresentable_field_tests {
             &mut ExportReport::default(),
         )
         .unwrap();
-        // outbounds[0] 是 direct，节点从 [1] 开始。
-        assert_eq!(xray["outbounds"][1]["settings"]["encryption"], encryption);
+        // 节点在 outbounds[0]（作为默认出站），direct 在最后。
+        assert_eq!(xray["outbounds"][0]["settings"]["encryption"], encryption);
         let sing = export(
             Target::SingBox,
             std::slice::from_ref(enc),
             &mut ExportReport::default(),
         )
         .unwrap();
-        assert_eq!(sing["outbounds"][1]["encryption"], encryption);
+        assert_eq!(sing["outbounds"][0]["encryption"], encryption);
         let mihomo = export(
             Target::Mihomo,
             std::slice::from_ref(enc),
@@ -3113,7 +3150,7 @@ mod unrepresentable_field_tests {
         let nodes = nodes(&config, "example.com", &mut report);
 
         let sing = export(Target::SingBox, &nodes, &mut report).unwrap();
-        assert_eq!(sing["outbounds"][1]["tls"]["alpn"], json!(["custom", "h3"]));
+        assert_eq!(sing["outbounds"][0]["tls"]["alpn"], json!(["custom", "h3"]));
 
         let mihomo = export(Target::Mihomo, &nodes, &mut report).unwrap();
         assert_eq!(mihomo["proxies"][0]["alpn"], json!(["custom", "h3"]));
@@ -3149,6 +3186,84 @@ mod shadowsocks_multiuser_tests {
         assert!(
             report.notes.iter().any(|note| note.contains("身份密钥")),
             "{:?}",
+            report.notes
+        );
+    }
+}
+
+#[cfg(test)]
+mod default_route_tests {
+    use super::*;
+
+    fn one(value: serde_json::Value) -> Node {
+        let config = crate::config::Config::from_json(
+            &serde_json::json!({
+                "version": 1,
+                "inbounds": [value],
+                "outbounds": [{"type": "direct", "tag": "direct"}],
+                "route": {"default": "direct"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        nodes(&config, "example.com", &mut ExportReport::default())
+            .into_iter()
+            .next()
+            .expect("应生成一个节点")
+    }
+
+    /// 导出的客户端配置必须**默认走节点**。
+    ///
+    /// 此前的实现把 `freedom`/`direct` 放在首位（Xray 用第一个出站当默认），
+    /// sing-box 则写死 `route.final = "direct"`。实测结果是：节点离线时，
+    /// 用导出的配置仍能访问目标——因为客户端在直连，用户看不出区别。
+    #[test]
+    fn xray_defaults_to_the_node_not_direct() {
+        let node = one(serde_json::json!({
+            "type": "vless", "tag": "n", "listen": "0.0.0.0:443",
+            "users": [{"name": "a", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
+            "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"
+        }));
+        let value = export(
+            Target::Xray,
+            std::slice::from_ref(&node),
+            &mut ExportReport::default(),
+        )
+        .unwrap();
+        let outbounds = value["outbounds"].as_array().unwrap();
+        // Xray 的默认出站是第一个。
+        assert_eq!(outbounds[0]["tag"], "n", "首个出站必须是节点");
+        assert!(
+            outbounds.iter().any(|item| item["protocol"] == "freedom"),
+            "仍需保留 freedom 供显式规则使用"
+        );
+    }
+
+    #[test]
+    fn sing_box_final_targets_the_node_not_direct() {
+        let node = one(serde_json::json!({
+            "type": "vless", "tag": "n", "listen": "0.0.0.0:443",
+            "users": [{"name": "a", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
+            "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"
+        }));
+        let value = export(
+            Target::SingBox,
+            std::slice::from_ref(&node),
+            &mut ExportReport::default(),
+        )
+        .unwrap();
+        assert_eq!(value["route"]["final"], "n", "route.final 必须指向节点");
+    }
+
+    /// 没有可用节点时必须显式提示：生成的客户端会直连。
+    #[test]
+    fn no_nodes_reports_that_traffic_will_bypass_the_server() {
+        let mut report = ExportReport::default();
+        let value = export(Target::Xray, &[], &mut report).unwrap();
+        assert_eq!(value["outbounds"].as_array().unwrap().len(), 1);
+        assert!(
+            report.notes.iter().any(|note| note.contains("直连")),
+            "没有节点时必须提示会直连：{:?}",
             report.notes
         );
     }
