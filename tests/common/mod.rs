@@ -43,14 +43,41 @@ pub struct Certificate {
     pub dir: tempfile::TempDir,
     pub der: rustls::pki_types::CertificateDer<'static>,
 }
+/// 测试证书的有效期：相对当前时间，避免固定日期过期后测试失效。
+///
+/// Chromium 拒绝超过 398 天的证书有效期，这里用「昨天到 30 天后」。
+pub fn test_certificate_dates() -> ((i32, u8, u8), (i32, u8, u8)) {
+    fn civil_from_days(days: i64) -> (i32, u8, u8) {
+        // Howard Hinnant 的 civil_from_days。
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if m <= 2 { y + 1 } else { y };
+        (year as i32, m as u8, d as u8)
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let days = now.div_euclid(86_400);
+    (civil_from_days(days - 1), civil_from_days(days + 30))
+}
+
 impl Certificate {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         // Chromium（NaiveProxy 客户端）拒绝 rcgen 默认的 1975..4096 有效期，
-        // 报 `cert validity too long`；显式设为一年。
+        // 报 `cert validity too long`；用相对当前时间的 31 天。
         let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
-        params.not_before = rcgen::date_time_ymd(2026, 1, 1);
-        params.not_after = rcgen::date_time_ymd(2027, 1, 1);
+        let (not_before, not_after) = test_certificate_dates();
+        params.not_before = rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
+        params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let certified = params.self_signed(&key_pair).unwrap();
         std::fs::write(dir.path().join("cert.pem"), certified.pem()).unwrap();

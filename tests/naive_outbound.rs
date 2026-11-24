@@ -147,6 +147,38 @@ fn strict_configuration_defaults_redaction_header_bounds_and_protocol_combinatio
     invalid["outbounds"][0]["type"] = json!("http");
     assert!(Config::from_json(&invalid.to_string()).is_err());
 }
+/// 上游域名解析出多个地址时，H3 出站不能只试第一个。
+#[tokio::test]
+async fn h3_outbound_tries_each_resolved_address() {
+    let cert = Certificate::new();
+    let up = Running::start(upstream(&cert)).await;
+    let echo = Echo::tcp("127.0.0.1", false).await;
+
+    let mut proxy = proxy(&cert, up.address, "3", false);
+    proxy["endpoint"] = json!(format!("up.test:{}", up.address.port()));
+    let mut config = downstream(proxy);
+    // 第一个地址不可达，第二个才是上游；只试首个会整体失败。
+    config["dns"] = json!({"hosts": {"up.test": ["127.0.0.2", "127.0.0.1"]}});
+    config["limits"]["dial_attempt_timeout_ms"] = json!(180);
+    config["limits"]["dial_timeout_ms"] = json!(2500);
+    let down = Running::start(config).await;
+
+    let (mut stream, _) = timeout(
+        WAIT,
+        common::socks(1, common::address(echo.address), down.address),
+    )
+    .await
+    .expect("SOCKS 建连超时");
+    stream.write_all(b"multi-address").await.unwrap();
+    stream.flush().await.unwrap();
+    let mut reply = [0u8; 13];
+    timeout(WAIT, stream.read_exact(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&reply, b"multi-address");
+}
+
 #[tokio::test]
 async fn all_versions_large_tcp_and_fin_reverse_response() {
     for version in ["1.1", "2", "3"] {

@@ -59,6 +59,17 @@
 - **`dubhe convert` 把 domain 并集转成交集**：Xray 同一个 `domain` 数组内
   `domain:`/`keyword:`/`regexp:`/`full:`/`geosite:` 是并集，而它们在本项目里是
   不同字段、彼此取交集。现在按种类拆成多条同出站的相邻规则，语义仍是并集。
+- **热重载后的 `urltest` 探测任务无法被停机取消**：停机取消的是实例启动时
+  那一份令牌，重载换过的几代探测循环收不到取消，`children.wait()` 一直等。
+  改为实例级根令牌 + 每代 `child_token()`：重载只取消旧一代，停机取消根。
+- **`urltest` 把 `reject` 成员当直连探测**：`reject` 与 `direct` 都没有上游
+  代理，探测按 `None` 直接拨号，成功的连接会被当成健康结果参与选路。
+  现在只对 `direct` 与真实代理出站拨号；`reject` 不产生样本。
+- **Naive H3 出站只试上游域名的第一个地址**：首个地址不可达时整体失败，
+  即使后面有健康地址。现在在 `dial_timeout_ms` 内按 `dial_attempt_timeout_ms`
+  逐个尝试。
+- **测试证书固定 2027-01-01 到期**：改为相对当前时间（昨天到 30 天后），
+  避免固定日期过后测试集体失效；仍满足 Chromium 的 398 天上限。
 - **`convert` 把裸域名当成精确域名**：Xray 的 `domain:["example.com"]` 是
   **子串匹配**（`Domain_Substr`，实测也命中 `notexample.com`），此前写成
   `domains`（精确）会漏掉子域名，把本该走代理的流量送到默认出口。现在写入

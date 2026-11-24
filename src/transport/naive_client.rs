@@ -10,6 +10,7 @@ use crate::{
     forward::{Context, Upstream},
     route::ProxyOutbound,
     session::{Host, Target},
+    tls::ClientTls,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::{Buf, Bytes};
@@ -18,10 +19,11 @@ use http::{HeaderValue, Request, StatusCode};
 use std::{
     future::{Future, poll_fn},
     io,
+    net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -366,65 +368,31 @@ async fn connect_h3(ctx: &Context, proxy: &ProxyOutbound, target: &Target) -> io
     }
     let request = request(proxy, target)?;
     let tls = proxy.tls.as_ref().ok_or_else(|| invalid("Naive缺少TLS"))?;
-    let peer = ctx
-        .dns
-        .resolve(&proxy.endpoint)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| invalid("Naive上游无地址"))?;
-    let shared = Shared::new();
-    let mut lifetime = Lifetime::new(&shared);
-    let socket = std::net::UdpSocket::bind(if peer.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })?;
-    let runtime = runtime::Runtime::new(ctx.children.clone());
-    let mut endpoint = quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        None,
-        socket,
-        runtime.clone(),
-    )?;
-    lifetime.endpoint = Some(endpoint.clone());
-    // QUIC握手之前即登记端点/驱动回收；错误CA与半握手取消同样被children覆盖。
-    let cleanup_endpoint = endpoint.clone();
-    let cleanup_cancel = shared.cancel.clone();
-    let cleanup_stop = ctx.outbound_stop.clone();
-    ctx.children.spawn(async move {
-        tokio::select! { biased;
-            _ = cleanup_cancel.cancelled() => {},
-            _ = cleanup_stop.cancelled() => {},
+    let addresses = ctx.dns.resolve(&proxy.endpoint).await?;
+    if addresses.is_empty() {
+        return Err(invalid("Naive上游无地址"));
+    }
+    // 逐个地址尝试：只试第一个会让「首个地址不可达、第二个健康」的上游整体不可用。
+    let attempt = Duration::from_millis(ctx.limits.dial_attempt_timeout_ms);
+    let deadline = Instant::now() + Duration::from_millis(ctx.limits.dial_timeout_ms);
+    let mut last_error = None;
+    let mut established = None;
+    for peer in addresses {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
         }
-        cleanup_endpoint.close(0u32.into(), b"naive endpoint cleanup");
-        let _ = timeout(Duration::from_secs(2), cleanup_endpoint.wait_idle()).await;
-        drop(cleanup_endpoint);
-        runtime.shutdown().await; // 期限后也等全部Quinn驱动真正析构，不留下仍占端口的任务。
-    });
-    let mut config = (*tls.config).clone();
-    config.alpn_protocols = vec![b"h3".to_vec()];
-    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(config).map_err(error)?;
-    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(0u32.into());
-    transport.max_concurrent_uni_streams(3u32.into());
-    transport.stream_receive_window(STREAM_WINDOW.into());
-    transport.receive_window((256u32 * 1024).into());
-    transport.send_window(256 * 1024);
-    transport.datagram_receive_buffer_size(None);
-    transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_millis(ctx.limits.udp_idle_timeout_ms))
-            .map_err(error)?,
-    ));
-    config.transport_config(Arc::new(transport));
-    endpoint.set_default_client_config(config);
-    let connection = endpoint
-        .connect(peer, &tls.server_name.to_str())
-        .map_err(error)?
-        .await
-        .map_err(error)?;
-    lifetime.connection = Some(connection.clone());
+        match connect_h3_peer(ctx, tls, peer, attempt.min(remaining)).await {
+            Ok(value) => {
+                established = Some(value);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let Some((endpoint, connection, shared, lifetime)) = established else {
+        return Err(last_error.unwrap_or_else(|| invalid("Naive H3连接失败")));
+    };
     let negotiated = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok());
@@ -479,6 +447,74 @@ async fn connect_h3(ctx: &Context, proxy: &ProxyOutbound, target: &Target) -> io
     };
     Ok(Upstream::new_send(PaddedStream::new(stream, padded), local))
 }
+
+/// 建立到单个地址的 H3 承载；失败时 `lifetime` 析构会取消端点清理任务。
+async fn connect_h3_peer(
+    ctx: &Context,
+    tls: &ClientTls,
+    peer: SocketAddr,
+    budget: Duration,
+) -> io::Result<(quinn::Endpoint, quinn::Connection, Arc<Shared>, Lifetime)> {
+    let shared = Shared::new();
+    let mut lifetime = Lifetime::new(&shared);
+    let socket = std::net::UdpSocket::bind(if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })?;
+    let runtime = runtime::Runtime::new(ctx.children.clone());
+    let mut endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        runtime.clone(),
+    )?;
+    lifetime.endpoint = Some(endpoint.clone());
+    // QUIC握手之前即登记端点/驱动回收；错误CA与半握手取消同样被children覆盖。
+    let cleanup_endpoint = endpoint.clone();
+    let cleanup_cancel = shared.cancel.clone();
+    let cleanup_stop = ctx.outbound_stop.clone();
+    ctx.children.spawn(async move {
+        tokio::select! { biased;
+            _ = cleanup_cancel.cancelled() => {},
+            _ = cleanup_stop.cancelled() => {},
+        }
+        cleanup_endpoint.close(0u32.into(), b"naive endpoint cleanup");
+        let _ = timeout(Duration::from_secs(2), cleanup_endpoint.wait_idle()).await;
+        drop(cleanup_endpoint);
+        runtime.shutdown().await; // 期限后也等全部Quinn驱动真正析构，不留下仍占端口的任务。
+    });
+    let mut config = (*tls.config).clone();
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(config).map_err(error)?;
+    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(0u32.into());
+    transport.max_concurrent_uni_streams(3u32.into());
+    transport.stream_receive_window(STREAM_WINDOW.into());
+    transport.receive_window((256u32 * 1024).into());
+    transport.send_window(256 * 1024);
+    transport.datagram_receive_buffer_size(None);
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_millis(ctx.limits.udp_idle_timeout_ms))
+            .map_err(error)?,
+    ));
+    config.transport_config(Arc::new(transport));
+    endpoint.set_default_client_config(config);
+    let connecting = endpoint
+        .connect(peer, &tls.server_name.to_str())
+        .map_err(error)?;
+    let connection = match timeout(budget, connecting).await {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(cause)) => return Err(error(cause)),
+        Err(_) => {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "Naive H3 握手超时"));
+        }
+    };
+    lifetime.connection = Some(connection.clone());
+    Ok((endpoint, connection, shared, lifetime))
+}
+
 async fn h3_pump(
     mut send: H3Send,
     mut rx: mpsc::Receiver<Write>,

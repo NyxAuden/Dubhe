@@ -190,6 +190,8 @@ pub struct Server {
     context: Arc<Context>,
     shared: Arc<crate::forward::SharedContext>,
     probe_stop: Arc<std::sync::Mutex<CancellationToken>>,
+    /// 探测任务的实例级根令牌：每一代用 `child_token()`，停机取消根。
+    probe_root: CancellationToken,
     addresses: HashMap<String, SocketAddr>,
     cert_reloads: tls::ReloadHandle,
     reload_fingerprint: Option<serde_json::Value>,
@@ -246,7 +248,8 @@ impl Server {
         // 共享槽在 run 启动时初始化；bind 到 run 之间库调用方仍可通过
         // `Arc::get_mut` 注入 DNS 等测试依赖。
         let shared = crate::forward::SharedContext::new();
-        let probe_stop = Arc::new(std::sync::Mutex::new(CancellationToken::new()));
+        let probe_root = CancellationToken::new();
+        let probe_stop = Arc::new(std::sync::Mutex::new(probe_root.child_token()));
         let replay = Arc::new(shadowsocks::replay::ReplayPool::new(
             config.limits.max_replay_entries,
         ));
@@ -974,6 +977,7 @@ impl Server {
             context,
             shared,
             probe_stop,
+            probe_root,
             addresses,
             cert_reloads: tls::ReloadHandle::new(cert_reloads),
             reload_fingerprint: reload_fingerprint(&config),
@@ -994,6 +998,7 @@ impl Server {
         HotReloadHandle {
             shared: self.shared.clone(),
             probe_stop: self.probe_stop.clone(),
+            probe_root: self.probe_root.clone(),
             fingerprint: self.reload_fingerprint.clone(),
             has_udp_listeners: self.has_udp_listeners,
         }
@@ -1293,7 +1298,8 @@ impl Server {
             self.context.stats.snapshot().connections
         };
         force.cancel();
-        probe_token.cancel();
+        // 取消根令牌：热重载可能已经换过几代，启动时那份不是当前任务。
+        self.probe_root.cancel();
         while let Some(result) = tasks.join_next().await {
             if !matches!(result, Ok(Ok(()))) {
                 failure.get_or_insert_with(|| anyhow::anyhow!("停止监听任务失败"));

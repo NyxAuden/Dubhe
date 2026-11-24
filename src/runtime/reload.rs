@@ -5,6 +5,7 @@ use super::*;
 pub struct HotReloadHandle {
     pub(super) shared: Arc<crate::forward::SharedContext>,
     pub(super) probe_stop: Arc<std::sync::Mutex<CancellationToken>>,
+    pub(super) probe_root: CancellationToken,
     pub(super) fingerprint: Option<serde_json::Value>,
     pub(super) has_udp_listeners: bool,
 }
@@ -43,7 +44,7 @@ impl HotReloadHandle {
         previous.router.close_outbound_pools();
         let (old, next_token) = {
             let mut guard = crate::sync::locked(&self.probe_stop);
-            let old = std::mem::replace(&mut *guard, CancellationToken::new());
+            let old = std::mem::replace(&mut *guard, self.probe_root.child_token());
             (old, guard.clone())
         };
         old.cancel();

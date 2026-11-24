@@ -191,6 +191,14 @@ pub(crate) struct UrltestMember {
     proxy: Option<Arc<ProxyOutbound>>,
 }
 
+impl UrltestMember {
+    /// 探测能否通过这个成员真实拨号。`reject` 与 `reverse` 没有可拨号的
+    /// 终端，按 `proxy: None` 当直连会违反它们的语义。
+    pub(crate) fn dialable(&self) -> bool {
+        matches!(self.kind, OutboundKind::Direct) || self.kind.is_proxy()
+    }
+}
+
 /// 延迟探测组：周期经各成员拨号 `probe`，选择延迟最低的成员。
 ///
 /// 探测只建立 TCP 连接并立即关闭，不发送业务载荷；UDP 仅复用该选择结果。

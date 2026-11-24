@@ -579,8 +579,9 @@ fn padded_target_certificate(
     rustls::pki_types::PrivateKeyDer<'static>,
 )> {
     let mut params = rcgen::CertificateParams::new(vec!["localhost".into()])?;
-    params.not_before = rcgen::date_time_ymd(2026, 1, 1);
-    params.not_after = rcgen::date_time_ymd(2027, 1, 1);
+    let (not_before, not_after) = common::test_certificate_dates();
+    params.not_before = rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
+    params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
     params
         .custom_extensions
         .push(rcgen::CustomExtension::from_oid_content(

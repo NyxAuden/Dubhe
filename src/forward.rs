@@ -957,6 +957,10 @@ async fn probe_round(context: &Arc<Context>, group: &Arc<UrltestGroup>, stop: &C
         let target = group.probe_target().clone();
         let limit = group.timeout();
         tasks.spawn(async move {
+            if !member.dialable() {
+                // `reject`/`reverse` 不能被探测成「健康」：不拨号、无样本。
+                return (index, None);
+            }
             let started = Instant::now();
             let result = tokio::select! {
                 biased;
