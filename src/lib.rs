@@ -1,5 +1,6 @@
 //! 独立服务端内核：协议处理与共享运行机制分离。
 mod admin;
+pub mod apply;
 pub mod config;
 pub(crate) mod connections;
 pub mod convert;

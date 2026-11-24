@@ -87,6 +87,14 @@ pub struct Config {
     /// 打开后任何已认证账户都能注册为载体，只适合受控部署。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reverse_route_fallback: bool,
+    /// 部署标识：面板每次提交生成新的 32 位小写十六进制 ID。
+    ///
+    /// 内核只是把它当**公开关联标记**回显在 `GET /status` 里，用于确认「跑的
+    /// 是不是我提交的那一版」。它不是配置哈希、不是认证凭据，也不参与选路；
+    /// 手写配置可以省略。复用同一个非空 ID 却改业务内容会被拒绝，避免一个
+    /// 标签指向两份不同配置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<String>,
 }
 
 /// 反向 Mux Bridge：引用一个已配置的 VLESS 出站作为到 Portal 的连接。

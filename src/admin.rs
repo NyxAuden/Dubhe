@@ -15,7 +15,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::ApiConfig, connections::Registry, telemetry::Stats, transport::httpupgrade::read_head,
+    apply::ApplyState, config::ApiConfig, connections::Registry, telemetry::Stats,
+    transport::httpupgrade::read_head,
 };
 
 /// 管理连接并发上限与请求期限；管理面不应占用代理业务额度。
@@ -28,6 +29,7 @@ pub(crate) async fn serve(
     config: ApiConfig,
     stats: Arc<Stats>,
     connections: Arc<Registry>,
+    apply: Option<Arc<ApplyState>>,
     stop: CancellationToken,
     force: CancellationToken,
 ) -> io::Result<()> {
@@ -67,9 +69,10 @@ pub(crate) async fn serve(
                 let token = token.clone();
                 let stats = stats.clone();
                 let connections = connections.clone();
+                let apply = apply.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let _ = handle(stream, &token, &stats, &connections).await;
+                    let _ = handle(stream, &token, &stats, &connections, apply.as_deref()).await;
                 });
             }
         }
@@ -83,6 +86,7 @@ async fn handle(
     token: &str,
     stats: &Stats,
     connections: &Registry,
+    apply: Option<&ApplyState>,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let deadline = Instant::now() + REQUEST_TIMEOUT;
@@ -116,6 +120,7 @@ async fn handle(
     let known = matches!(
         route,
         "/healthz"
+            | "/status"
             | "/stats"
             | "/stats/users"
             | "/stats/users/reset"
@@ -123,8 +128,8 @@ async fn handle(
             | "/metrics"
             | "/connections"
     ) || route.starts_with("/connections/");
-    // `/metrics` 是只读端点，不接受 DELETE；其余管理端点允许 GET/DELETE/POST。
-    if route == "/metrics" && request.method != "GET" {
+    // 只读端点不接受 DELETE/POST；其余管理端点允许 GET/DELETE/POST。
+    if matches!(route, "/metrics" | "/status") && request.method != "GET" {
         return respond(
             &mut stream,
             deadline,
@@ -151,6 +156,24 @@ async fn handle(
     match (request.method, route) {
         ("GET", "/healthz") => {
             respond(&mut stream, deadline, 200, "OK", "", br#"{"status":"ok"}"#).await
+        }
+        // 配置应用结果。已认证读取成功一律 200，包括 `result:"rejected"`：
+        // 这表示「读取成功」，不是「部署成功」；判定见 `rolled_back`。
+        ("GET", "/status") => {
+            let Some(apply) = apply else {
+                // 嵌入式库实例没有重载协调器，不给假版本号。
+                return respond(
+                    &mut stream,
+                    deadline,
+                    503,
+                    "Service Unavailable",
+                    "",
+                    br#"{"error_code":"apply_status_unavailable"}"#,
+                )
+                .await;
+            };
+            let body = apply.snapshot().to_json();
+            respond(&mut stream, deadline, 200, "OK", "", &body).await
         }
         ("GET", "/stats") => {
             let body = serde_json::to_vec(&stats.snapshot())

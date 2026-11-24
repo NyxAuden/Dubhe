@@ -206,6 +206,9 @@ pub struct Server {
     cert_reloads: tls::ReloadHandle,
     reload_fingerprint: Option<serde_json::Value>,
     has_udp_listeners: bool,
+    /// 配置应用状态；只由 CLI 重载协调器写入。库调用者默认 `None`，
+    /// 此时 `/status` 返回 `503 apply_status_unavailable`，不给假版本号。
+    apply: Option<Arc<crate::apply::ApplyState>>,
 }
 
 /// 仅影响监听器生命周期的配置子集；用于判断能否热替换 `Context`。
@@ -1000,6 +1003,7 @@ impl Server {
             cert_reloads: tls::ReloadHandle::new(cert_reloads),
             reload_fingerprint: reload_fingerprint(&config),
             has_udp_listeners,
+            apply: None,
         })
     }
     /// 证书轮换句柄；`run` 会消费 `Server`，因此必须在启动前取得。
@@ -1021,6 +1025,13 @@ impl Server {
             has_udp_listeners: self.has_udp_listeners,
         }
     }
+    /// 附加配置应用状态句柄。只由 CLI 重载协调器调用；重建与回退都必须
+    /// 复用同一个 `Arc`，否则面板会看到 `instance_id` 变化而无法确认。
+    pub fn with_apply_state(mut self, apply: Arc<crate::apply::ApplyState>) -> Self {
+        self.apply = Some(apply);
+        self
+    }
+
     pub fn local_addr(&self, tag: &str) -> Option<SocketAddr> {
         self.addresses.get(tag).copied()
     }
@@ -1062,6 +1073,7 @@ impl Server {
                 api,
                 self.context.stats.clone(),
                 self.context.connections.clone(),
+                self.apply.clone(),
                 stop.clone(),
                 force.clone(),
             ));
@@ -1272,6 +1284,11 @@ impl Server {
             ));
         }
         tracing::info!(event = "ready", listeners = self.addresses.len());
+        // 启动就绪才提交待定终态：把「取得 socket」报成「已启动」会让面板
+        // 在真正可用之前就确认成功。
+        if let Some(apply) = &self.apply {
+            apply.commit_pending();
+        }
         let mut tick =
             tokio::time::interval(Duration::from_millis(self.context.limits.stats_interval_ms));
         let mut failure = None;

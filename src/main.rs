@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use dubhe::apply::{ApplyErrorCode, ApplyMode, ApplyResult, ApplyState};
 use dubhe::{Config, Server};
 use tokio_util::sync::CancellationToken;
 
@@ -286,6 +287,39 @@ fn same_config(left: &Config, right: &Config) -> bool {
     }
 }
 
+/// 除 `deployment_id` 外业务配置是否完全相同。
+///
+/// 面板换标签但没改内容时走元数据路径：接受新标签，不做无谓的重绑定。
+fn same_business_config(left: &Config, right: &Config) -> bool {
+    let business = |config: &Config| {
+        let mut value = serde_json::to_value(config).ok()?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("deployment_id");
+        }
+        Some(value)
+    };
+    matches!((business(left), business(right)), (Some(left), Some(right)) if left == right)
+}
+
+/// 读取重载候选，区分「读不到」与「配置无效」——两者要给面板不同的错误码，
+/// 不能都归成一次普通失败。
+enum Candidate {
+    Unreadable,
+    Invalid,
+    // `Config` 很大，装箱避免把枚举体撑到配置大小。
+    Valid(Box<Config>),
+}
+
+fn read_candidate(path: &PathBuf) -> Candidate {
+    match std::fs::read_to_string(path) {
+        Err(_) => Candidate::Unreadable,
+        Ok(input) => match Config::from_json(&input) {
+            Ok(config) => Candidate::Valid(Box::new(config)),
+            Err(_) => Candidate::Invalid,
+        },
+    }
+}
+
 #[cfg(unix)]
 async fn run(path: PathBuf, mut config: Config) -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -297,7 +331,12 @@ async fn run(path: PathBuf, mut config: Config) -> Result<()> {
     // 绑定新实例。新配置校验失败时保持旧实例不变。
     let mut hangup = signal(SignalKind::hangup())?;
     let mut stop = CancellationToken::new();
-    let server = Server::bind(config.clone()).await?;
+    // 状态句柄属于进程，不属于某个 Server 实例：重建与回退必须复用同一个
+    // Arc，否则面板看到的 `instance_id` 会变，无法确认是自己那次提交。
+    let apply = ApplyState::new(config.deployment_id.clone());
+    let server = Server::bind(config.clone())
+        .await?
+        .with_apply_state(apply.clone());
     let mut reload = server.reload_handle();
     let mut hot = server.hot_reload_handle();
     let mut running = Box::pin(server.run(stop.clone()));
@@ -307,37 +346,82 @@ async fn run(path: PathBuf, mut config: Config) -> Result<()> {
             _ = interrupt.recv() => {}
             _ = terminate.recv() => {}
             _ = hangup.recv() => {
-                let new_config = match read_config(path.clone()) {
-                    Ok(config) => config,
-                    Err(error) => {
-                        tracing::error!(event = "reload", reason = %error);
+                let attempt = apply.begin();
+                let new_config = match read_candidate(&path) {
+                    Candidate::Valid(config) => *config,
+                    Candidate::Unreadable => {
+                        tracing::error!(event = "reload", reason = "配置文件不可读取");
+                        apply.finish(attempt, ApplyMode::Validate, ApplyResult::Rejected,
+                            Some(ApplyErrorCode::ConfigUnreadable), None);
+                        continue;
+                    }
+                    Candidate::Invalid => {
+                        tracing::error!(event = "reload", reason = "配置无效");
+                        apply.finish(attempt, ApplyMode::Validate, ApplyResult::Rejected,
+                            Some(ApplyErrorCode::ConfigInvalid), None);
                         continue;
                     }
                 };
+                apply.set_candidate(attempt, new_config.deployment_id.clone());
                 if let Err(error) = Server::check(&new_config) {
                     tracing::error!(event = "reload", reason = %error);
+                    apply.finish(attempt, ApplyMode::Validate, ApplyResult::Rejected,
+                        Some(ApplyErrorCode::ConfigInvalid), None);
+                    continue;
+                }
+                // 复用当前标签却改了业务内容：拒绝，否则一个标签会指向两份配置。
+                if new_config.deployment_id.is_some()
+                    && new_config.deployment_id == config.deployment_id
+                    && !same_business_config(&config, &new_config)
+                {
+                    tracing::error!(event = "reload", reason = "deployment_id 被复用");
+                    apply.finish(attempt, ApplyMode::Validate, ApplyResult::Rejected,
+                        Some(ApplyErrorCode::DeploymentIdReused), None);
                     continue;
                 }
                 if same_config(&config, &new_config) {
-                    match reload.reload() {
-                        Ok(count) => {
+                    let outcome = reload.reload();
+                    match &outcome {
+                        Ok(count) if *count > 0 => {
                             tracing::info!(event = "reload_tls", inbounds = count);
+                            // 单纯轮换证书不推进配置代数。
+                            apply.finish(attempt, ApplyMode::Tls, ApplyResult::Applied, None, None);
+                        }
+                        Ok(_) => {
+                            tracing::info!(event = "reload_tls", inbounds = 0);
+                            apply.finish(attempt, ApplyMode::Tls, ApplyResult::Noop, None, None);
                         }
                         Err(error) => {
                             tracing::error!(event = "reload_tls", reason = %error);
+                            apply.finish(attempt, ApplyMode::Tls, ApplyResult::Rejected,
+                                Some(ApplyErrorCode::TlsReloadFailed), None);
                         }
                     }
+                    continue;
+                }
+                if same_business_config(&config, &new_config) {
+                    // 只换了部署标签：接受标签并推进一代，不做无谓的重绑定。
+                    config = new_config;
+                    tracing::info!(event = "reload_metadata");
+                    apply.finish(attempt, ApplyMode::Metadata, ApplyResult::Applied, None,
+                        config.deployment_id.clone());
                     continue;
                 }
                 match hot.reload(&new_config) {
                     Ok(true) => {
+                        let deployment_id = new_config.deployment_id.clone();
                         config = new_config;
                         tracing::info!(event = "reload_hot");
+                        apply.finish(attempt, ApplyMode::Hot, ApplyResult::Applied, None,
+                            deployment_id);
                         continue;
                     }
-                    Ok(false) => {}
+                    // 需要重建：不是失败，也不是成功，先标记重绑进行中。
+                    Ok(false) => apply.set_mode(attempt, ApplyMode::Rebind),
                     Err(error) => {
                         tracing::error!(event = "reload_hot", reason = %error);
+                        apply.finish(attempt, ApplyMode::Hot, ApplyResult::Rejected,
+                            Some(ApplyErrorCode::HotApplyFailed), None);
                         continue;
                     }
                 }
@@ -345,20 +429,33 @@ async fn run(path: PathBuf, mut config: Config) -> Result<()> {
                 if let Err(error) = (&mut running).await {
                     tracing::error!(event = "reload_stop", reason = %error);
                 }
-                let server = match Server::bind(new_config.clone()).await {
+                let (next, outcome) = match Server::bind(new_config.clone()).await {
                     Ok(server) => {
+                        let deployment_id = new_config.deployment_id.clone();
                         config = new_config;
-                        server
+                        (server, (ApplyResult::Applied, None, deployment_id))
                     }
                     Err(error) => {
                         tracing::error!(event = "reload_bind", reason = %error);
-                        Server::bind(config.clone()).await?
+                        // 回退只恢复旧**配置**，不恢复旧会话与计数器。
+                        let server = Server::bind(config.clone()).await?;
+                        (
+                            server,
+                            (
+                                ApplyResult::RolledBack,
+                                Some(ApplyErrorCode::CandidateBindFailed),
+                                config.deployment_id.clone(),
+                            ),
+                        )
                     }
                 };
-                reload = server.reload_handle();
-                hot = server.hot_reload_handle();
+                // 终态等新监听 ready 再提交，避免把「拿到 socket」报成「已启动」。
+                let (result, error_code, deployment_id) = outcome;
+                apply.stage_commit(attempt, ApplyMode::Rebind, result, error_code, deployment_id);
+                reload = next.reload_handle();
+                hot = next.hot_reload_handle();
                 stop = CancellationToken::new();
-                running = Box::pin(server.run(stop.clone()));
+                running = Box::pin(next.with_apply_state(apply.clone()).run(stop.clone()));
                 continue;
             }
         }

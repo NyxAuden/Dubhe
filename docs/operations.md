@@ -80,6 +80,7 @@ curl -fsS -H "Authorization: Bearer $(cat /etc/dubhe/api.token)" \
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/healthz` | 存活探针，固定返回 `{"status":"ok"}`；**不表示新配置已生效** |
+| GET | `/status` | 配置应用状态：`active_revision` / `active_deployment_id` / `last_apply` |
 | GET | `/stats` | 全局计数快照（JSON） |
 | GET | `/stats/users` | 按入口+用户计数，含 `quota_bytes` / `expires_at_ms` |
 | POST | `/stats/users/reset` | 清零计数；`?inbound=` / `?user=` 缩小范围，**省略即清全部** |
@@ -98,6 +99,22 @@ curl -fsS -H "Authorization: Bearer $(cat /etc/dubhe/api.token)" \
 - `/connections` 的条目有目标地址；这个 token 因此等同于「可读取用户访问了
   哪里」。只应放在面板后端，不要下发到浏览器。
 
+### 一次变更的标准顺序
+
+面板或运维改配置时按这个顺序，避免「发出信号就当成功」：
+
+1. 面板侧串行化：同一个配置文件只允许一项变更在途。
+2. 生成新的 `deployment_id` 写入候选配置（可选，但面板强烈建议；手写配置可省略）。
+3. `dubhe check -c <candidate>`；失败就不要替换。
+4. 读一次 `GET /status`，记下基线 `instance_id` 与 `last_apply.attempt`。
+5. 同目录临时文件 + `rename` 原子替换，保证读者不会看到半份 JSON。
+6. 发 `SIGHUP`。
+7. 限时轮询 `GET /status` 到终态，按 `api.md` 第 6 节判定。
+8. 用真实业务连接做冒烟（新用户/新路由是否按预期工作）。
+
+回退之后磁盘上很可能仍是那份坏候选，**必须恢复上次良好文件**；不要靠再发一次
+`SIGHUP` 修复。
+
 ### 重载契约（面板接入必须知道）
 
 `SIGHUP` 有三条不同路径，结果不能都显示成「已生效」：
@@ -111,8 +128,10 @@ curl -fsS -H "Authorization: Bearer $(cat /etc/dubhe/api.token)" \
 - 校验失败（`check` 或解析失败）时**旧实例继续运行**，新配置不生效。
 - 重新绑定时若新配置绑定失败，会尝试重新绑定旧配置；面板不能假设「返回成功」
   就等于「新配置在跑」。
-- 目前没有「哪一版配置已生效」的机器可读接口；要确认生效，请用**业务结果**
-  （新连接是否按新路由/新用户工作）验证，不要用 `/healthz` 的 200。
+- 用 `GET /status` 确认生效：`last_apply.result == "applied"`、`instance_id` 未变、
+  `active_deployment_id` 等于本次提交的标签。`rolled_back` 是**部署失败**。
+  完整字段、错误码与面板确认算法见[管理 API 与配置应用契约](api.md)。
+- `/healthz` 的 200 **不能**用来补判成功，它只说明进程在。
 
 ## 日志
 

@@ -39,6 +39,12 @@ impl Config {
         ensure!(!self.inbounds.is_empty(), "inbounds 不得为空");
         ensure!(!self.outbounds.is_empty(), "outbounds 不得为空");
         self.limits.validate()?;
+        if let Some(id) = &self.deployment_id {
+            ensure!(
+                crate::apply::valid_deployment_id(id),
+                "deployment_id 必须是 32 位小写十六进制"
+            );
+        }
         if let Some(api) = &self.api {
             ensure!(api.listen.ip().is_loopback(), "api.listen 必须是回环地址");
             ensure!(

@@ -230,7 +230,7 @@ cargo-fuzz 每周定时任务、systemd unit 与容器镜像。
 **工程与安全**
 
 - [威胁模型](docs/threat-model.md) · [失败关闭矩阵](docs/fail-closed-matrix.md)
-- [运维基线](docs/operations.md) · [可复现构建](docs/reproducibility.md)
+- [运维基线](docs/operations.md) · [管理 API 与配置应用契约](docs/api.md) · [可复现构建](docs/reproducibility.md)
 - [依赖基线](docs/dependency-baseline.md) · [SBOM](docs/sbom.md)
 - [开源补齐计划](docs/oss-checklist.md)
 
