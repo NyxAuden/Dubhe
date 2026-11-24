@@ -393,6 +393,66 @@ async fn nw3_vector_outbound_relays_tcp_through_portal() {
     upstream.shutdown().await;
 }
 
+/// 证书文件名里的字面 `%20` 不能被解码成空格。
+///
+/// Nowhere 只对查询参数解码一次；此前 `crt=` 也把调用方的 `%20` 当转义，
+/// `check` 通过、`run` 却去打开 `cert literal.pem`。
+#[tokio::test]
+async fn nw3_certificate_path_with_literal_percent_still_starts() {
+    let cert = Certificate::new();
+    let directory = tempfile::tempdir().unwrap();
+    let certificate = directory.path().join("cert%20literal.pem");
+    let private_key = directory.path().join("key%20literal.pem");
+    std::fs::copy(cert.dir.path().join("cert.pem"), &certificate).unwrap();
+    std::fs::copy(cert.dir.path().join("key.pem"), &private_key).unwrap();
+
+    let port = free_port();
+    let upstream = Running::start(json!({
+        "version": 1,
+        "inbounds": [{
+            "type": "nw3",
+            "tag": "nw3-in",
+            "listen": format!("127.0.0.1:{port}"),
+            "key": KEY,
+            "morph": false,
+            "out": "direct",
+            "certificate": certificate,
+            "private_key": private_key
+        }],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {"default": "direct"},
+        "limits": {"shutdown_timeout_ms": 500, "handshake_timeout_ms": 3000}
+    }))
+    .await;
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let url = format!(
+        "vector://{KEY}@127.0.0.1:{port}?morph=0&sni=localhost&pin={}&in=127.0.0.1:1",
+        pin(&cert)
+    );
+    let downstream = Running::start(json!({
+        "version": 1,
+        "inbounds": [{"type": "socks5", "tag": "local", "listen": "127.0.0.1:0"}],
+        "outbounds": [{"type": "nw3-vector", "tag": "up", "url": url}],
+        "route": {"default": "up"},
+        "limits": {"shutdown_timeout_ms": 100, "handshake_timeout_ms": 3000}
+    }))
+    .await;
+    let (mut tunnel, _) = timeout(
+        READY,
+        common::socks(1, common::address(echo.address), downstream.address),
+    )
+    .await
+    .expect("NW3 Vector 出站建连超时");
+    tunnel.write_all(b"nw3-percent").await.unwrap();
+    tunnel.flush().await.unwrap();
+    let mut echoed = vec![0; b"nw3-percent".len()];
+    tunnel.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"nw3-percent");
+    drop(tunnel);
+    downstream.shutdown().await;
+    upstream.shutdown().await;
+}
+
 #[tokio::test]
 async fn nw3_portal_egress_relays_tcp_with_vendored_vector_client() {
     let cert = Certificate::new();

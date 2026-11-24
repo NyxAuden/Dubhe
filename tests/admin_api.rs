@@ -460,6 +460,52 @@ async fn user_traffic_is_attributed_after_an_authenticated_socks_connection() {
     assert!(entry["uplink"].as_u64().unwrap() >= 7, "{entry}");
     assert!(entry["downlink"].as_u64().unwrap() >= 7, "{entry}");
 
+    // 真实用户存在时：一错一对的限额请求必须整体 400，两个字段都不变。
+    let (head, _) = request(
+        api,
+        format!(
+            "POST /stats/users/limits?inbound=socks&user=alice&quota_bytes=oops&expires_at_ms=123 \
+             HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 0\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+    let users: serde_json::Value = serde_json::from_str(&read_users(api).await).unwrap();
+    let entry = &users.as_array().expect("数组")[0];
+    assert_eq!(entry["quota_bytes"], 0, "{entry}");
+    assert_eq!(entry["expires_at_ms"], 0, "{entry}");
+
+    // 合法的双字段请求：两项都保存。
+    let (head, body) = request(
+        api,
+        format!(
+            "POST /stats/users/limits?inbound=socks&user=alice&quota_bytes=123&expires_at_ms=456 \
+             HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 0\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(body.contains("\"updated\":1"), "{body}");
+    let users: serde_json::Value = serde_json::from_str(&read_users(api).await).unwrap();
+    let entry = &users.as_array().expect("数组")[0];
+    assert_eq!(entry["quota_bytes"], 123, "{entry}");
+    assert_eq!(entry["expires_at_ms"], 456, "{entry}");
+
     drop(stream);
     server.shutdown().await;
+}
+
+async fn read_users(api: SocketAddr) -> String {
+    let (head, body) = request(
+        api,
+        format!(
+            "GET /stats/users HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    body
 }
