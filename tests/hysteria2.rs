@@ -1154,3 +1154,71 @@ fn tls_client_hello(server_name: &str) -> Vec<u8> {
     record.extend_from_slice(&handshake);
     record
 }
+
+/// Hysteria2 入口的 UDP 经 SOCKS5 出站转发。
+///
+/// 修复前这条路径调用 `ctx.allowed()`，选到任何代理出站都返回
+/// `Unsupported`——串接部署（中转机 + 落地机）下 Hysteria2 的 UDP 直接失败，
+/// 只有 TCP 能用。
+///
+/// 这里用第二个 dubhe 实例充当「落地机」的 SOCKS5 入口：它支持
+/// UDP ASSOCIATE，因此能验证完整的 UDP 中继，而不只是「不再报错」。
+#[tokio::test]
+async fn datagram_relays_through_a_socks5_outbound() {
+    // 落地机：SOCKS5 入口，出站直连。
+    let upstream = Running::start(json!({
+        "version": 1,
+        "inbounds": [{"type": "socks5", "tag": "up", "listen": "127.0.0.1:0"}],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {"default": "direct"},
+        "limits": {"shutdown_timeout_ms": 100, "handshake_timeout_ms": 3000}
+    }))
+    .await;
+
+    // 中转机：Hysteria2 入口，UDP 全部经 SOCKS5 出站。
+    let cert = common::Certificate::new();
+    let mut value = config(&cert);
+    value["outbounds"] = json!([
+        {"type": "direct", "tag": "direct"},
+        {
+            "type": "socks5",
+            "tag": "up",
+            "endpoint": upstream.address.to_string()
+        }
+    ]);
+    value["route"] = json!({"default": "up"});
+    let running = Running::start(value).await;
+    let echo = Echo::udp("127.0.0.1").await;
+    let (endpoint, connection) = authenticated(&running, &cert).await;
+
+    let payload = b"hy2-via-socks";
+    let destination = echo.address.to_string();
+    let mut datagram = Vec::new();
+    datagram.extend_from_slice(&7u32.to_be_bytes());
+    datagram.extend_from_slice(&1u16.to_be_bytes());
+    datagram.push(0);
+    datagram.push(1);
+    wire::encode_varint(destination.len() as u64, &mut datagram).unwrap();
+    datagram.extend_from_slice(destination.as_bytes());
+    datagram.extend_from_slice(payload);
+    connection
+        .send_datagram(prost::bytes::Bytes::from(datagram))
+        .unwrap();
+
+    let reply = timeout(Duration::from_secs(5), connection.read_datagram())
+        .await
+        .expect("经 SOCKS5 出站的 UDP 回包超时")
+        .unwrap();
+    let (target_length, offset) = wire::decode_varint(&reply[8..]).unwrap();
+    let target_start = 8 + offset;
+    let target_end = target_start + target_length as usize;
+    assert_eq!(
+        std::str::from_utf8(&reply[target_start..target_end]).unwrap(),
+        destination
+    );
+    assert_eq!(&reply[target_end..], payload, "回调载荷应保持一致");
+
+    drop(endpoint);
+    running.shutdown().await;
+    upstream.shutdown().await;
+}

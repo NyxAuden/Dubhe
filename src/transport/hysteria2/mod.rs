@@ -100,7 +100,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::User,
     forward::{self, Context},
-    session::{Host, Network, Target},
+    session::{Host, Target},
     telemetry::Gauge,
 };
 
@@ -974,7 +974,7 @@ async fn udp_session(
     let _gauge = ctx.stats.enter(Gauge::Udp);
     let activity: Activity = Arc::new(Mutex::new(Instant::now()));
     let packet_id = Arc::new(AtomicU16::new(0));
-    let mut mappings: HashMap<Target, Arc<UdpSocket>> = HashMap::new();
+    let mut mappings: HashMap<Target, UdpMapping> = HashMap::new();
     let mut tasks: JoinSet<()> = JoinSet::new();
     loop {
         // 映射读取任务通常随会话结束；这里回收异常退出的句柄。
@@ -1020,9 +1020,24 @@ async fn udp_session(
     lock(&sessions).remove(&session_id);
 }
 
+/// 单目标的 UDP 出站方式。
+///
+/// 直连保持原有快路径（每目标一个 connected socket + 读任务）；代理出站
+/// 共用一个 `RoutedUdp`，由它负责上游关联与回程。
+enum UdpMapping {
+    Direct(Arc<UdpSocket>),
+    Proxied { outgoing: mpsc::Sender<Vec<u8>> },
+}
+
+impl UdpMapping {
+    fn is_proxied(&self) -> bool {
+        matches!(self, Self::Proxied { .. })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_to(
-    mappings: &mut HashMap<Target, Arc<UdpSocket>>,
+    mappings: &mut HashMap<Target, UdpMapping>,
     tasks: &mut JoinSet<()>,
     connection: &Connection,
     ctx: &Arc<Context>,
@@ -1033,10 +1048,118 @@ async fn forward_to(
     activity: &Activity,
     packet: QueuedPacket,
 ) -> io::Result<()> {
-    ctx.allowed(tag, Network::Udp, &packet.target).await?;
+    // 先选路。`udp_selected` 会拒绝 reject 规则、HTTP 出站与链式出站；
+    // 选到代理时走共享 UDP 关联（与 SOCKS5/VLESS 等路径同一套实现），
+    // 否则保持原有的直连快路径。
+    let proxied = ctx.udp_selected(tag, &packet.target).await?.proxy.is_some();
     let payload_limit = ctx.limits.max_udp_payload.min(wire::MAX_UDP_PAYLOAD);
     if packet.payload.len() > payload_limit {
         return Err(invalid("Hysteria2 UDP 载荷过长"));
+    }
+
+    // 路由变化可能把同一目标从直连改为代理（或反之）；旧映射不再适用。
+    if mappings
+        .get(&packet.target)
+        .is_some_and(|mapping| mapping.is_proxied() != proxied)
+    {
+        mappings.remove(&packet.target);
+    }
+
+    if proxied {
+        if !mappings.contains_key(&packet.target) {
+            if mappings.len() >= ctx.limits.max_udp_targets {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "UDP 目标上限"));
+            }
+            // 回程要把目标地址写回 QUIC 报头，因此提前取出。
+            let target_host = match &packet.target.host {
+                crate::session::Host::Ip(ip) => ip.to_string(),
+                crate::session::Host::Domain(domain) => domain.clone(),
+            };
+            let target_port = packet.target.port;
+            let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+            let outlet =
+                crate::udp::RoutedUdp::new(ctx.clone(), tag.to_owned(), packet.target.clone())
+                    .await?;
+            let reader_connection = connection.clone();
+            let reader_traffic = traffic.clone();
+            let reader_activity = activity.clone();
+            let reader_packet_id = packet_id.clone();
+            let reader_ctx = ctx.clone();
+            let tracker = ctx.children.clone();
+            let _ = tasks.spawn(tracker.track_future(async move {
+                // `RoutedUdp` 的 send 与 recv 必须由同一处持有，因此整个
+                // 移进任务：发送走 channel，回程在这里写回 QUIC。
+                let mut outlet = outlet;
+                loop {
+                    tokio::select! {
+                        biased;
+                        outgoing = rx.recv() => {
+                            let Some(payload) = outgoing else { break };
+                            if outlet.send(&payload).await.is_err() {
+                                break;
+                            }
+                        }
+                        datagram = outlet.recv() => {
+                            let Ok(datagram) = datagram else { break };
+                            let length = datagram.payload.len();
+                            let id = reader_packet_id.fetch_add(1, Ordering::Relaxed);
+                            let destination = wire::format_host_port(
+                                &target_host,
+                                target_port,
+                            );
+                            let fragments = match wire::fragment_udp_message(
+                                session_id,
+                                id,
+                                &destination,
+                                &datagram.payload,
+                                wire::UDP_MTU,
+                            ) {
+                                Ok(fragments) => fragments,
+                                Err(_) => {
+                                    reader_ctx.stats.drop_packet();
+                                    continue;
+                                }
+                            };
+                            let mut failed = false;
+                            for fragment in fragments {
+                                if reader_connection.send_datagram(fragment.into()).is_err() {
+                                    reader_ctx.stats.drop_packet();
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                            if failed {
+                                break;
+                            }
+                            *lock(&reader_activity) = Instant::now();
+                            reader_ctx
+                                .stats
+                                .downlink
+                                .fetch_add(length as u64, Ordering::Relaxed);
+                            if let Some(counter) = &reader_traffic {
+                                counter.add(false, length);
+                            }
+                        }
+                    }
+                }
+            }));
+            mappings.insert(packet.target.clone(), UdpMapping::Proxied { outgoing: tx });
+        }
+        let Some(UdpMapping::Proxied { outgoing }) = mappings.get(&packet.target) else {
+            return Err(io::Error::other("UDP 映射类型不一致"));
+        };
+        outgoing
+            .send(packet.payload.clone())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "UDP 代理映射已失效"))?;
+        *lock(activity) = Instant::now();
+        ctx.stats
+            .uplink
+            .fetch_add(packet.payload.len() as u64, Ordering::Relaxed);
+        if let Some(counter) = traffic {
+            counter.add(true, packet.payload.len());
+        }
+        return Ok(());
     }
 
     if !mappings.contains_key(&packet.target) {
@@ -1108,10 +1231,10 @@ async fn forward_to(
                 }
             }
         }));
-        mappings.insert(packet.target.clone(), socket.clone());
+        mappings.insert(packet.target.clone(), UdpMapping::Direct(socket.clone()));
     }
 
-    let Some(socket) = mappings.get(&packet.target) else {
+    let Some(UdpMapping::Direct(socket)) = mappings.get(&packet.target) else {
         return Err(io::Error::other("UDP 映射丢失"));
     };
     let written = socket.send(&packet.payload).await?;
