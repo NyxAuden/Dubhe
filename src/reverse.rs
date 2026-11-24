@@ -326,11 +326,25 @@ impl Registry {
                     frame = rx.recv() => frame,
                 };
                 let Some(frame) = frame else { break };
-                if write.write_all(&frame).await.is_err() {
+                // 对端不读时 write_all 会一直等窗口；停机必须能打断它。
+                let written = tokio::select! {
+                    biased;
+                    _ = writer_inner.shutdown.cancelled() => break,
+                    result = write.write_all(&frame) => result,
+                };
+                if written.is_err() {
                     break;
                 }
             }
-            let _ = write.shutdown().await;
+            // 强停时直接丢弃写半部；正常关闭也只给有界的优雅 flush，
+            // 不能因为对端不读而把停机挂住。
+            if !writer_inner.shutdown.is_cancelled() {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(writer_inner.queue_timeout_ms),
+                    write.shutdown(),
+                )
+                .await;
+            }
             writer_inner.close();
         }));
 
@@ -344,7 +358,12 @@ impl Registry {
                     frame = mux::read_frame(&mut read, &budget) => frame,
                 };
                 let Ok(Some(frame)) = frame else { break };
-                if !handle_frame(frame, &reader_inner).await {
+                let handled = tokio::select! {
+                    biased;
+                    _ = reader_inner.shutdown.cancelled() => false,
+                    handled = handle_frame(frame, &reader_inner) => handled,
+                };
+                if !handled {
                     break;
                 }
             }
@@ -600,7 +619,11 @@ async fn heartbeat_loop(client: Arc<ClientInner>) {
         port: 0,
     };
     if let Ok(frame) = mux::encode_new(id, Network::Udp, &control, &[]) {
-        let _ = client.writer.send(frame).await;
+        let _ = tokio::select! {
+            biased;
+            _ = client.shutdown.cancelled() => return,
+            sent = client.writer.send(frame) => sent,
+        };
     }
     let mut interval = tokio::time::interval(HEARTBEAT);
     interval.tick().await;
@@ -620,7 +643,12 @@ async fn heartbeat_loop(client: Arc<ClientInner>) {
         let Ok(frame) = mux::encode_data(id, None, &control_message()) else {
             return;
         };
-        if client.writer.send(frame).await.is_err() {
+        let sent = tokio::select! {
+            biased;
+            _ = client.shutdown.cancelled() => return,
+            sent = client.writer.send(frame) => sent,
+        };
+        if sent.is_err() {
             return;
         }
     }
@@ -786,7 +814,7 @@ impl AsyncWrite for SessionStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn portal_context() -> Arc<Context> {
         let config = Config::from_json(
@@ -815,6 +843,41 @@ mod tests {
         )
         .unwrap();
         Arc::new(Context::new(&config).unwrap())
+    }
+
+    /// 载体对端读到首字节后不再读取：写侧背压时停机不能等它。
+    ///
+    /// 只让 writer 的「取帧」响应取消还不够——`write_all` 也会一直等窗口。
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_a_stalled_carrier_write() {
+        let ctx = portal_context();
+        let (carrier, mut peer) = tokio::io::duplex(1);
+        ctx.reverse.attach("portal", carrier, &ctx).unwrap();
+
+        let client = ctx
+            .reverse
+            .portals
+            .get("portal")
+            .unwrap()
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .next()
+            .expect("载体应已注册");
+        // 一帧 64 字节，管道只有 1 字节；对端读掉 1 字节后不再读。
+        client.writer.send(vec![0xAB; 64]).await.unwrap();
+        let mut first = [0u8; 1];
+        peer.read_exact(&mut first).await.unwrap();
+        assert_eq!(first, [0xAB]);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        ctx.shutdown.cancel();
+        ctx.children.close();
+        tokio::time::timeout(Duration::from_secs(2), ctx.children.wait())
+            .await
+            .expect("停机不应等对端读完");
     }
 
     #[tokio::test]

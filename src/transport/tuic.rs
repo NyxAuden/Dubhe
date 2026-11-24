@@ -452,7 +452,10 @@ async fn handle_connection(
     ));
     tasks.spawn(heartbeat_task(shared.clone(), auth_rx.clone()));
     tasks.spawn(uni_loop(shared.clone(), auth_rx.clone(), fatal_tx.clone()));
-    tasks.spawn(bi_loop(shared.clone(), auth_rx.clone()));
+    // 真正创建 TCP 流的是 bi_loop；连接收尾对它的集合只有有界等待，
+    // 登记它本身才能让停机等到「接受流 → 登记流」这段窗口结束。
+    let tracker = shared.ctx.children.clone();
+    tasks.spawn(tracker.track_future(bi_loop(shared.clone(), auth_rx.clone())));
     tasks.spawn(datagram_loop(
         shared.clone(),
         auth_rx.clone(),
