@@ -336,15 +336,15 @@ impl Registry {
                     break;
                 }
             }
-            // 强停时直接丢弃写半部；正常关闭也只给有界的优雅 flush，
-            // 不能因为对端不读而把停机挂住。
-            if !writer_inner.shutdown.is_cancelled() {
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(writer_inner.queue_timeout_ms),
-                    write.shutdown(),
-                )
-                .await;
+            // 正常关闭给有界的优雅 flush；强停要能打断**已经开始**的 flush，
+            // 只在进入前检查一次会让已开始的刷新一直等到超时。
+            let grace = Duration::from_millis(writer_inner.queue_timeout_ms);
+            tokio::select! {
+                biased;
+                _ = writer_inner.shutdown.cancelled() => {}
+                _ = tokio::time::timeout(grace, write.shutdown()) => {}
             }
+            writer_inner.close();
             writer_inner.close();
         }));
 
@@ -878,6 +878,47 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), ctx.children.wait())
             .await
             .expect("停机不应等对端读完");
+    }
+
+    /// 优雅关闭已经开始、正在 flush 时再强停：必须能打断。
+    ///
+    /// 只在进入 `shutdown()` 前检查一次 `is_cancelled()` 会让已开始的刷新
+    /// 一直等到 `queue_timeout_ms`（默认 10 秒）。
+    #[tokio::test]
+    async fn shutdown_interrupts_an_in_progress_graceful_flush() {
+        let ctx = portal_context();
+        let (carrier, mut peer) = tokio::io::duplex(1);
+        // BufWriter 让帧先进入缓冲，writer 才能在 flush 阶段阻塞。
+        let buffered = tokio::io::BufWriter::with_capacity(4096, carrier);
+        ctx.reverse.attach("portal", buffered, &ctx).unwrap();
+
+        let client = ctx
+            .reverse
+            .portals
+            .get("portal")
+            .unwrap()
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .next()
+            .expect("载体应已注册");
+        client.writer.send(vec![0xCD; 256]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 对端半关闭发送方向：reader 读到 EOF → close() → writer 进入
+        // 优雅 shutdown；此时 flush 会阻塞在不再读取的对端上。
+        peer.shutdown().await.unwrap();
+        let mut first = [0u8; 1];
+        peer.read_exact(&mut first).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        ctx.shutdown.cancel();
+        ctx.children.close();
+        tokio::time::timeout(Duration::from_secs(2), ctx.children.wait())
+            .await
+            .expect("强停应打断已开始的优雅 flush");
     }
 
     #[tokio::test]
