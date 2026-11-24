@@ -2366,6 +2366,49 @@ mod tests {
         assert_eq!(mihomo["proxies"][0]["name"], "PROXY");
     }
 
+    /// 第一个节点不可导出、第二个可用时，默认出口必须指向第二个。
+    ///
+    /// 只验证「全空」不够：`primary` 取的是**首个成功转换**的节点，
+    /// 取错会让客户端默认用一个被跳过的 tag。
+    #[test]
+    fn first_skipped_node_does_not_become_the_default() {
+        let value = json!({
+            "version": 1,
+            "inbounds": [
+                // Xray 拒绝无 TLS 且指向公网地址的 VLESS 出站。
+                {"type": "vless", "tag": "plaintext", "listen": "0.0.0.0:443",
+                 "users": [{"name": "a", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}]},
+                {"type": "shadowsocks", "tag": "usable", "listen": "0.0.0.0:8388",
+                 "method": "aes-128-gcm", "password": "usable-password"}
+            ],
+            "outbounds": [{"tag": "direct", "type": "direct"}],
+            "route": {"default": "direct"}
+        });
+        let config = Config::from_json(&value.to_string()).expect("配置应合法");
+        let mut report = ExportReport::default();
+        let nodes = nodes(&config, "example.com", &mut report);
+        assert_eq!(nodes.len(), 2);
+
+        let xray = export(Target::Xray, &nodes, &mut report).expect("应有一个可用节点");
+        let outbounds = xray["outbounds"].as_array().unwrap();
+        assert_eq!(
+            outbounds[0]["tag"], "usable",
+            "默认出口必须是可用的那个：{xray}"
+        );
+        assert!(
+            outbounds.iter().all(|item| item["tag"] != "plaintext"),
+            "不可用节点不应出现：{xray}"
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("跳过 plaintext")),
+            "{:?}",
+            report.notes
+        );
+    }
+
     #[test]
     fn unknown_target_is_an_error() {
         let error = Target::parse("clash").unwrap_err();

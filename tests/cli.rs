@@ -184,6 +184,63 @@ async fn export_refuses_a_target_with_no_usable_node() {
     assert_eq!(value["outbounds"][0]["tag"], "g");
 }
 
+/// 写入失败（目录不可写）时必须保留旧文件，不能留下截断配置。
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_write_keeps_the_previous_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("server.json");
+    let mut configuration = socks_config();
+    configuration["inbounds"] = json!([{
+        "type": "shadowsocks", "tag": "s", "listen": "127.0.0.1:8388",
+        "method": "aes-128-gcm", "password": "test-password"
+    }]);
+    fs::write(&config_path, configuration.to_string()).unwrap();
+    let export_dir = directory.path().join("out");
+    fs::create_dir(&export_dir).unwrap();
+    let target = export_dir.join("xray-client.json");
+    fs::write(&target, "previous-config").unwrap();
+
+    // 目录变成只读：临时文件创建失败，写入必须整体失败。
+    fs::set_permissions(&export_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let status = Command::new(BINARY)
+        .args([
+            "export",
+            "--to",
+            "xray",
+            "-c",
+            config_path.to_str().unwrap(),
+            "--host",
+            "example.com",
+            "-o",
+            export_dir.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    fs::set_permissions(&export_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(!status.success(), "不可写目录必须失败");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "previous-config",
+        "失败时旧文件必须原样保留"
+    );
+    let leftovers: Vec<_> = fs::read_dir(&export_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        leftovers,
+        vec!["xray-client.json".to_owned()],
+        "{leftovers:?}"
+    );
+}
+
 fn bind_released(address: std::net::SocketAddr) -> StdListener {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {

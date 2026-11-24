@@ -348,6 +348,37 @@ fn rule_set_source_json_matches_suffix() {
     );
 }
 
+/// sing-box 允许 `ip_cidr` 写成单个字符串。只验证「解析成功」不够：
+/// 这条规则必须真的选中 IP 目标。
+#[test]
+fn rule_set_scalar_ip_cidr_matches_an_ip() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = json!({
+        "version": 3,
+        "rules": [{"ip_cidr": "192.0.2.0/24"}]
+    });
+    let path = write(dir.path(), "scalar-ip.json", rules.to_string().as_bytes());
+    let geo = json!({"rule_sets": [{"tag": "docs", "path": path}]});
+    assert_eq!(
+        select(
+            geo.clone(),
+            json!({"ip_cidrs": ["rule_set:docs"], "outbound": "reject"}),
+            ip("192.0.2.1"),
+            443
+        ),
+        OutboundKind::Reject
+    );
+    assert_eq!(
+        select(
+            geo,
+            json!({"ip_cidrs": ["rule_set:docs"], "outbound": "reject"}),
+            ip("198.51.100.1"),
+            443
+        ),
+        OutboundKind::Direct
+    );
+}
+
 /// rule-set 里的正则保留原文大小写：`\D` 与 `\d` 语义相反。
 #[test]
 fn rule_set_regex_keeps_original_case() {

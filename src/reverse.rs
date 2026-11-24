@@ -1053,8 +1053,12 @@ mod runtime_tests {
     }
 
     async fn keep_frame(payload: &[u8]) -> mux::Frame {
+        keep_frame_for(7, payload).await
+    }
+
+    async fn keep_frame_for(id: u16, payload: &[u8]) -> mux::Frame {
         let budget = Arc::new(Semaphore::new(1024));
-        let bytes = mux::encode_data(7, None, payload).unwrap();
+        let bytes = mux::encode_data(id, None, payload).unwrap();
         mux::read_frame(&mut &bytes[..], &budget)
             .await
             .unwrap()
@@ -1116,6 +1120,86 @@ mod runtime_tests {
             client.is_closed(),
             "End 帧发不出去时必须断开载体，不能让 Portal 留住半条会话"
         );
+    }
+
+    /// 载体已断开时 `shutdown` 必须报错，不能假装结束帧已送达。
+    #[tokio::test]
+    async fn shutdown_reports_broken_pipe_when_the_carrier_is_gone() {
+        let (sender, incoming) = mpsc::channel::<Vec<u8>>(1);
+        let (writer, frames) = mpsc::channel::<Vec<u8>>(1);
+        drop(frames); // 写端已关闭
+        let (client, failed) = client_with(writer, sender, 10);
+        let mut stream = session_stream(&client, incoming, failed, 10);
+
+        let error = tokio::io::AsyncWriteExt::shutdown(&mut stream)
+            .await
+            .expect_err("载体已断开时必须返回错误");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe, "{error}");
+    }
+
+    /// 写队列暂时满、随后排空时，`shutdown` 必须等到 End 真正入队再成功。
+    #[tokio::test]
+    async fn shutdown_waits_for_a_full_queue_to_drain() {
+        let (sender, incoming) = mpsc::channel::<Vec<u8>>(1);
+        let (writer, mut frames) = mpsc::channel::<Vec<u8>>(1);
+        writer.send(vec![1]).await.unwrap(); // 队列已满
+        let (client, failed) = client_with(writer, sender, 3_000);
+        let mut stream = session_stream(&client, incoming, failed, 3_000);
+
+        let shutdown = tokio::spawn(async move { stream.shutdown().await });
+        // 先让队列排空，shutdown 应随即完成而不是等到超时。
+        assert_eq!(frames.recv().await.unwrap(), vec![1]);
+        let end = tokio::time::timeout(Duration::from_secs(1), frames.recv())
+            .await
+            .expect("shutdown 应在队列排空后发送 End")
+            .expect("应收到 End");
+        assert_eq!(end[4], 0x03);
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown 不应卡住")
+            .unwrap()
+            .expect("End 入队后应成功");
+    }
+
+    /// 同一条载体上，一条流因背压被终止不能影响另一条流。
+    #[tokio::test]
+    async fn one_failed_session_does_not_affect_another() {
+        let (first_tx, _first_rx) = mpsc::channel::<Vec<u8>>(1);
+        first_tx.send(vec![0]).await.unwrap(); // 流 7 的队列已满
+        let (writer, mut frames) = mpsc::channel::<Vec<u8>>(8);
+        let (client, first_failed) = client_with(writer, first_tx, 10);
+
+        // 同一载体上的另一条流。
+        let (second_tx, mut second_rx) = mpsc::channel::<Vec<u8>>(4);
+        let second_failed = Arc::new(AtomicBool::new(false));
+        client
+            .sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                8,
+                Session {
+                    sender: second_tx,
+                    failed: second_failed.clone(),
+                },
+            );
+
+        assert!(handle_frame(keep_frame_for(7, &[1]).await, &client).await);
+        assert!(first_failed.load(Ordering::Acquire), "流 7 应被标记失败");
+
+        assert!(handle_frame(keep_frame_for(8, &[2]).await, &client).await);
+        assert_eq!(
+            second_rx.recv().await.unwrap(),
+            vec![2],
+            "流 8 必须继续收到数据"
+        );
+        assert!(!second_failed.load(Ordering::Acquire), "流 8 不应被牵连");
+        assert!(!client.is_closed(), "End 帧能入队时不应断开整条载体");
+
+        // 流 7 的 End 已经发出。
+        let end = frames.recv().await.expect("应发出流 7 的 End");
+        assert_eq!(end[2..4], 7u16.to_be_bytes());
+        assert_eq!(end[5], 0x02);
     }
 
     /// 消费者只是慢、还没超时，分片必须排队送达而不是被丢弃。
