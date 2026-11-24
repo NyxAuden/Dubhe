@@ -11,7 +11,8 @@
   `/GunService/Tun` 与 `/svc/TunMulti` 交给 Xray，`/GunService/Tun` 与
   `/svc/a/b` 交给 Mihomo，双路径节点（`path` + `multi_path`）以单流客户端
   交给 sing-box；`/svc/TunMulti` 导出到 sing-box 会明确拒绝。
-- `dubhe convert` 把 Xray 的 `serviceName` 换算成完整路径：老式 `GunService` →
+- `dubhe convert` 把 Xray 的 `serviceName` 换算成完整路径（`/svc/a|b` →
+  `/svc/a` + `/svc/b`，已用真 Xray 的 `multiMode` 客户端打 `/svc/b` 验证回环）：老式 `GunService` →
   `/GunService/Tun`、`/GunService/TunMulti`；新式 `/svc/单|多` → `/svc/单`、`/svc/多`
   （只在最后一个 `/` 之后解析 `|`）。同一条路径同时注册两种流（Xray 允许）无法在
   dubhe 里区分，转换会失败。
