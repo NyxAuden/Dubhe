@@ -4,8 +4,6 @@
 //! 多级 routing action、downloadSettings 等）显式报错而不是静默丢弃。
 //! 转换结果会再走一遍 `Config::from_json`，因此不可能输出无法启动的配置。
 
-use std::collections::BTreeSet;
-
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
@@ -418,26 +416,46 @@ fn convert_websocket(stream: Option<&Value>) -> Value {
     Value::Object(out)
 }
 
+/// Xray 的 `serviceName` → 完整 HTTP/2 路径。
+///
+/// 本仓库的 `grpc.path` 存完整路径（`/GunService/Tun`）。Xray 老式写法只给服务名，
+/// 客户端请求 `/<service>/Tun`（multiMode 为 `/<service>/TunMulti`）；以 `/` 开头
+/// 是新式完整路径，服务端用 `单路径|多路径` 给出 multi 路径。
+fn grpc_paths(service: &str) -> (String, Option<String>) {
+    if let Some(rest) = service.strip_prefix('/') {
+        return match rest.split_once('|') {
+            Some((single, multi)) => (format!("/{single}"), Some(format!("/{multi}"))),
+            None => (format!("/{rest}"), None),
+        };
+    }
+    (
+        format!("/{service}/Tun"),
+        Some(format!("/{service}/TunMulti")),
+    )
+}
+
 fn convert_grpc(stream: Option<&Value>, index: usize) -> Result<Value> {
     let settings = stream.and_then(|s| s.get("grpcSettings"));
-    let path = settings
+    let service = settings
         .and_then(|s| s.get("serviceName"))
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| anyhow!("inbounds[{index}] 的 gRPC 缺少 serviceName"))?;
-    let path = if path.starts_with('/') {
-        path.to_owned()
-    } else {
-        format!("/{path}")
-    };
-    let mut out = Map::new();
-    out.insert("path".into(), json!(path));
-    if settings
+    let multi_mode = settings
         .and_then(|s| s.get("multiMode"))
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        out.insert("multi_path".into(), json!("/multipath"));
+        .unwrap_or(false);
+    let (path, multi_path) = grpc_paths(service);
+    if multi_mode && multi_path.is_none() {
+        bail!(
+            "inbounds[{index}] 的 gRPC 使用新式完整路径 + multiMode，\
+             但 serviceName 缺少 `单路径|多路径` 分隔；无法推导 multi_path"
+        );
+    }
+    let mut out = Map::new();
+    out.insert("path".into(), json!(path));
+    if multi_mode && let Some(multi_path) = multi_path {
+        out.insert("multi_path".into(), json!(multi_path));
     }
     Ok(Value::Object(out))
 }
@@ -544,6 +562,17 @@ fn convert_outbound(
         .unwrap_or_else(|| format!("{protocol}-{index}"));
     let settings = object.get("settings").cloned().unwrap_or_else(|| json!({}));
     let stream = object.get("streamSettings");
+    if let Some(chain) = stream
+        .and_then(|s| s.get("sockopt"))
+        .and_then(|s| s.get("dialerProxy"))
+        .and_then(Value::as_str)
+    {
+        // 丢掉 dialerProxy 会让这条出站直连，等于跳过用户配置的链式代理。
+        bail!(
+            "outbounds[{index}] 使用 sockopt.dialerProxy={chain} 链式代理；\
+             转换无法等价表达，请改用 dubhe 的 via 字段手工配置"
+        );
+    }
 
     match protocol {
         "freedom" => Ok(json!({"tag": tag, "type": "direct"})),
@@ -562,7 +591,7 @@ fn convert_outbound(
                 out.insert("flow".into(), json!("xtls-rprx-vision"));
             }
             apply_outbound_security(stream, &mut out, index, ca_file, report)?;
-            apply_outbound_transport(stream, &mut out)?;
+            apply_outbound_transport(stream, &mut out, index)?;
             Ok(Value::Object(out))
         }
         "vmess" => {
@@ -579,7 +608,7 @@ fn convert_outbound(
                 out.insert("security".into(), json!(security));
             }
             apply_outbound_security(stream, &mut out, index, ca_file, report)?;
-            apply_outbound_transport(stream, &mut out)?;
+            apply_outbound_transport(stream, &mut out, index)?;
             Ok(Value::Object(out))
         }
         "trojan" => {
@@ -596,7 +625,7 @@ fn convert_outbound(
                 ),
             );
             apply_outbound_security(stream, &mut out, index, ca_file, report)?;
-            apply_outbound_transport(stream, &mut out)?;
+            apply_outbound_transport(stream, &mut out, index)?;
             Ok(Value::Object(out))
         }
         "shadowsocks" => {
@@ -619,6 +648,7 @@ fn convert_outbound(
                         .ok_or_else(|| anyhow!("outbounds[{index}] 缺少 password"))?
                 ),
             );
+            apply_plain_outbound_wrapping(stream, &mut out, index, protocol, ca_file, report)?;
             Ok(Value::Object(out))
         }
         "socks" => {
@@ -637,6 +667,7 @@ fn convert_outbound(
                     out.insert("password".into(), json!(password));
                 }
             }
+            apply_plain_outbound_wrapping(stream, &mut out, index, protocol, ca_file, report)?;
             Ok(Value::Object(out))
         }
         "http" => {
@@ -655,10 +686,50 @@ fn convert_outbound(
                     out.insert("password".into(), json!(password));
                 }
             }
+            apply_plain_outbound_wrapping(stream, &mut out, index, protocol, ca_file, report)?;
             Ok(Value::Object(out))
         }
         other => bail!("outbounds[{index}] 的协议 {other} 暂不支持转换"),
     }
+}
+
+/// socks/http/shadowsocks 出站在 dubhe 里支持 TLS，但不支持 REALITY 与自定义承载。
+///
+/// Xray 对这三类出站也套用 `streamSettings`；此前转换器直接跳过，带 TLS 的
+/// 上游被静默降成明文，而退出码仍是 0。
+fn apply_plain_outbound_wrapping(
+    stream: Option<&Value>,
+    out: &mut Map<String, Value>,
+    index: usize,
+    protocol: &str,
+    ca_file: Option<&str>,
+    report: &mut Report,
+) -> Result<()> {
+    let network = stream
+        .and_then(|s| s.get("network"))
+        .and_then(Value::as_str)
+        .unwrap_or("tcp");
+    anyhow::ensure!(
+        network == "tcp",
+        "outbounds[{index}] 的 {protocol} 出站使用 network={network} 承载，\
+         dubhe 的该类出站只支持原始 TCP；请改用 vless/vmess/trojan 出站"
+    );
+    let security = stream
+        .and_then(|s| s.get("security"))
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    anyhow::ensure!(
+        security != "reality",
+        "outbounds[{index}] 的 {protocol} 出站使用 REALITY，\
+         dubhe 的该类出站不支持 REALITY；请改用 vless/vmess/trojan 出站"
+    );
+    if security == "tls" && protocol == "shadowsocks" {
+        bail!(
+            "outbounds[{index}] 的 shadowsocks 出站使用 TLS，dubhe 的 shadowsocks 出站不支持 TLS；\
+             请改用 socks/http 出站或在上游终止 TLS"
+        );
+    }
+    apply_outbound_security(stream, out, index, ca_file, report)
 }
 
 fn apply_outbound_security(
@@ -720,7 +791,11 @@ fn apply_outbound_security(
     }
 }
 
-fn apply_outbound_transport(stream: Option<&Value>, out: &mut Map<String, Value>) -> Result<()> {
+fn apply_outbound_transport(
+    stream: Option<&Value>,
+    out: &mut Map<String, Value>,
+    index: usize,
+) -> Result<()> {
     let network = stream
         .and_then(|s| s.get("network"))
         .and_then(Value::as_str)
@@ -753,19 +828,23 @@ fn apply_outbound_transport(stream: Option<&Value>, out: &mut Map<String, Value>
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| anyhow!("出站的 gRPC 缺少 serviceName"))?;
-            let path = if service.starts_with('/') {
-                service.to_owned()
+            let multi_mode = settings
+                .and_then(|s| s.get("multiMode"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let (single, multi_path) = grpc_paths(service);
+            // multiMode 时 Xray 客户端请求的是 `/<service>/TunMulti`，不是单流路径。
+            let path = if multi_mode {
+                multi_path.ok_or_else(|| {
+                    anyhow!("outbounds[{index}] 的 gRPC 使用新式完整路径 + multiMode，但缺少 `单路径|多路径` 分隔")
+                })?
             } else {
-                format!("/{service}")
+                single
             };
             let mut transport = Map::new();
             transport.insert("type".into(), json!("grpc"));
             transport.insert("path".into(), json!(path));
-            if settings
-                .and_then(|s| s.get("multiMode"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
+            if multi_mode {
                 transport.insert("multi".into(), json!(true));
             }
             out.insert("transport".into(), Value::Object(transport));
@@ -856,21 +935,17 @@ fn convert_routing(
     outbounds: &[Value],
     report: &mut Report,
 ) -> Result<Value> {
-    let tags: BTreeSet<&str> = outbounds
-        .iter()
-        .filter_map(|item| item.get("tag").and_then(Value::as_str))
-        .collect();
-    let default = if tags.contains("proxy") {
-        "proxy"
-    } else if tags.contains("direct") {
-        "direct"
-    } else {
-        outbounds
-            .first()
-            .and_then(|item| item.get("tag"))
-            .and_then(Value::as_str)
-            .unwrap_or("direct")
-    };
+    // Xray 的默认出站就是**配置里第一个出站**（proxyman 用首个注册的出站做
+    // defaultHandler）。按 tag 名猜 proxy/direct 会改变流量路径：一个
+    // `[{tag:"node"},{tag:"direct"}]` 的上游配置会被转成默认直连。
+    let default = outbounds
+        .first()
+        .and_then(|item| item.get("tag"))
+        .and_then(Value::as_str)
+        .unwrap_or("direct");
+    report.note(format!(
+        "route.default 取 Xray 第一个出站 {default}（Xray 以首个出站为默认出口）"
+    ));
 
     let mut route = Map::new();
     route.insert("default".into(), json!(default));
@@ -901,73 +976,9 @@ fn convert_routing(
             if item.get("balancerTag").is_some() {
                 bail!("routing.rules[{index}] 使用 balancerTag，暂不支持转换");
             }
-            let mut rule = Map::new();
-            rule.insert("outbound".into(), json!(outbound));
-            if let Some(domains) = item.get("domain").and_then(Value::as_array) {
-                let mut exact = Vec::new();
-                // 同一 Xray `domain` 数组内部是并集；而 dubhe 的
-                // `domains` 与 `domain_suffix`/`domain_keyword`/`domain_regex`
-                // 是不同字段、彼此取交集。把并集拆到不同字段会改变语义，
-                // 因此混合时直接失败，不做有损转换。
-                let mut has_geosite = false;
-                let mut has_other_kind = false;
-                for domain in domains.iter().filter_map(Value::as_str) {
-                    if domain.starts_with("geosite:") {
-                        has_geosite = true;
-                        // dubhe 支持 geosite:，但要求配置里给出 geo.geosite
-                        // 数据文件。**必须并进 `exact`**：之前直接写进
-                        // `rule["domains"]`，随后 `rule.insert("domains", exact)`
-                        // 会把它覆盖掉。
-                        exact.push(json!(domain));
-                        report.note(format!(
-                            "routing.rules[{index}] 的 {domain} 已保留；在 dubhe 配置里设置 geo.geosite 指向 geosite.dat 才会生效"
-                        ));
-                    } else if domain.starts_with("ext:") {
-                        report.note(format!(
-                            "routing.rules[{index}] 的 {domain} 需要外部规则集，已跳过；可用 geo.rule_sets 引用 sing-box source JSON"
-                        ));
-                    } else if let Some(suffix) = domain.strip_prefix("domain:") {
-                        has_other_kind = true;
-                        rule.entry("domain_suffix")
-                            .or_insert_with(|| json!([]))
-                            .as_array_mut()
-                            .expect("数组")
-                            .push(json!(suffix));
-                    } else if let Some(keyword) = domain.strip_prefix("keyword:") {
-                        has_other_kind = true;
-                        rule.entry("domain_keyword")
-                            .or_insert_with(|| json!([]))
-                            .as_array_mut()
-                            .expect("数组")
-                            .push(json!(keyword));
-                    } else if let Some(pattern) = domain.strip_prefix("regexp:") {
-                        has_other_kind = true;
-                        rule.entry("domain_regex")
-                            .or_insert_with(|| json!([]))
-                            .as_array_mut()
-                            .expect("数组")
-                            .push(json!(pattern));
-                    } else if let Some(full) = domain.strip_prefix("full:") {
-                        exact.push(json!(full));
-                    } else if domain.starts_with("dotless:") {
-                        has_other_kind = true;
-                        report.note(format!(
-                            "routing.rules[{index}] 的 {domain}（无点域名）暂无对应字段，已跳过"
-                        ));
-                    } else {
-                        exact.push(json!(domain));
-                    }
-                }
-                anyhow::ensure!(
-                    !(has_geosite && has_other_kind),
-                    "routing.rules[{index}] 在同一 domain 数组里混用了 geosite: 与 domain:/keyword:/regexp:；\
-                     Xray 里它们是并集，而 dubhe 的这些字段之间是交集，无法等价转换。\
-                     请拆成多条规则，或在 Xray 侧展开后再转换"
-                );
-                if !exact.is_empty() {
-                    rule.insert("domains".into(), Value::Array(exact));
-                }
-            }
+            let mut base = Map::new();
+            base.insert("outbound".into(), json!(outbound));
+            let domain_groups = convert_domains(item.get("domain"), index, report)?;
             if let Some(ips) = item.get("ip").and_then(Value::as_array) {
                 let mut cidrs = Vec::new();
                 let mut has_private = false;
@@ -981,7 +992,7 @@ fn convert_routing(
                         report.note(format!(
                             "routing.rules[{index}] 的 geoip:private 近似映射为 ip_is_private，请复核地址集合差异"
                         ));
-                        rule.insert("ip_is_private".into(), json!(true));
+                        base.insert("ip_is_private".into(), json!(true));
                     } else if let Some(code) = ip.strip_prefix("geoip:") {
                         has_other_ip = true;
                         // dubhe 的 ip_cidrs 支持 geoip:<code>，同样要求
@@ -1014,11 +1025,11 @@ fn convert_routing(
                      无法等价转换。请拆成多条规则"
                 );
                 if !cidrs.is_empty() {
-                    rule.insert("ip_cidrs".into(), Value::Array(cidrs));
+                    base.insert("ip_cidrs".into(), Value::Array(cidrs));
                 }
             }
             if let Some(ports) = item.get("port") {
-                rule.insert("ports".into(), convert_ports(ports)?);
+                base.insert("ports".into(), convert_ports(ports)?);
             }
             if let Some(inbound) = item.get("inboundTag").and_then(Value::as_array) {
                 let tags: Vec<Value> = inbound
@@ -1027,7 +1038,7 @@ fn convert_routing(
                     .map(|v| json!(v))
                     .collect();
                 if !tags.is_empty() {
-                    rule.insert("inbounds".into(), Value::Array(tags));
+                    base.insert("inbounds".into(), Value::Array(tags));
                 }
             }
             if let Some(network) = item.get("network").and_then(Value::as_str) {
@@ -1042,35 +1053,108 @@ fn convert_routing(
                     }
                 }
                 if !networks.is_empty() {
-                    rule.insert("networks".into(), Value::Array(networks));
+                    base.insert("networks".into(), Value::Array(networks));
                 }
             }
             // 只允许把**有匹配条件**的规则写出去。若条件全都被跳过
             // （例如只有 `ext:` 引用），剩下的 `{outbound}` 会变成
             // 无条件规则——把所有流量导向该出站。
-            let has_condition = [
-                "domains",
-                "domain_suffix",
-                "domain_keyword",
-                "domain_regex",
-                "ip_cidrs",
-                "ip_is_private",
-                "ports",
-                "inbounds",
-                "networks",
-            ]
-            .iter()
-            .any(|key| rule.contains_key(*key));
-            anyhow::ensure!(
-                has_condition,
-                "routing.rules[{index}] 转换后没有任何匹配条件（引用均被跳过），\
-                 继续输出会变成无条件规则；请在 Xray 侧展开或补充具体值"
-            );
-            rules.push(Value::Object(rule));
+            for group in domain_groups {
+                let mut rule = base.clone();
+                rule.extend(group);
+                let has_condition = [
+                    "domains",
+                    "domain_suffix",
+                    "domain_keyword",
+                    "domain_regex",
+                    "ip_cidrs",
+                    "ip_is_private",
+                    "ports",
+                    "inbounds",
+                    "networks",
+                ]
+                .iter()
+                .any(|key| rule.contains_key(*key));
+                anyhow::ensure!(
+                    has_condition,
+                    "routing.rules[{index}] 转换后没有任何匹配条件（引用均被跳过），\
+                     继续输出会变成无条件规则；请在 Xray 侧展开或补充具体值"
+                );
+                rules.push(Value::Object(rule));
+            }
         }
     }
     route.insert("rules".into(), Value::Array(rules));
     Ok(Value::Object(route))
+}
+
+/// 把 Xray 的 `domain` 数组按种类拆成多组条件。
+///
+/// Xray 的 `domain` 数组内部是**并集**（`domain:a.com` 或 `keyword:b` 任一命中），
+/// 而 dubhe 的 `domains`/`domain_suffix`/`domain_keyword`/`domain_regex` 是不同
+/// 字段、彼此取**交集**。直接塞进同一条规则会从 OR 变成 AND：本该走代理的流量
+/// 落到默认出口。按种类拆成多条同 outbound 的相邻规则，才保持并集语义。
+fn convert_domains(
+    value: Option<&Value>,
+    index: usize,
+    report: &mut Report,
+) -> Result<Vec<Map<String, Value>>> {
+    let Some(value) = value else {
+        return Ok(vec![Map::new()]);
+    };
+    let domains = value
+        .as_array()
+        .ok_or_else(|| anyhow!("routing.rules[{index}].domain 必须是数组"))?;
+    let mut exact = Vec::new();
+    let mut suffix = Vec::new();
+    let mut keyword = Vec::new();
+    let mut regex = Vec::new();
+    for domain in domains.iter().filter_map(Value::as_str) {
+        if domain.starts_with("geosite:") {
+            // dubhe 支持 geosite:，但要求配置里给出 geo.geosite 数据文件。
+            exact.push(json!(domain));
+            report.note(format!(
+                "routing.rules[{index}] 的 {domain} 已保留；在 dubhe 配置里设置 geo.geosite 指向 geosite.dat 才会生效"
+            ));
+        } else if domain.starts_with("ext:") {
+            report.note(format!(
+                "routing.rules[{index}] 的 {domain} 需要外部规则集，已跳过；可用 geo.rule_sets 引用 sing-box source JSON"
+            ));
+        } else if let Some(item) = domain.strip_prefix("domain:") {
+            suffix.push(json!(item));
+        } else if let Some(item) = domain.strip_prefix("keyword:") {
+            keyword.push(json!(item));
+        } else if let Some(item) = domain.strip_prefix("regexp:") {
+            regex.push(json!(item));
+        } else if let Some(item) = domain.strip_prefix("full:") {
+            exact.push(json!(item));
+        } else if domain.starts_with("dotless:") {
+            report.note(format!(
+                "routing.rules[{index}] 的 {domain}（无点域名）暂无对应字段，已跳过"
+            ));
+        } else {
+            exact.push(json!(domain));
+        }
+    }
+    let mut groups = Vec::new();
+    for (key, values) in [
+        ("domains", exact),
+        ("domain_suffix", suffix),
+        ("domain_keyword", keyword),
+        ("domain_regex", regex),
+    ] {
+        if values.is_empty() {
+            continue;
+        }
+        let mut group = Map::new();
+        group.insert(key.into(), Value::Array(values));
+        groups.push(group);
+    }
+    if groups.is_empty() {
+        // 数组里只有被跳过的引用：让调用方的「没有匹配条件」检查处理。
+        groups.push(Map::new());
+    }
+    Ok(groups)
 }
 
 fn convert_ports(value: &Value) -> Result<Value> {
@@ -1238,32 +1322,46 @@ mod tests {
         assert_eq!(route["default"], "direct");
         assert_eq!(route["domain_strategy"], "ip-if-non-match");
         let rules = route["rules"].as_array().unwrap();
-        assert_eq!(rules[0]["outbound"], "direct");
-        assert_eq!(rules[0]["domain_suffix"][0], "example.org");
-        assert_eq!(rules[0]["domain_keyword"][0], "ads");
+        // Xray 的 domain 数组是并集，dubhe 的不同字段是交集：转换器必须按种类
+        // 拆成多条同 outbound 的规则，否则 domain:/keyword: 从 OR 变成 AND。
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule["outbound"] == "direct"
+                    && rule["domain_suffix"][0] == "example.org"),
+            "{rules:?}"
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule["outbound"] == "direct" && rule["domain_keyword"][0] == "ads"),
+            "{rules:?}"
+        );
         // `full:` 必须进 domains（此前会被 geosite 分支覆盖掉）。
         assert!(
-            rules[0]["domains"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| item == "exact.example"),
-            "domains 应保留 full:exact.example：{:?}",
-            rules[0]["domains"]
+            rules.iter().any(|rule| {
+                rule["domains"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| item == "exact.example"))
+            }),
+            "domains 应保留 full:exact.example：{rules:?}"
         );
         // geosite 引用必须保留在 domains 里（此前被后续 insert 覆盖）。
         assert!(
-            rules[2]["domains"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| item == "geosite:google"),
-            "domains 应保留 geosite:google：{:?}",
-            rules[2]["domains"]
+            rules.iter().any(|rule| {
+                rule["domains"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| item == "geosite:google"))
+            }),
+            "domains 应保留 geosite:google：{rules:?}"
         );
-        assert_eq!(rules[1]["ports"][0]["start"], 53);
-        assert_eq!(rules[1]["ports"][1]["start"], 80);
-        assert_eq!(rules[1]["ports"][1]["end"], 90);
+        let ports = rules
+            .iter()
+            .find(|rule| rule["outbound"] == "block" && rule.get("ports").is_some())
+            .expect("端口规则应存在");
+        assert_eq!(ports["ports"][0]["start"], 53);
+        assert_eq!(ports["ports"][1]["start"], 80);
+        assert_eq!(ports["ports"][1]["end"], 90);
     }
 
     /// `geoip:<code>` 必须保留到 `ip_cidrs`，而不是「提示后跳过」——
@@ -1331,6 +1429,162 @@ mod tests {
         assert!(error.to_string().contains("quic"), "{error}");
     }
 
+    /// Xray 对 socks/http/shadowsocks 出站同样套用 `streamSettings`。此前转换器
+    /// 只在这些协议之外处理 TLS，带 TLS 的上游被静默降成明文，退出码仍是 0。
+    #[test]
+    fn proxy_outbound_tls_is_not_dropped() {
+        let value = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [
+                {
+                    "tag": "socks-tls",
+                    "protocol": "socks",
+                    "settings": {"servers": [{
+                        "address": "127.0.0.2", "port": 1080,
+                        "users": [{"user": "u", "pass": "p"}]
+                    }]},
+                    "streamSettings": {
+                        "network": "tcp", "security": "tls",
+                        "tlsSettings": {"serverName": "proxy.example"}
+                    }
+                },
+                {
+                    "tag": "http-tls",
+                    "protocol": "http",
+                    "settings": {"servers": [{"address": "127.0.0.3", "port": 3128}]},
+                    "streamSettings": {"network": "tcp", "security": "tls"}
+                }
+            ]
+        });
+        // 必须要求信任锚，而不是生成一份明文上游。
+        let error = from_xray(&value.to_string(), None).unwrap_err();
+        assert!(error.to_string().contains("--ca-file"), "{error}");
+
+        let converted = from_xray(&value.to_string(), Some("/etc/ssl/certs/ca.pem"))
+            .expect("给出信任锚后应可转换");
+        let rendered = serde_json::to_value(&converted.config).unwrap();
+        let outbounds = rendered["outbounds"].as_array().unwrap();
+        assert_eq!(outbounds[0]["tls"]["ca_file"], "/etc/ssl/certs/ca.pem");
+        assert_eq!(outbounds[0]["tls"]["server_name"], "proxy.example");
+        assert_eq!(outbounds[1]["tls"]["ca_file"], "/etc/ssl/certs/ca.pem");
+        assert_eq!(outbounds[1]["username"], serde_json::Value::Null);
+    }
+
+    /// dubhe 的 shadowsocks 出站不支持 TLS；不能静默丢掉。
+    #[test]
+    fn shadowsocks_outbound_tls_fails_closed() {
+        let value = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{
+                "tag": "ss-tls",
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{
+                    "address": "127.0.0.3", "port": 8388,
+                    "method": "aes-256-gcm", "password": "pw"
+                }]},
+                "streamSettings": {"network": "tcp", "security": "tls"}
+            }]
+        });
+        let error = from_xray(&value.to_string(), Some("/etc/ssl/certs/ca.pem")).unwrap_err();
+        assert!(error.to_string().contains("不支持 TLS"), "{error}");
+    }
+
+    /// dubhe 的 socks/http/shadowsocks 出站只支持原始 TCP，承载无法等价表达时
+    /// 必须报错——否则同样是「成功生成一份明文配置」。
+    #[test]
+    fn proxy_outbound_with_transport_fails_instead_of_becoming_plain() {
+        let value = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{
+                "tag": "socks-ws",
+                "protocol": "socks",
+                "settings": {"servers": [{"address": "127.0.0.2", "port": 1080}]},
+                "streamSettings": {"network": "ws", "security": "tls"}
+            }]
+        });
+        let error = from_xray(&value.to_string(), Some("/etc/ssl/certs/ca.pem")).unwrap_err();
+        assert!(error.to_string().contains("network=ws"), "{error}");
+    }
+
+    #[test]
+    fn dialer_proxy_chain_fails_closed() {
+        let value = serde_json::json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{
+                "tag": "chained",
+                "protocol": "socks",
+                "settings": {"servers": [{"address": "127.0.0.2", "port": 1080}]},
+                "streamSettings": {"sockopt": {"dialerProxy": "hop"}}
+            }]
+        });
+        let error = from_xray(&value.to_string(), None).unwrap_err();
+        assert!(error.to_string().contains("dialerProxy"), "{error}");
+    }
+
+    /// Xray 的默认出站是**配置里第一个出站**；按 tag 名猜会改变流量路径。
+    #[test]
+    fn default_outbound_is_the_first_one_like_xray() {
+        let value = serde_json::json!({
+            "inbounds": [{"tag": "in", "listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [
+                {
+                    "tag": "node",
+                    "protocol": "socks",
+                    "settings": {"servers": [{"address": "127.0.0.2", "port": 1080}]}
+                },
+                {"tag": "direct", "protocol": "freedom"}
+            ]
+        });
+        let converted = from_xray(&value.to_string(), None).expect("应可转换");
+        let rendered = serde_json::to_value(&converted.config).unwrap();
+        assert_eq!(
+            rendered["route"]["default"], "node",
+            "默认出口必须跟随 Xray 的首个出站"
+        );
+    }
+
+    /// Xray 的 `domain` 数组内部是并集；转成 dubhe 的不同字段后必须仍然是并集。
+    #[test]
+    fn mixed_domain_kinds_stay_a_union() {
+        use crate::session::{Host, Network, Target};
+
+        let value = serde_json::json!({
+            "inbounds": [{"tag": "in", "listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [
+                {
+                    "tag": "node",
+                    "protocol": "socks",
+                    "settings": {"servers": [{"address": "127.0.0.2", "port": 1080}]}
+                },
+                {"tag": "direct", "protocol": "freedom"}
+            ],
+            "routing": {"rules": [{
+                "type": "field",
+                "domain": ["domain:ads.example", "keyword:tracker"],
+                "outboundTag": "direct"
+            }]}
+        });
+        let converted = from_xray(&value.to_string(), None).expect("应可转换");
+        let router = crate::route::Router::new(&converted.config).expect("路由应可编译");
+        let select = |host: &str| {
+            router.select(
+                "in",
+                Network::Tcp,
+                &Target {
+                    host: Host::Domain(host.into()),
+                    port: 443,
+                },
+            )
+        };
+        // 两种写法都必须命中 direct；未命中的域名回落到首个出站（node）。
+        assert_eq!(select("x.ads.example"), crate::config::OutboundKind::Direct);
+        assert_eq!(
+            select("cdn.tracker.example"),
+            crate::config::OutboundKind::Direct
+        );
+        assert_ne!(select("other.example"), crate::config::OutboundKind::Direct);
+    }
+
     #[test]
     fn routing_rule_without_outbound_tag_fails_closed() {
         let value = serde_json::json!({
@@ -1377,15 +1631,35 @@ mod transport_tests {
         serde_json::to_value(&converted.json).unwrap()["inbounds"][0].clone()
     }
 
+    /// Xray 的 serviceName 是服务名，客户端请求 `/<service>/Tun`；本仓库存完整
+    /// 路径。此前只拼了 `/<service>`，转换出的入口会 404。
     #[test]
-    fn grpc_inbound_gets_leading_slash_and_multi_path() {
+    fn grpc_inbound_appends_the_stream_name() {
         let mut stream = certs();
         stream["network"] = json!("grpc");
-        stream["grpcSettings"] = json!({"serviceName": "Tun", "multiMode": true});
+        stream["grpcSettings"] = json!({"serviceName": "GunService"});
         let inbound = convert_inbound(stream);
         assert_eq!(inbound["type"], "vless-grpc");
-        assert_eq!(inbound["grpc"]["path"], "/Tun");
-        assert_eq!(inbound["grpc"]["multi_path"], "/multipath");
+        assert_eq!(inbound["grpc"]["path"], "/GunService/Tun");
+        assert!(inbound["grpc"].get("multi_path").is_none());
+
+        let mut stream = certs();
+        stream["network"] = json!("grpc");
+        stream["grpcSettings"] = json!({"serviceName": "GunService", "multiMode": true});
+        let inbound = convert_inbound(stream);
+        assert_eq!(inbound["grpc"]["path"], "/GunService/Tun");
+        assert_eq!(inbound["grpc"]["multi_path"], "/GunService/TunMulti");
+    }
+
+    /// 新式写法：Xray 把以 `/` 开头的 serviceName 当完整路径，`单|多` 分隔。
+    #[test]
+    fn grpc_inbound_accepts_full_path_service_name() {
+        let mut stream = certs();
+        stream["network"] = json!("grpc");
+        stream["grpcSettings"] = json!({"serviceName": "/svc/a|svc/b", "multiMode": true});
+        let inbound = convert_inbound(stream);
+        assert_eq!(inbound["grpc"]["path"], "/svc/a");
+        assert_eq!(inbound["grpc"]["multi_path"], "/svc/b");
     }
 
     #[test]
@@ -1474,7 +1748,8 @@ mod transport_tests {
         let json = serde_json::to_value(&converted.json).unwrap();
         let outbound = &json["outbounds"][0];
         assert_eq!(outbound["transport"]["type"], "grpc");
-        assert_eq!(outbound["transport"]["path"], "/Tun");
+        // multiMode 时 Xray 客户端请求 `/<service>/TunMulti`。
+        assert_eq!(outbound["transport"]["path"], "/Tun/TunMulti");
         assert_eq!(outbound["transport"]["multi"], true);
         assert_eq!(outbound["tls"]["ca_file"], "/ca.pem");
     }
@@ -1557,10 +1832,10 @@ mod routing_field_alignment_tests {
         );
     }
 
-    /// 同一 domain 数组混用 geosite 与 domain:/keyword:/regexp: 无法等价
-    /// 转换（Xray 是并集，dubhe 这些字段之间是交集），必须报错。
+    /// 同一 domain 数组混用 geosite 与 domain:/keyword:/regexp: 时，按种类拆成
+    /// 多条同 outbound 的规则——Xray 是并集，直接塞进同一条会变成交集。
     #[test]
-    fn mixed_geosite_and_suffix_in_one_array_is_rejected() {
+    fn mixed_geosite_and_suffix_in_one_array_is_split() {
         let text = serde_json::json!({
             "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
             "outbounds": [{"tag": "direct", "protocol": "freedom"}],
@@ -1570,8 +1845,12 @@ mod routing_field_alignment_tests {
             ]}
         })
         .to_string();
-        let error = from_xray(&text, None).unwrap_err().to_string();
-        assert!(error.contains("混用了"), "{error}");
+        let converted = from_xray(&text, None).expect("应拆成两条规则");
+        let rendered = serde_json::to_value(&converted.config).unwrap();
+        let rules = rendered["route"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2, "{rules:?}");
+        assert_eq!(rules[0]["domains"][0], "geosite:google");
+        assert_eq!(rules[1]["domain_suffix"][0], "a.test");
     }
 
     /// geoip:private 与其它 IP 项混写同样无法等价转换。

@@ -127,7 +127,7 @@ Xray 输出按 v26 结构生成：
   `xray x25519 -i "<私钥>"` 是确定性的（同一私钥永远得到同一公钥），
   本项目的派生与之逐字节一致。注意 REALITY 的 `short_ids` 不可推导——
   它是配置里显式列出的一组字节，客户端必须拿到同样的值。
-- 导出的配置里带凭据，属于敏感文件；默认写入本地目录，不要提交到仓库。
+- 导出的配置里带凭据，属于敏感文件；写入时用 0600 权限，不要提交到仓库。
 
 ## 从 Xray 配置转换
 
@@ -148,7 +148,17 @@ Xray 输出按 v26 结构生成：
 
 - 转换结果会再走一遍本项目校验，**不可能输出无法启动的配置**。
 - `geosite:`/`geoip:`/`ext:` 规则集、`fallback`、`balancerTag`、XHTTP 的
-  `downloadSettings` 会写进报告或直接报错，不会静默丢弃。
+  `downloadSettings`、`sockopt.dialerProxy` 链式代理会写进报告或直接报错，
+  不会静默丢弃。
+- 默认出口跟随 Xray：**配置里第一个出站**。按 tag 名猜 `proxy`/`direct` 会让
+  `[{tag:"node"},{tag:"direct"}]` 这样的配置变成默认直连。
+- 同一个 `domain` 数组内的 `domain:`/`keyword:`/`regexp:`/`full:` 是并集，
+  转换后拆成多条同出站的相邻规则，保持并集语义。
+- gRPC 的 `serviceName` 是服务名，客户端实际请求 `/<service>/Tun`；
+  `convert` 会自动补流名，`export` 会去掉流名。multiMode 与自定义多段路径
+  只有 Xray 目标能表达。
+- SOCKS/HTTP 出站的 `streamSettings.security = "tls"` 会保留；
+  Shadowsocks 出站不支持 TLS，遇到直接报错而不是降成明文。
 - 带 TLS 的出站必须用 `--ca-file` 指定信任锚 PEM；本项目不隐式信任系统根证书。
 - 无认证的 SOCKS/HTTP 若监听非回环，转换会失败并提示，而不是替你打开
   `allow_insecure`。

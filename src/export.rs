@@ -1188,8 +1188,7 @@ fn xray_outbound(node: &Node) -> std::result::Result<Value, String> {
         Transport::Grpc { ref path, multi } => {
             stream.insert("network".into(), json!("grpc"));
             let mut grpc = Map::new();
-            let service = path.trim_start_matches('/');
-            grpc.insert("serviceName".into(), json!(service));
+            grpc.insert("serviceName".into(), json!(xray_grpc_name(path)));
             if multi {
                 grpc.insert("multiMode".into(), json!(true));
             }
@@ -1529,10 +1528,17 @@ fn sing_box_outbound(node: &Node) -> std::result::Result<Value, String> {
             "path": path,
             "headers": host.as_ref().map(|host| json!({"Host": host})).unwrap_or(Value::Null)
         })),
-        Transport::Grpc { ref path, .. } => Some(json!({
-            "type": "grpc",
-            "service_name": path.trim_start_matches('/')
-        })),
+        Transport::Grpc { ref path, multi } => {
+            if multi {
+                // sing-box 的 grpc transport 只有 service_name，客户端固定请求
+                // /<service>/Tun，没有 Xray 的 TunMulti。
+                return Err("sing-box 没有 gRPC multiMode，无法导出该承载".to_owned());
+            }
+            Some(json!({
+                "type": "grpc",
+                "service_name": plain_grpc_name(path)?
+            }))
+        }
         Transport::HttpUpgrade { ref path, ref host } => Some(json!({
             "type": "httpupgrade",
             "path": path,
@@ -1758,11 +1764,15 @@ fn mihomo_proxy(node: &Node) -> std::result::Result<Value, String> {
             }
             out.insert("ws-opts".into(), opts);
         }
-        Transport::Grpc { ref path, .. } => {
+        Transport::Grpc { ref path, multi } => {
+            if multi {
+                // Mihomo 的 grpc-opts 只有 grpc-service-name，没有 multiMode。
+                return Err("Mihomo 没有 gRPC multiMode，无法导出该承载".to_owned());
+            }
             out.insert("network".into(), json!("grpc"));
             out.insert(
                 "grpc-opts".into(),
-                json!({"grpc-service-name": path.trim_start_matches('/')}),
+                json!({"grpc-service-name": plain_grpc_name(path)?}),
             );
         }
         Transport::HttpUpgrade { ref path, ref host } => {
@@ -1941,7 +1951,7 @@ fn anywhere_proxy(node: &Node, index: usize) -> std::result::Result<Value, Strin
             }
             Transport::Grpc { path, multi } => Some(json!({
                 "type": "grpc",
-                "serviceName": path.trim_start_matches('/'),
+                "serviceName": xray_grpc_name(path),
                 "multiMode": multi
             })),
             Transport::HttpUpgrade { path, host } => {
@@ -2025,6 +2035,40 @@ fn xhttp_mode(mode: crate::config::Mode) -> &'static str {
 }
 
 /// 判断导出目标是私有地址或私有域名（Xray 允许这类明文出站）。
+/// 本仓库的 `grpc.path` 存**完整 HTTP/2 路径**（`/GunService/Tun`），而
+/// Xray / sing-box / Mihomo 的 `serviceName` 只写服务名，路径由客户端自己拼
+/// `/Tun` 或 `/TunMulti`。导出时把流名去掉，否则客户端会请求
+/// `/GunService%2FTun/Tun`（Xray）或 `/GunService/Tun/Tun`（另两家）。
+fn grpc_service(path: &str) -> Option<&str> {
+    let service = path.strip_prefix('/')?;
+    service
+        .strip_suffix("/Tun")
+        .or_else(|| service.strip_suffix("/TunMulti"))
+}
+
+/// Xray 的 `serviceName`：单段服务名用老式写法；多段或自定义路径按 Xray 的
+/// 新式完整路径原样写出（Xray 会把最后一段当流名）。
+fn xray_grpc_name(path: &str) -> String {
+    match grpc_service(path) {
+        Some(service) if !service.contains('/') => service.to_owned(),
+        _ => path.to_owned(),
+    }
+}
+
+/// sing-box / Mihomo 只能用老式 `serviceName`，也没有 multiMode。
+fn plain_grpc_name(path: &str) -> Result<&str, String> {
+    let service = grpc_service(path).ok_or_else(|| {
+        format!("自定义 gRPC 路径 {path} 无法导出到这个目标（只认 /<service>/Tun）")
+    })?;
+    if service.is_empty() {
+        return Err(format!("gRPC 路径 {path} 缺少服务名，无法导出到这个目标"));
+    }
+    if service.contains('/') {
+        return Err(format!("多段 gRPC 服务名 {service} 只支持 Xray 目标"));
+    }
+    Ok(service)
+}
+
 fn is_private_host(host: &str) -> bool {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return match ip {
@@ -2261,7 +2305,7 @@ mod transport_matrix_tests {
             "grpc" => json!({
                 "type": "vless-grpc", "tag": "n", "listen": "0.0.0.0:443",
                 "users": [{"name": "a", "uuid": UUID}],
-                "grpc": {"path": "/Tun"},
+                "grpc": {"path": "/TunService/Tun"},
                 "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"
             }),
             "httpupgrade" => json!({
@@ -2283,6 +2327,10 @@ mod transport_matrix_tests {
             }),
             other => panic!("未覆盖的承载 {other}"),
         };
+        node_from(value)
+    }
+
+    fn node_from(value: serde_json::Value) -> Node {
         let config = Config::from_json(
             &json!({
                 "version": 1,
@@ -2344,6 +2392,94 @@ mod transport_matrix_tests {
             assert_eq!(mihomo["proxies"][0]["network"], kind);
             let (anywhere, _) = get(Target::Anywhere, &node);
             assert_eq!(anywhere["proxies"][0]["transport"]["type"], kind);
+        }
+    }
+
+    /// 本仓库的 `grpc.path` 是完整 HTTP/2 路径（`/TunService/Tun`），而客户端
+    /// 目标的 `serviceName` 只要服务名，路径由客户端自己拼。此前导出
+    /// `TunService/Tun`，Xray 会请求 `/TunService%2FTun/Tun`，Mihomo/sing-box
+    /// 会请求 `/TunService/Tun/Tun`。
+    #[test]
+    fn grpc_service_name_strips_the_stream_name() {
+        let node = node_for("grpc");
+        let (xray, _) = get(Target::Xray, &node);
+        assert_eq!(
+            xray["outbounds"][0]["streamSettings"]["grpcSettings"]["serviceName"],
+            "TunService"
+        );
+        let (sing, _) = get(Target::SingBox, &node);
+        assert_eq!(
+            sing["outbounds"][0]["transport"]["service_name"],
+            "TunService"
+        );
+        let (mihomo, _) = get(Target::Mihomo, &node);
+        assert_eq!(
+            mihomo["proxies"][0]["grpc-opts"]["grpc-service-name"],
+            "TunService"
+        );
+        let (anywhere, _) = get(Target::Anywhere, &node);
+        assert_eq!(
+            anywhere["proxies"][0]["transport"]["serviceName"],
+            "TunService"
+        );
+    }
+
+    /// 多流 gRPC：Xray 用 `serviceName + multiMode`；另两家没有 multiMode。
+    #[test]
+    fn grpc_multi_mode_only_exports_to_xray() {
+        let node = node_from(json!({
+            "type": "vless-grpc", "tag": "n", "listen": "0.0.0.0:443",
+            "users": [{"name": "a", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
+            "grpc": {"path": "/TunService/TunMulti", "multi_path": "/TunService/Tun"},
+            "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"
+        }));
+        // node_for 里的 multi 标志来自 path 后缀；这里直接确认 Xray 的写法。
+        let (xray, _) = get(Target::Xray, &node);
+        let grpc = &xray["outbounds"][0]["streamSettings"]["grpcSettings"];
+        assert_eq!(grpc["serviceName"], "TunService");
+        assert_eq!(grpc["multiMode"], true);
+        for target in [Target::SingBox, Target::Mihomo] {
+            let (value, report) = get(target, &node);
+            assert!(
+                report.notes.iter().any(|note| note.contains("multiMode")),
+                "{target:?} 应报告不支持 multiMode：{:?}",
+                report.notes
+            );
+            let entries = if target == Target::SingBox {
+                value["outbounds"].as_array().unwrap().clone()
+            } else {
+                value["proxies"].as_array().unwrap().clone()
+            };
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry["tag"] != "n" && entry["name"] != "n"),
+                "{target:?} 不应静默导出坏配置：{entries:?}"
+            );
+        }
+    }
+
+    /// 自定义路径（不是 `/.../Tun`）只能给 Xray 的新式完整路径写法。
+    #[test]
+    fn custom_grpc_path_only_exports_to_xray() {
+        let node = node_from(json!({
+            "type": "vless-grpc", "tag": "n", "listen": "0.0.0.0:443",
+            "users": [{"name": "a", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
+            "grpc": {"path": "/svc/custom"},
+            "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"
+        }));
+        let (xray, _) = get(Target::Xray, &node);
+        assert_eq!(
+            xray["outbounds"][0]["streamSettings"]["grpcSettings"]["serviceName"],
+            "/svc/custom"
+        );
+        for target in [Target::SingBox, Target::Mihomo] {
+            let (_, report) = get(target, &node);
+            assert!(
+                report.notes.iter().any(|note| note.contains("gRPC")),
+                "{target:?} 应报告自定义路径不可导出：{:?}",
+                report.notes
+            );
         }
     }
 

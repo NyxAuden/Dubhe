@@ -112,6 +112,99 @@ impl CliProcess {
 /// 会间歇性拿到 `AddrInUse`（2026-11-22 在 CI x86_64 上实测复现）。
 ///
 /// 这里改为在临时端口范围之外顺序探测，并保证进程内不重复发放。
+/// 子进程退出后立刻重绑端口，证明监听确实被释放。
+///
+/// 并行跑全套测试时实测出现过一次 `AddrInUse`：端口刚被释放、或被并发的
+/// 客户端连接占成 TIME_WAIT。这里只重试一小段时间，**退出码与非 ready 断言
+/// 不变**，监听泄漏仍会让测试失败。
+fn bind_released(address: std::net::SocketAddr) -> StdListener {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match StdListener::bind(address) {
+            Ok(listener) => return listener,
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "端口 {address} 未被释放：{error}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// 导出与转换结果里有密码/私钥，文件必须是 0600。
+#[cfg(unix)]
+#[tokio::test]
+async fn export_and_convert_outputs_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("server.json");
+    let mut configuration = socks_config();
+    configuration["inbounds"] = json!([{
+        "type": "shadowsocks", "tag": "s", "listen": "127.0.0.1:0",
+        "method": "aes-128-gcm", "password": "test-password"
+    }]);
+    fs::write(&config_path, configuration.to_string()).unwrap();
+
+    let export_dir = directory.path().join("export");
+    let status = Command::new(BINARY)
+        .args([
+            "export",
+            "-c",
+            config_path.to_str().unwrap(),
+            "--host",
+            "example.com",
+            "-o",
+            export_dir.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "export 应成功");
+
+    let convert_input = directory.path().join("xray.json");
+    fs::write(
+        &convert_input,
+        json!({
+            "inbounds": [{"listen": "127.0.0.1", "port": 1080, "protocol": "socks"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let convert_output = directory.path().join("converted.json");
+    let status = Command::new(BINARY)
+        .args([
+            "convert",
+            "-i",
+            convert_input.to_str().unwrap(),
+            "-o",
+            convert_output.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "convert 应成功");
+
+    for path in [
+        export_dir.join("xray-client.json"),
+        export_dir.join("sing-box-client.json"),
+        convert_output,
+    ] {
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "{} 权限应为 0600，实际 {mode:o}",
+            path.display()
+        );
+    }
+}
+
 fn reserve_port() -> std::net::SocketAddr {
     static ISSUED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
         std::sync::OnceLock::new();
@@ -281,7 +374,7 @@ async fn shadowsocks_failed_joint_start_has_no_ready_and_releases_earlier_ports(
         Some("ready" | "inbound_ready")
     )));
     assert!(!process.output().contains(CONFIG_PASSWORD));
-    let _tcp = StdListener::bind(first_address).unwrap();
+    let _tcp = bind_released(first_address);
     let _udp = std::net::UdpSocket::bind(first_address).unwrap();
     let _second_tcp = StdListener::bind(occupied.local_addr().unwrap()).unwrap();
 }
@@ -720,7 +813,7 @@ async fn vmess_failed_joint_run_releases_earlier_listener_and_never_reports_read
         let mut process = CliProcess::spawn("run", Some(&configuration.to_string()));
         assert_eq!(process.wait_exit().await.code(), Some(1));
         assert_vmess_cli_redacted_and_not_ready(&process);
-        let _rebound = StdListener::bind(address).unwrap();
+        let _rebound = bind_released(address);
         assert_eq!(
             occupied.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -747,10 +840,7 @@ async fn vmess_later_invalid_tls_run_leaves_all_prior_ports_available() {
     let mut process = CliProcess::spawn("run", Some(&configuration.to_string()));
     assert_eq!(process.wait_exit().await.code(), Some(1));
     assert_vmess_cli_redacted_and_not_ready(&process);
-    let _rebound: Vec<_> = addresses
-        .into_iter()
-        .map(|address| StdListener::bind(address).unwrap())
-        .collect();
+    let _rebound: Vec<_> = addresses.into_iter().map(bind_released).collect();
 }
 
 #[tokio::test]

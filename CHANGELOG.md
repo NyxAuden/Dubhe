@@ -48,6 +48,35 @@
 
 ### 修复
 
+- **`dubhe convert` 把带 TLS 的上游降成明文**：Xray 对 SOCKS/HTTP/Shadowsocks
+  出站同样套用 `streamSettings`，转换器此前直接跳过，目标是受保护代理时也
+  只输出明文上游，且退出码为 0。现在 SOCKS/HTTP 的 `security: "tls"` 会被保留
+  （仍要求 `--ca-file` 给信任锚），Shadowsocks 出站不支持 TLS 则直接报错；
+  自定义承载、REALITY 与 `sockopt.dialerProxy` 链式代理一律报错，不再静默跳过。
+- **`dubhe convert` 改变默认出口**：Xray 用**配置里第一个出站**当默认出口，
+  转换器此前按 tag 名猜 `proxy`/`direct`，`[{tag:"node"},{tag:"direct"}]`
+  这类配置会被转成默认直连。现在跟随第一个出站，并在报告里写明。
+- **`dubhe convert` 把 domain 并集转成交集**：Xray 同一个 `domain` 数组内
+  `domain:`/`keyword:`/`regexp:`/`full:`/`geosite:` 是并集，而它们在本项目里是
+  不同字段、彼此取交集。现在按种类拆成多条同出站的相邻规则，语义仍是并集。
+- **`dubhe export` 的 Xray / sing-box 客户端默认直连**：Xray 导出把
+  `freedom` 放在首个出站，sing-box 写死 `route.final: "direct"`，两者都会
+  在节点离线时照常访问目标，用户很难察觉。现在默认出口指向第一个可用节点，
+  没有可用节点时在报告里明确提示会直连。
+- **gRPC 的 `serviceName` 与完整路径对不上**：本仓库的 `grpc.path` 存完整
+  HTTP/2 路径（`/GunService/Tun`），而 Xray 的 `serviceName` 只是服务名。
+  `convert` 此前只补到 `/GunService`（真实客户端请求 `/GunService/Tun`，全部
+  404），`export` 则导出 `GunService/Tun`（Xray 拼成
+  `/GunService%2FTun/Tun`）。现在进出口都按 `/<service>/Tun` 与
+  `/<service>/TunMulti` 对齐；sing-box / Mihomo 遇到 multiMode 或自定义
+  多段路径会报告不可导出，而不是生成连不上的配置。
+- **反向 Mux 的 TCP 背压会丢字节**：Bridge 侧会话队列满时丢弃整个分片后连接
+  继续，对端只看到数据少了一段，没有任何错误。现在队列满超过
+  `dial_timeout_ms` 就移除会话并回带 error 的 `End` 帧；正常但较慢的消费者
+  仍按背压排队送达。`poll_shutdown` 的 `End` 帧也不再在队列满时被丢弃。
+- **导出/转换的文件权限**：`dubhe export` 与带 `-o` 的 `dubhe convert` 结果里
+  有 UUID、密码与 REALITY 私钥，此前按 umask 写成 0644。现在创建时用 0600，
+  已存在的旧文件也会收紧权限。
 - **NW3 Portal 的流量现在受内核控制面约束**：`out` 为 `direct`（默认）时，
   内核注入一个仅供本进程使用的 loopback SOCKS5 入口（tag `__nw3_internal`），
   并把 Portal 的 `out` 指向它。因此 `route.rules` 对 NW3 生效，业务字节计入

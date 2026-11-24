@@ -183,9 +183,9 @@
 （会退化成无条件规则），转换直接失败，不输出该规则。
 
 Xray 同一个 `domain` 数组内的各类前缀是**并集**，而 dubhe 的 `domains` 与
-`domain_suffix` / `domain_keyword` / `domain_regex` 之间是**交集**。因此把
-`geosite:` 与 `domain:` / `keyword:` / `regexp:` 混写在一个数组里无法等价转换，
-`convert` 会报错并要求拆成多条规则。`geoip:private` 与其它 `ip` 项混写同理。
+`domain_suffix` / `domain_keyword` / `domain_regex` 之间是**交集**。`convert`
+按种类把同一个数组拆成多条同出站的相邻规则，语义仍是并集；
+`geoip:private` 与其它 `ip` 项混写无法这样表达，会报错并要求拆成多条规则。
 
 ## 测试
 

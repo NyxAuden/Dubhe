@@ -141,7 +141,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 let value = dubhe::export::export(target, &nodes, &mut report)?;
                 let name = format!("{}.json", target.file_name());
                 let path = output.join(&name);
-                std::fs::write(&path, serde_json::to_string_pretty(&value)? + "\n")?;
+                write_private(&path, &(serde_json::to_string_pretty(&value)? + "\n"))?;
                 println!("{}", path.display());
             }
             if !report.notes.is_empty() {
@@ -175,7 +175,7 @@ async fn execute(cli: Cli) -> Result<()> {
             let rendered = serde_json::to_string_pretty(&converted.json)?;
             let report = converted.report;
             match output {
-                Some(path) => std::fs::write(&path, rendered + "\n")
+                Some(path) => write_private(&path, &(rendered + "\n"))
                     .map_err(|_| anyhow::anyhow!("转换输出不可写入"))?,
                 None => println!("{rendered}"),
             }
@@ -198,6 +198,30 @@ async fn execute(cli: Cli) -> Result<()> {
 }
 /// 配置内容比较；序列化失败按“已变化”处理，走完整重启。
 #[cfg(unix)]
+/// 导出/转换结果里有 UUID、密码与 REALITY 私钥，必须 0600。
+///
+/// `mode(0o600)` 只在创建时生效，所以写完后对已存在的文件再收紧一次权限，
+/// 避免旧文件仍是 0644。
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(text.as_bytes())?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, text)
+    }
+}
+
 fn same_config(left: &Config, right: &Config) -> bool {
     match (serde_json::to_value(left), serde_json::to_value(right)) {
         (Ok(left), Ok(right)) => left == right,

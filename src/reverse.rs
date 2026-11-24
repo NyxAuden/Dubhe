@@ -60,6 +60,8 @@ struct ClientInner {
     /// Mux UDP 会话：回包携带实际来源目标。
     udp_sessions: StdMutex<HashMap<u16, UdpReplySender>>,
     next: AtomicU16,
+    /// 单帧投递到本地会话的等待上限；超时即显式结束该会话。
+    queue_timeout_ms: u64,
     closed: StdMutex<bool>,
     /// 隧道关闭时唤醒心跳任务，避免停机等待下一次 5 秒心跳。
     closed_notify: Notify,
@@ -197,6 +199,13 @@ impl ClientInner {
             .unwrap_or_else(|error| error.into_inner())
             .remove(&id);
     }
+
+    fn remove_session(&self, id: u16) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id);
+    }
 }
 
 impl Registry {
@@ -256,6 +265,7 @@ impl Registry {
             sessions: StdMutex::new(HashMap::new()),
             udp_sessions: StdMutex::new(HashMap::new()),
             next: AtomicU16::new(1),
+            queue_timeout_ms: ctx.limits.dial_timeout_ms,
             closed: StdMutex::new(false),
             closed_notify: Notify::new(),
         });
@@ -285,19 +295,30 @@ impl Registry {
         let reader_inner = inner.clone();
         ctx.children.spawn(tracker.track_future(async move {
             while let Ok(Some(frame)) = mux::read_frame(&mut read, &budget).await {
-                if !handle_frame(frame, &reader_inner) {
+                if !handle_frame(frame, &reader_inner).await {
                     break;
                 }
             }
             reader_inner.close();
         }));
 
+        {
+            // 检查与占位必须在同一把锁里：分开做时并发握手会同时通过检查，
+            // 实际载体数可能超过 MAX_CARRIERS。
+            let mut clients = portal
+                .clients
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            clients.retain(|client| client.strong_count() > 0);
+            if clients.len() >= MAX_CARRIERS {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "反向隧道数量已满",
+                ));
+            }
+            clients.push(Arc::downgrade(&inner));
+        }
         spawn_heartbeat(inner.clone(), ctx);
-        portal
-            .clients
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(Arc::downgrade(&inner));
         Ok(())
     }
 
@@ -440,7 +461,7 @@ async fn bridge_once(ctx: Arc<Context>, tag: String, proxy: Arc<ProxyOutbound>) 
 }
 
 /// 处理 Bridge 下行帧；返回 `false` 表示隧道应终止。
-fn handle_frame(frame: mux::Frame, client: &Arc<ClientInner>) -> bool {
+async fn handle_frame(frame: mux::Frame, client: &Arc<ClientInner>) -> bool {
     match frame.status {
         Status::Keep if matches!(frame.network, Some(Network::Udp)) => {
             let (Some(target), Some(chunk)) = (frame.target, frame.payload) else {
@@ -477,9 +498,13 @@ fn handle_frame(frame: mux::Frame, client: &Arc<ClientInner>) -> bool {
                 .cloned();
             match sender {
                 Some(sender) => {
-                    if sender.try_send(chunk.payload).is_err() {
-                        // 会话读取过慢：丢弃并结束该会话，不阻塞整条隧道。
-                        let _ = sender.try_send(Vec::new());
+                    // 背压时必须**显式结束会话**：丢弃单个分片后连接继续，
+                    // 对端只看到数据少了一段，属于静默损坏。
+                    let deadline = Duration::from_millis(client.queue_timeout_ms);
+                    let sent = tokio::time::timeout(deadline, sender.send(chunk.payload)).await;
+                    if !sent.is_ok_and(|result| result.is_ok()) {
+                        client.remove_session(frame.id);
+                        let _ = client.writer.try_send(mux::encode_end(frame.id, true));
                     }
                 }
                 None => {
@@ -649,13 +674,25 @@ impl AsyncWrite for SessionStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if !this.shutdown {
-            let _ = this.client.writer.try_send(mux::encode_end(this.id, false));
-            this.shutdown = true;
-            this.release();
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        if this.shutdown {
+            return Poll::Ready(Ok(()));
         }
+        // End 帧必须排进写队列后才算关闭；队列满时返回 Pending，而不是
+        // `try_send` 失败后当作已通知（Portal 会一直留着对端连接）。
+        let delivered = {
+            let id = this.id;
+            let sender = this.sender();
+            match sender.poll_reserve(cx) {
+                Poll::Ready(Ok(())) => sender.send_item(mux::encode_end(id, false)).is_ok(),
+                Poll::Ready(Err(_)) => true,
+                Poll::Pending => return Poll::Pending,
+            }
+        };
+        let _ = delivered;
+        this.shutdown = true;
+        this.release();
         Poll::Ready(Ok(()))
     }
 }
@@ -894,5 +931,84 @@ mod runtime_tests {
         stop.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
         echo_task.abort();
+    }
+
+    fn client_with(
+        writer: mpsc::Sender<Vec<u8>>,
+        sender: mpsc::Sender<Vec<u8>>,
+        timeout_ms: u64,
+    ) -> Arc<ClientInner> {
+        Arc::new(ClientInner {
+            writer,
+            sessions: StdMutex::new(HashMap::from([(7u16, sender)])),
+            udp_sessions: StdMutex::new(HashMap::new()),
+            next: AtomicU16::new(1),
+            queue_timeout_ms: timeout_ms,
+            closed: StdMutex::new(false),
+            closed_notify: Notify::new(),
+        })
+    }
+
+    async fn keep_frame(payload: &[u8]) -> mux::Frame {
+        let budget = Arc::new(Semaphore::new(1024));
+        let bytes = mux::encode_data(7, None, payload).unwrap();
+        mux::read_frame(&mut &bytes[..], &budget)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// 会话队列满、且消费者不动时必须**显式结束会话**。
+    ///
+    /// 改前这里丢弃整个分片后连接继续：对端只看到少了一段数据，没有错误、
+    /// 没有断开，属于静默损坏。
+    #[tokio::test]
+    async fn backpressure_ends_the_session_instead_of_dropping_bytes() {
+        let (sender, _rx) = mpsc::channel::<Vec<u8>>(1);
+        sender.send(vec![0]).await.unwrap(); // 队列已满
+        let (writer, mut frames) = mpsc::channel::<Vec<u8>>(8);
+        let client = client_with(writer, sender, 10);
+
+        assert!(handle_frame(keep_frame(&[2]).await, &client).await);
+
+        assert!(
+            client
+                .sessions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty(),
+            "投递失败后会话必须被移除"
+        );
+        let end = frames.recv().await.expect("必须发出 End");
+        assert_eq!(end[2..4], 7u16.to_be_bytes(), "End 必须带上会话 id");
+        assert_eq!(end[4], 0x03, "帧类型应为 End");
+        assert_eq!(end[5], 0x02, "必须以 error 标记，不能静默截断");
+    }
+
+    /// 消费者只是慢、还没超时，分片必须排队送达而不是被丢弃。
+    #[tokio::test]
+    async fn slow_session_still_receives_the_chunk() {
+        let (sender, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        sender.send(vec![0]).await.unwrap();
+        let (writer, _frames) = mpsc::channel::<Vec<u8>>(8);
+        let client = client_with(writer, sender, 3_000);
+
+        let handle = tokio::spawn({
+            let client = client.clone();
+            async move { handle_frame(keep_frame(&[2]).await, &client).await }
+        });
+
+        assert_eq!(rx.recv().await.unwrap(), vec![0]);
+        assert_eq!(rx.recv().await.unwrap(), vec![2], "分片不能被丢弃");
+        assert!(handle.await.unwrap());
+        assert_eq!(
+            client
+                .sessions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1,
+            "正常投递不应结束会话"
+        );
     }
 }
