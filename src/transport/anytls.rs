@@ -61,7 +61,7 @@ const COMMAND_SERVER_SETTINGS: u8 = 10;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     stream: TcpStream,
-    config: Inbound,
+    config: Arc<Inbound>,
     tls: Option<crate::tls::ServerTls>,
     ctx: Arc<Context>,
     handshake: crate::runtime::HandshakePermits,
@@ -73,7 +73,7 @@ pub(crate) async fn serve(
     let mut accepted = timeout_at(deadline, acceptor.accept(stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "AnyTLS TLS握手超时"))??;
-    let (tag, users, raw_scheme) = match &config {
+    let (tag, users, raw_scheme) = match &*config {
         Inbound::AnyTls {
             tag,
             users,

@@ -248,7 +248,7 @@ fn closed() -> io::Error {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     stream: TcpStream,
-    config: Inbound,
+    config: Arc<Inbound>,
     security: Option<crate::tls::InboundSecurity>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
@@ -527,7 +527,7 @@ impl<S: AsyncRead + Unpin> Conn<S> {
 #[allow(clippy::too_many_arguments)]
 async fn serve_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut conn: Conn<S>,
-    config: Inbound,
+    config: Arc<Inbound>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
     pool: Arc<Pool>,
@@ -711,7 +711,7 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 #[allow(clippy::too_many_arguments)]
 async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     io: S,
-    config: Inbound,
+    config: Arc<Inbound>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
     pool: Arc<Pool>,
@@ -2148,7 +2148,7 @@ fn h3_error(error: impl std::fmt::Display) -> io::Error {
 pub(crate) async fn serve_quic(
     socket: tokio::net::UdpSocket,
     tls: Arc<rustls::ServerConfig>,
-    config: Inbound,
+    config: Arc<Inbound>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
     pool: Arc<Pool>,
@@ -2234,7 +2234,7 @@ fn quic_server_config(tls: Arc<rustls::ServerConfig>) -> io::Result<quinn::Serve
 /// 单个 QUIC 连接内的 HTTP/3 请求循环。
 async fn serve_h3_connection(
     connection: quinn::Connection,
-    config: Inbound,
+    config: Arc<Inbound>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
     pool: Arc<Pool>,

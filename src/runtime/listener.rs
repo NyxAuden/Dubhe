@@ -41,7 +41,9 @@ pub(super) struct ShadowsocksListener {
 
 pub(super) struct Listener {
     pub(super) socket: TcpListener,
-    pub(super) config: Inbound,
+    /// 整份入口配置只在启动时构造一次；每连接克隆的是 Arc，避免把
+    /// 用户表（多用户时可达数百 KiB）随连接数复制。
+    pub(super) config: Arc<Inbound>,
     pub(super) tls: Option<tls::ServerTls>,
     /// WS/gRPC/XHTTP/HTTPUpgrade 的安全层；TLS 或 REALITY。
     pub(super) security: Option<tls::InboundSecurity>,
@@ -173,7 +175,7 @@ pub(super) enum Detour {
 
 impl Detour {
     pub(super) fn from_listener(listener: &Listener) -> Option<Self> {
-        match &listener.config {
+        match &*listener.config {
             Inbound::Shadowsocks { tag, .. } => Some(Self::Shadowsocks {
                 tag: tag.clone(),
                 prepared: listener.shadowsocks.as_ref()?.prepared.clone(),

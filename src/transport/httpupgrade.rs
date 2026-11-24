@@ -5,6 +5,7 @@
 //! 调用方须用同一个绝对期限包住 TLS、升级与首个协议认证；本模块不刷新期限。
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -25,7 +26,7 @@ const READ_CHUNK: usize = 1_024;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     stream: TcpStream,
-    config: Inbound,
+    config: Arc<Inbound>,
     security: Option<crate::tls::InboundSecurity>,
     vmess: Option<std::sync::Arc<vmess::Prepared>>,
     ctx: std::sync::Arc<Context>,

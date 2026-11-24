@@ -885,7 +885,7 @@ impl Server {
             addresses.insert(inbound.tag().to_owned(), address);
             listeners.push(Listener {
                 socket,
-                config: inbound.clone(),
+                config: Arc::new(inbound.clone()),
                 tls: tls.clone(),
                 security: tls
                     .as_ref()
@@ -925,11 +925,11 @@ impl Server {
         let shadowtls_detours: Vec<usize> = listeners
             .iter()
             .enumerate()
-            .filter(|(_, listener)| matches!(&listener.config, Inbound::ShadowTls { .. }))
+            .filter(|(_, listener)| matches!(&*listener.config, Inbound::ShadowTls { .. }))
             .map(|(index, _)| index)
             .collect();
         for index in shadowtls_detours {
-            let detour_tag = match &listeners[index].config {
+            let detour_tag = match &*listeners[index].config {
                 Inbound::ShadowTls { detour, .. } => detour.clone(),
                 _ => unreachable!("仅处理 ShadowTLS 入口"),
             };
@@ -1083,7 +1083,7 @@ impl Server {
                     tasks.spawn(crate::transport::xhttp::serve_quic(
                         socket,
                         tls,
-                        config,
+                        Arc::new(config),
                         vmess,
                         self.context.clone(),
                         pool,
@@ -1102,7 +1102,7 @@ impl Server {
                         socket,
                         prepared,
                         tls,
-                        config,
+                        Arc::new(config),
                         vmess,
                         self.context.clone(),
                         stop.clone(),
@@ -1118,7 +1118,7 @@ impl Server {
                     tasks.spawn(crate::transport::v2ray_quic::serve(
                         socket,
                         tls,
-                        config,
+                        Arc::new(config),
                         vmess,
                         self.context.clone(),
                         stop.clone(),
@@ -1128,7 +1128,7 @@ impl Server {
                 UdpListener::Dokodemo { socket, config } => {
                     tasks.spawn(crate::transport::dokodemo::serve_udp(
                         socket,
-                        config,
+                        Arc::new(config),
                         self.context.clone(),
                         stop.clone(),
                         force.clone(),
@@ -1143,7 +1143,7 @@ impl Server {
                     tasks.spawn(crate::transport::naive_h3::serve(
                         socket,
                         tls,
-                        config,
+                        Arc::new(config),
                         self.context.clone(),
                         slots.clone(),
                         handshakes,

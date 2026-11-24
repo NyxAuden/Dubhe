@@ -33,12 +33,12 @@ use crate::{
 
 pub(crate) async fn serve(
     stream: TcpStream,
-    config: Inbound,
+    config: Arc<Inbound>,
     ctx: Arc<Context>,
     handshake: crate::runtime::HandshakePermits,
     deadline: Instant,
 ) -> io::Result<()> {
-    let (tag, target) = match &config {
+    let (tag, target) = match &*config {
         Inbound::DokodemoDoor {
             tag, address, port, ..
         } => {
@@ -60,7 +60,7 @@ pub(crate) async fn serve(
     if let Inbound::DokodemoDoor {
         sniffing: Some(sniffing),
         ..
-    } = &config
+    } = &*config
         && sniffing.enabled
         && matches!(target.host, Host::Ip(_))
         && let Some(domain) = sniff_server_name(&stream, deadline, &sniffing.dest_override).await
@@ -145,12 +145,12 @@ enum Destination {
 /// UDP 监听入口：固定目标、按客户端源地址分配关联。
 pub(crate) async fn serve_udp(
     socket: UdpSocket,
-    config: Inbound,
+    config: Arc<Inbound>,
     ctx: Arc<Context>,
     stop: CancellationToken,
     force: CancellationToken,
 ) -> io::Result<()> {
-    let (tag, target) = match &config {
+    let (tag, target) = match &*config {
         Inbound::DokodemoDoor {
             tag, address, port, ..
         } => {

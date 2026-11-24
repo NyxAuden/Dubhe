@@ -77,7 +77,7 @@ pub(crate) async fn serve(
     socket: UdpSocket,
     prepared: Arc<Prepared>,
     tls: Option<TlsAcceptor>,
-    config: Inbound,
+    config: Arc<Inbound>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
     stop: CancellationToken,
@@ -195,7 +195,7 @@ pub(crate) async fn serve(
 /// KCP 流之上的协议分派；TLS 是可选的外层。
 async fn dispatch(
     stream: KcpStream,
-    config: Inbound,
+    config: Arc<Inbound>,
     tls: Option<TlsAcceptor>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
@@ -211,11 +211,11 @@ async fn dispatch(
         ),
         None => Box::new(stream),
     };
-    match config {
+    match &*config {
         Inbound::VlessKcp {
             tag, users, xudp, ..
         } => {
-            let mut stream: Box<dyn crate::tls::Io> = match ctx.vless_encryption(&tag) {
+            let mut stream: Box<dyn crate::tls::Io> = match ctx.vless_encryption(tag) {
                 Some(prepared) => Box::new(
                     timeout(deadline, prepared.accept(stream))
                         .await
@@ -227,12 +227,12 @@ async fn dispatch(
             };
             let accepted = timeout(
                 deadline,
-                vless::handshake_with_xudp(&mut stream, &users, xudp),
+                vless::handshake_with_xudp(&mut stream, users, *xudp),
             )
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "mKCP/VLESS 认证超时"))??;
             drop(handshake);
-            crate::runtime::serve_plain_vless(stream, accepted, &tag, ctx, deadline, xudp).await
+            crate::runtime::serve_plain_vless(stream, accepted, tag, ctx, deadline, *xudp).await
         }
         Inbound::VmessKcp { tag, .. } => {
             let prepared = vmess.ok_or_else(|| io::Error::other("VMess 未准备"))?;
@@ -241,16 +241,16 @@ async fn dispatch(
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "mKCP/VMess 认证超时"))??;
             let allow_udp = prepared.allow_udp();
             drop(handshake);
-            crate::runtime::serve_vmess(stream, accepted, &tag, ctx, deadline, allow_udp).await
+            crate::runtime::serve_vmess(stream, accepted, tag, ctx, deadline, allow_udp).await
         }
         Inbound::TrojanKcp { tag, users, .. } => {
-            let request = timeout(deadline, trojan::read_request(&mut stream, &users))
+            let request = timeout(deadline, trojan::read_request(&mut stream, users))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "mKCP/Trojan 认证超时"))??;
             drop(handshake);
             match request.command {
                 Command::Connect => {
-                    crate::runtime::serve_trojan_connect(stream, &tag, ctx, &request).await
+                    crate::runtime::serve_trojan_connect(stream, tag, ctx, &request).await
                 }
                 Command::UdpAssociate => {
                     crate::udp::trojan(stream, ctx, tag.clone(), request.user.as_deref()).await

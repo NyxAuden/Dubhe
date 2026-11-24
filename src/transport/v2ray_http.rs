@@ -37,7 +37,7 @@ const MAX_HEADERS: usize = 64;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     stream: TcpStream,
-    inbound: Inbound,
+    inbound: Arc<Inbound>,
     tls: Option<crate::tls::ServerTls>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
@@ -92,7 +92,7 @@ fn http_config(inbound: &Inbound) -> io::Result<&V2rayHttp> {
 
 async fn serve_h1<S>(
     mut io: S,
-    config: Inbound,
+    config: Arc<Inbound>,
     http: V2rayHttp,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
@@ -136,7 +136,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn serve_h2<S>(
     io: S,
-    config: Inbound,
+    config: Arc<Inbound>,
     http: V2rayHttp,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,

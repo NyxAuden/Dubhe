@@ -32,7 +32,7 @@ use crate::{
 pub(crate) async fn serve(
     socket: UdpSocket,
     tls: Arc<rustls::ServerConfig>,
-    config: Inbound,
+    config: Arc<Inbound>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
     stop: CancellationToken,
@@ -93,7 +93,7 @@ pub(crate) async fn serve(
 
 async fn serve_connection(
     connection: quinn::Connection,
-    config: Inbound,
+    config: Arc<Inbound>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
     stop: CancellationToken,

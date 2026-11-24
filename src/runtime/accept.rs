@@ -227,15 +227,15 @@ pub(super) async fn accept_loop(
                         biased;
                         _ = force.cancelled() => {},
                         result = async {
-                            if matches!(config, Inbound::VlessGrpc { .. } | Inbound::VmessGrpc { .. } | Inbound::TrojanGrpc { .. }) {
+                            if matches!(&*config, Inbound::VlessGrpc { .. } | Inbound::VmessGrpc { .. } | Inbound::TrojanGrpc { .. }) {
                                 crate::transport::grpc::serve(stream, config.clone(), security, vmess, ctx.clone(), handshake_permit, grpc_slots, stop, force.clone()).await
-                            } else if matches!(config, Inbound::Naive { .. }) {
+                            } else if matches!(&*config, Inbound::Naive { .. }) {
                                 crate::transport::naive::serve(stream, config.clone(), tls, ctx.clone(), handshake_permit, grpc_slots.clone(), stop, force.clone()).await
-                            } else if matches!(config, Inbound::AnyTls { .. }) {
+                            } else if matches!(&*config, Inbound::AnyTls { .. }) {
                                 crate::transport::anytls::serve(stream, config.clone(), tls, ctx.clone(), handshake_permit, stop, force.clone()).await
-                            } else if matches!(config, Inbound::VlessHttpUpgrade { .. } | Inbound::VmessHttpUpgrade { .. } | Inbound::TrojanHttpUpgrade { .. }) {
+                            } else if matches!(&*config, Inbound::VlessHttpUpgrade { .. } | Inbound::VmessHttpUpgrade { .. } | Inbound::TrojanHttpUpgrade { .. }) {
                                 crate::transport::httpupgrade::serve(stream, config.clone(), security, vmess, ctx.clone(), handshake_permit, stop, force.clone()).await
-                            } else if matches!(config, Inbound::DokodemoDoor { .. }) {
+                            } else if matches!(&*config, Inbound::DokodemoDoor { .. }) {
                                 let deadline = tokio::time::Instant::now()
                                     + Duration::from_millis(ctx.limits.handshake_timeout_ms);
                                 crate::transport::dokodemo::serve(
@@ -246,18 +246,18 @@ pub(super) async fn accept_loop(
                                     deadline,
                                 )
                                 .await
-                            } else if matches!(config, Inbound::VlessHttp { .. } | Inbound::VmessHttp { .. } | Inbound::TrojanHttp { .. }) {
+                            } else if matches!(&*config, Inbound::VlessHttp { .. } | Inbound::VmessHttp { .. } | Inbound::TrojanHttp { .. }) {
                                 crate::transport::v2ray_http::serve(stream, config.clone(), tls, vmess, ctx.clone(), handshake_permit, stop, force.clone()).await
-                            } else if matches!(config, Inbound::VlessXhttp { .. } | Inbound::VmessXhttp { .. } | Inbound::TrojanXhttp { .. }) {
+                            } else if matches!(&*config, Inbound::VlessXhttp { .. } | Inbound::VmessXhttp { .. } | Inbound::TrojanXhttp { .. }) {
                                 let pool = xhttp.ok_or_else(|| io::Error::other("XHTTP会话表未准备"))?;
                                 crate::transport::xhttp::serve(stream, config.clone(), security, vmess, ctx.clone(), pool, handshake_permit, stop, force.clone()).await
-                            } else if matches!(config, Inbound::VlessWs { .. } | Inbound::VmessWs { .. } | Inbound::TrojanWs { .. }) {
+                            } else if matches!(&*config, Inbound::VlessWs { .. } | Inbound::VmessWs { .. } | Inbound::TrojanWs { .. }) {
                                 handle_websocket(stream, &config, security, vmess, ctx.clone(), handshake_permit).await
-                            } else if matches!(config, Inbound::Snell { .. }) {
+                            } else if matches!(&*config, Inbound::Snell { .. }) {
                                 let prepared = snell.clone().ok_or_else(|| io::Error::other("Snell 状态未准备"))?;
                                 stream.set_nodelay(true)?;
                                 Box::pin(snell::serve(stream, prepared, ctx.clone(), config.tag(), handshake_permit)).await
-                            } else if matches!(config, Inbound::ShadowTls { .. }) {
+                            } else if matches!(&*config, Inbound::ShadowTls { .. }) {
                                 let prepared = shadowtls.clone().ok_or_else(|| io::Error::other("ShadowTLS 状态未准备"))?;
                                 let detour = detour.clone().ok_or_else(|| io::Error::other("ShadowTLS detour 未解析"))?;
                                 stream.set_nodelay(true)?;
@@ -276,7 +276,7 @@ pub(super) async fn accept_loop(
                                     // 未认证流量已按真实 TLS 回落到伪装服务器。
                                     crate::transport::shadowtls::AuthOutcome::Fallback => Ok(()),
                                 }
-                            } else if matches!(config, Inbound::VmessReality { .. }) {
+                            } else if matches!(&*config, Inbound::VmessReality { .. }) {
                                 let vmess = vmess.clone().ok_or_else(|| io::Error::other("VMess 状态未准备"))?;
                                 let reality = reality.clone().ok_or_else(|| io::Error::other("REALITY 未准备"))?;
                                 Box::pin(handle_vmess_reality(stream, config.tag(), vmess, reality, ctx.clone(), handshake_permit)).await
@@ -298,7 +298,7 @@ pub(super) async fn accept_loop(
                         } => {
                             if let Err(error) = result {
                                 // 新入口的路由拒绝已在 Context 分类；其余旧入口统计语义保持不变。
-                                if !matches!(config, Inbound::VlessReality { .. } | Inbound::VmessReality { .. } | Inbound::TrojanReality { .. } | Inbound::VlessWs { .. } | Inbound::VmessWs { .. } | Inbound::TrojanWs { .. } | Inbound::VlessGrpc { .. } | Inbound::VmessGrpc { .. } | Inbound::TrojanGrpc { .. } | Inbound::VlessHttpUpgrade { .. } | Inbound::VmessHttpUpgrade { .. } | Inbound::TrojanHttpUpgrade { .. } | Inbound::VlessXhttp { .. } | Inbound::VmessXhttp { .. } | Inbound::TrojanXhttp { .. } | Inbound::Naive { .. } | Inbound::AnyTls { .. } | Inbound::Snell { .. } | Inbound::ShadowTls { .. }) || !forward::is_route_rejection(&error) {
+                                if !matches!(&*config, Inbound::VlessReality { .. } | Inbound::VmessReality { .. } | Inbound::TrojanReality { .. } | Inbound::VlessWs { .. } | Inbound::VmessWs { .. } | Inbound::TrojanWs { .. } | Inbound::VlessGrpc { .. } | Inbound::VmessGrpc { .. } | Inbound::TrojanGrpc { .. } | Inbound::VlessHttpUpgrade { .. } | Inbound::VmessHttpUpgrade { .. } | Inbound::TrojanHttpUpgrade { .. } | Inbound::VlessXhttp { .. } | Inbound::VmessXhttp { .. } | Inbound::TrojanXhttp { .. } | Inbound::Naive { .. } | Inbound::AnyTls { .. } | Inbound::Snell { .. } | Inbound::ShadowTls { .. }) || !forward::is_route_rejection(&error) {
                                     ctx.stats.reject();
                                 }
                                 // 限速按入口分开：原来所有入口共用一个时间戳，

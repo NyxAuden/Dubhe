@@ -24,7 +24,7 @@ use crate::{
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch<S>(
     mut stream: S,
-    config: Inbound,
+    config: Arc<Inbound>,
     vmess: Option<Arc<vmess::Prepared>>,
     tls_enabled: bool,
     ctx: Arc<Context>,
@@ -35,14 +35,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let duration = std::time::Duration::from_millis(ctx.limits.handshake_timeout_ms);
-    match config {
+    match &*config {
         Inbound::VlessHttp {
             tag, users, xudp, ..
         }
         | Inbound::VlessQuic {
             tag, users, xudp, ..
         } => {
-            let mut stream: Box<dyn crate::tls::Io> = match ctx.vless_encryption(&tag) {
+            let mut stream: Box<dyn crate::tls::Io> = match ctx.vless_encryption(tag) {
                 Some(prepared) => Box::new(
                     timeout_at(deadline, prepared.accept(stream))
                         .await
@@ -54,7 +54,7 @@ where
             };
             let accepted = match timeout_at(
                 deadline,
-                vless::handshake_with_xudp(&mut stream, &users, xudp),
+                vless::handshake_with_xudp(&mut stream, users, *xudp),
             )
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "V2Ray 传输/VLESS 认证超时"))
@@ -69,7 +69,7 @@ where
                 }
             };
             drop(handshake);
-            crate::runtime::serve_plain_vless(stream, accepted, &tag, ctx, duration, xudp).await
+            crate::runtime::serve_plain_vless(stream, accepted, tag, ctx, duration, *xudp).await
         }
         Inbound::VmessHttp { tag, .. } | Inbound::VmessQuic { tag, .. } => {
             let prepared = vmess.ok_or_else(|| io::Error::other("VMess 未准备"))?;
@@ -86,10 +86,10 @@ where
             };
             let allow_udp = prepared.allow_udp();
             drop(handshake);
-            crate::runtime::serve_vmess(stream, accepted, &tag, ctx, duration, allow_udp).await
+            crate::runtime::serve_vmess(stream, accepted, tag, ctx, duration, allow_udp).await
         }
         Inbound::TrojanHttp { tag, users, .. } | Inbound::TrojanQuic { tag, users, .. } => {
-            let request = match timeout_at(deadline, trojan::read_request(&mut stream, &users))
+            let request = match timeout_at(deadline, trojan::read_request(&mut stream, users))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "V2Ray 传输/Trojan 认证超时"))
                 .and_then(|result| result)
@@ -103,7 +103,7 @@ where
             drop(handshake);
             match request.command {
                 Command::Connect => {
-                    crate::runtime::serve_trojan_connect(stream, &tag, ctx, &request).await
+                    crate::runtime::serve_trojan_connect(stream, tag, ctx, &request).await
                 }
                 Command::UdpAssociate => {
                     crate::udp::trojan(stream, ctx, tag.clone(), request.user.as_deref()).await

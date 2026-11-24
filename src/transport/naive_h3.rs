@@ -41,7 +41,7 @@ fn error(error: impl std::fmt::Display) -> io::Error {
 pub(crate) async fn serve(
     socket: UdpSocket,
     tls: Arc<rustls::ServerConfig>,
-    config: Inbound,
+    config: Arc<Inbound>,
     ctx: Arc<Context>,
     slots: Arc<Semaphore>,
     handshakes: Arc<Semaphore>,
@@ -49,7 +49,7 @@ pub(crate) async fn serve(
     stop: CancellationToken,
     force: CancellationToken,
 ) -> io::Result<()> {
-    let Inbound::Naive { tag, users, .. } = config else {
+    let Inbound::Naive { tag, users, .. } = &*config else {
         return Err(io::Error::other("入口不是Naive"));
     };
     let mut tls = (*tls).clone();

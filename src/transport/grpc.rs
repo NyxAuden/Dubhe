@@ -520,7 +520,7 @@ async fn structure_deadline(deadlines: &Arc<Mutex<Option<StdInstant>>>) -> io::R
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     stream: TcpStream,
-    inbound: Inbound,
+    inbound: Arc<Inbound>,
     security: Option<crate::tls::InboundSecurity>,
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
@@ -592,7 +592,7 @@ pub(crate) async fn serve(
 
     let connection_slots = Arc::new(Semaphore::new(per_connection));
     let mut rpcs = JoinSet::new();
-    let grpc = match &inbound {
+    let grpc = match &*inbound {
         Inbound::VlessGrpc { grpc, .. }
         | Inbound::VmessGrpc { grpc, .. }
         | Inbound::TrojanGrpc { grpc, .. } => grpc.clone(),

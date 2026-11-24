@@ -27,7 +27,7 @@ mod h1;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     stream: TcpStream,
-    config: Inbound,
+    config: Arc<Inbound>,
     tls: Option<crate::tls::ServerTls>,
     ctx: Arc<Context>,
     handshake: crate::runtime::HandshakePermits,
@@ -41,7 +41,7 @@ pub(crate) async fn serve(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Naive TLS握手超时"))??;
     let alpn = accepted.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
-    let (tag, users, h1_padding) = match &config {
+    let (tag, users, h1_padding) = match &*config {
         Inbound::Naive {
             tag,
             users,
