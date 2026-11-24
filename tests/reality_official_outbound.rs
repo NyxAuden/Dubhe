@@ -114,7 +114,10 @@ async fn wait_listening(address: SocketAddr) -> Result<()> {
 /// 这里在范围之外顺序探测，并由调用方保证进程内不重复。
 fn pick_port() -> SocketAddr {
     static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(20000);
-    for _ in 20000u16..30000 {
+    // 本文件独占 25000–27499 段。`reserve_port` 的 HashSet 只能在**当前测试二进制**
+    // 内去重，cargo 并行跑多个测试二进制时互相看不见；此前四个文件共用
+    // 20000–29999，实测出现过 `入口 X 绑定失败: AddrInUse`。
+    for _ in 25000u16..27500 {
         let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
             drop(listener);

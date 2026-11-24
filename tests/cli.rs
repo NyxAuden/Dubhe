@@ -117,7 +117,10 @@ fn reserve_port() -> std::net::SocketAddr {
         std::sync::OnceLock::new();
     let issued = ISSUED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     // 20000–29999 低于临时端口下界 32768，避开内核自动分配的源端口。
-    for port in 20000u16..30000 {
+    // 本文件独占 20000–22499 段。`reserve_port` 的 HashSet 只能在**当前测试二进制**
+    // 内去重，cargo 并行跑多个测试二进制时互相看不见；此前四个文件共用
+    // 20000–29999，实测出现过 `入口 X 绑定失败: AddrInUse`。
+    for port in 20000u16..22500 {
         if issued.lock().unwrap().contains(&port) {
             continue;
         }

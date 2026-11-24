@@ -96,7 +96,10 @@ fn pick_port() -> SocketAddr {
     static ISSUED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
         std::sync::OnceLock::new();
     let issued = ISSUED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    for port in 20000u16..30000 {
+    // 本文件独占 27500–29999 段。`reserve_port` 的 HashSet 只能在**当前测试二进制**
+    // 内去重，cargo 并行跑多个测试二进制时互相看不见；此前四个文件共用
+    // 20000–29999，实测出现过 `入口 X 绑定失败: AddrInUse`。
+    for port in 27500u16..30000 {
         if issued.lock().unwrap().contains(&port) {
             continue;
         }

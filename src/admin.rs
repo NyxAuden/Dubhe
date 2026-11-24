@@ -48,7 +48,18 @@ pub(crate) async fn serve(
                 let _ = some;
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                // 管理端口的 accept 错误必须和普通入口一致地分类：
+                // 可恢复的（FD 耗尽等）退避重试，只有真正致命的才向上报。
+                // 用 `?` 直接抛出会让**整个 Server 停止**——一个管理端口
+                // 的瞬时 FD 耗竭不该带走所有代理入口。
+                let (stream, _) = match accepted {
+                    Ok(value) => value,
+                    Err(error) if crate::runtime::recoverable_accept_error(&error) => {
+                        tokio::time::sleep(crate::runtime::ACCEPT_BACKOFF).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
                     drop(stream);
                     continue;

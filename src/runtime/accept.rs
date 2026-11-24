@@ -104,7 +104,7 @@ impl Drop for PerIpGuard {
 /// - `ECONNABORTED`：对端在 accept 前关闭；
 /// - `EINTR`：被信号打断；
 /// - `EAGAIN` / `EWOULDBLOCK`：监听 socket 被设为非阻塞时的正常空转。
-fn recoverable_accept_error(error: &io::Error) -> bool {
+pub(crate) fn recoverable_accept_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
@@ -115,7 +115,7 @@ fn recoverable_accept_error(error: &io::Error) -> bool {
 ///
 /// 退避是必要的：立刻重试会在 FD 仍然耗尽时形成忙循环，把 CPU 打满。
 /// 取 20ms：既能在一批连接释放后很快恢复，又不会在持续压力下空转。
-const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+pub(crate) const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
 
 pub(super) async fn accept_loop(
     listener: Listener,
