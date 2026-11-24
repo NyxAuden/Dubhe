@@ -2200,6 +2200,11 @@ pub(crate) async fn serve_quic(
     )
     .await;
     tasks.abort_all();
+    // 连接任务里还有流任务与 gauge；abort 只是请求取消，这里等它们 drop。
+    let _ = timeout(Duration::from_secs(3), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
     endpoint.close(quinn::VarInt::from_u32(0), b"");
     let _ = timeout(Duration::from_secs(3), endpoint.wait_idle()).await;
     Ok(())
@@ -2272,7 +2277,13 @@ async fn serve_h3_connection(
         while streams.join_next().await.is_some() {}
     })
     .await;
+    // 上面的宽限 drain 可能超时；abort 之后仍要等到任务真正 drop，
+    // 否则它们持有的 `Gauge::Tcp` 会晚于连接任务结束。
     streams.abort_all();
+    let _ = timeout(shutdown, async {
+        while streams.join_next().await.is_some() {}
+    })
+    .await;
     Ok(())
 }
 
