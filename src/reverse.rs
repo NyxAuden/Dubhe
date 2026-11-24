@@ -345,7 +345,6 @@ impl Registry {
                 _ = tokio::time::timeout(grace, write.shutdown()) => {}
             }
             writer_inner.close();
-            writer_inner.close();
         }));
 
         let budget = Arc::new(Semaphore::new(256 * 1024));
