@@ -25,8 +25,27 @@ use crate::{
 
 mod accept;
 
+/// 该 NW3 入口是否应改走内部 relay，返回其地址字符串。
+///
+/// 只有 `out=direct` 才改写：`egress` 与用户显式配置的 SOCKS 上游必须保持
+/// 原样，否则同进程里的 Egress Portal 会被指向回环，出口语义被改。
+fn nw3_relay_for(
+    out: &crate::config::Nw3Out,
+    tag: &str,
+    addresses: &HashMap<String, SocketAddr>,
+) -> Option<String> {
+    if !matches!(out, crate::config::Nw3Out::Direct) {
+        return None;
+    }
+    addresses
+        .get(&format!("{NW3_RELAY_PREFIX}{tag}"))
+        .map(|address| address.to_string())
+}
+
 /// 为 NW3 注入的内部入口 tag。它不会出现在配置、导出或热重载指纹里。
-const NW3_INTERNAL_TAG: &str = "__nw3_internal";
+/// 内部 relay 的监听地址表键前缀。真实 tag 沿用它所属 NW3 入口的 tag，
+/// 否则 `route.rules[].inbounds: ["nw3-in"]` 匹配不到经 relay 的流量。
+pub(crate) const NW3_RELAY_PREFIX: &str = "__nw3_relay:";
 
 /// 握手期的两个名额（全局并发 + 单 IP 在途）。协议实现只需按原样持有并在
 /// 握手完成时 `drop`，两者的释放时机因此自动对齐。
@@ -252,21 +271,26 @@ impl Server {
         // `pub(crate)`，注入要在 GPL 代码里维护分叉；而 `out=` 是 Nowhere 的
         // 公开契约。代价是多一次回环往返（实测 SOCKS5 转发延迟 +0.235ms）。
         let mut inbounds = config.inbounds.clone();
-        let needs_nw3_relay = inbounds.iter().any(|inbound| {
-            matches!(
-                inbound,
+        // 每个 `out=direct` 的 NW3 入口各配一个内部 SOCKS5，tag 为
+        // `__nw3_relay:<原 tag>`。逐一配而不是共用一个，是因为共用会让所有
+        // Portal 的出站指向同一地址（`out=egress` 也被改写），且丢失入口身份。
+        let relays: Vec<(String, String)> = inbounds
+            .iter()
+            .filter_map(|inbound| match inbound {
                 Inbound::Nw3 {
+                    tag,
                     out: crate::config::Nw3Out::Direct,
                     ..
-                }
-            )
-        });
-        if needs_nw3_relay {
+                } => Some((tag.clone(), format!("{NW3_RELAY_PREFIX}{tag}"))),
+                _ => None,
+            })
+            .collect();
+        for (_, relay_tag) in relays.iter().rev() {
             // 放在最前：NW3 分支要能查到它实际绑定的端口（listen 端口为 0）。
             inbounds.insert(
                 0,
                 Inbound::Socks5 {
-                    tag: NW3_INTERNAL_TAG.to_owned(),
+                    tag: relay_tag.clone(),
                     listen: "127.0.0.1:0".parse().expect("静态回环地址"),
                     users: Vec::new(),
                     allow_insecure: false,
@@ -477,10 +501,14 @@ impl Server {
                 continue;
             }
             // NW3 由 Nowhere Portal 在 run 阶段自行绑定同端口的 TCP（TLS 1.3）与 QUIC。
-            if let Inbound::Nw3 { tag, listen, .. } = inbound {
-                let relay = addresses
-                    .get(NW3_INTERNAL_TAG)
-                    .map(|address| address.to_string());
+            if let Inbound::Nw3 {
+                tag, listen, out, ..
+            } = inbound
+            {
+                // 只有 `out=direct` 的 Portal 才走内部 relay。`egress` 与用户
+                // 显式配置的 SOCKS 上游必须保持原样——早期实现无条件覆盖，
+                // 导致同进程里的 Egress Portal 也被指向回环，出口语义被改。
+                let relay = nw3_relay_for(out, tag, &addresses);
                 let portal = transport::nw3::prepare_with_out(inbound, relay.as_deref())?;
                 addresses.insert(tag.clone(), *listen);
                 portals.push((tag.clone(), portal));
@@ -1279,5 +1307,58 @@ impl Server {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod nw3_relay_tests {
+    use super::*;
+    use crate::config::Nw3Out;
+
+    fn addresses(tag: &str) -> HashMap<String, SocketAddr> {
+        let mut map = HashMap::new();
+        map.insert(
+            format!("{NW3_RELAY_PREFIX}{tag}"),
+            "127.0.0.1:12345".parse().unwrap(),
+        );
+        map
+    }
+
+    /// `out=direct` 必须改走内部 relay：否则 NW3 流量绕过 route/limits/stats。
+    #[test]
+    fn direct_uses_the_internal_relay() {
+        let relay = nw3_relay_for(&Nw3Out::Direct, "nw3-in", &addresses("nw3-in"));
+        assert_eq!(relay.as_deref(), Some("127.0.0.1:12345"));
+    }
+
+    /// `out=egress` 与显式 SOCKS 上游**不得**被改写。
+    ///
+    /// 早期实现无条件覆盖，同进程里两种 Portal 并存时，`egress` 那个也会被
+    /// 指向回环 SOCKS——出口语义被改，且所有 Portal 共用同一地址。
+    #[test]
+    fn egress_and_explicit_socks_keep_their_out() {
+        let all = addresses("nw3-in");
+        assert!(nw3_relay_for(&Nw3Out::Egress, "nw3-in", &all).is_none());
+        assert!(nw3_relay_for(&Nw3Out::Socks("10.0.0.1:1080".into()), "nw3-in", &all).is_none());
+    }
+
+    /// relay 只按自己的 tag 取地址：两个 direct Portal 不互相串用。
+    #[test]
+    fn relays_are_per_inbound_tag() {
+        let mut all = addresses("first");
+        all.insert(
+            format!("{NW3_RELAY_PREFIX}second"),
+            "127.0.0.1:23456".parse().unwrap(),
+        );
+        assert_eq!(
+            nw3_relay_for(&Nw3Out::Direct, "first", &all).as_deref(),
+            Some("127.0.0.1:12345")
+        );
+        assert_eq!(
+            nw3_relay_for(&Nw3Out::Direct, "second", &all).as_deref(),
+            Some("127.0.0.1:23456")
+        );
+        // 没有对应 relay 的 tag 返回 None，而不是借用别人的地址。
+        assert!(nw3_relay_for(&Nw3Out::Direct, "third", &all).is_none());
     }
 }

@@ -1152,6 +1152,17 @@ fn proxy_from_outbound(
     }))
 }
 
+/// 去掉内部 relay 前缀，还原为配置里可见的入口 tag。
+///
+/// NW3 的 `out=direct` 经内部 SOCKS5 进入控制面，那条连接的 `inbound`
+/// 是 `__nw3_relay:<原 tag>`。规则里写的是原 tag，因此匹配前先归一化；
+/// 否则 `inbounds: ["nw3-in"]` 对 NW3 流量永远不成立。
+fn inbound_tag(inbound: &str) -> &str {
+    inbound
+        .strip_prefix(crate::runtime::NW3_RELAY_PREFIX)
+        .unwrap_or(inbound)
+}
+
 impl CompiledRule {
     fn evaluate(
         &self,
@@ -1236,7 +1247,8 @@ impl CompiledRule {
         domain: Option<&str>,
     ) -> bool {
         // 空字段不限制；不同字段取交集，同字段的多个值取并集。
-        (self.inbounds.is_empty() || self.inbounds.iter().any(|tag| tag == inbound))
+        (self.inbounds.is_empty()
+            || self.inbounds.iter().any(|tag| tag == inbound_tag(inbound)))
             && (self.networks.is_empty() || self.networks.contains(&network))
             // `domains` 与地理展开项是同一个 OR 组：两者都来自配置的
             // `domains` 数组，而 Xray 的 domain 数组内部是并集。
