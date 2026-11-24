@@ -880,3 +880,51 @@ async fn shared_global_connections_reject_old_listener_then_recover_after_auth_t
     drop(old);
     server.shutdown().await;
 }
+
+/// VMess 命令 2（fixed 单目标 UDP）经 SOCKS5 出站转发。
+///
+/// 修复前 `src/udp/vmess.rs` 在握手期调用 `ctx.allowed()`，它内部是
+/// `selected(..., allow_udp_proxy: false)`——选到代理出站就直接返回
+/// `Unsupported`，使 fixed 模式在链式部署下握手即失败。而数据面
+/// （`Association::send`）本来就用 `udp_selected`、允许代理，两侧不一致。
+#[tokio::test]
+async fn native_udp_fixed_target_relays_through_a_socks5_outbound() {
+    // 落地机：SOCKS5 入口，出站直连。
+    let upstream = Running::start(json!({
+        "version": 1,
+        "inbounds": [{"type": "socks5", "tag": "up", "listen": "127.0.0.1:0"}],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {"default": "direct"},
+        "limits": {"shutdown_timeout_ms": 100, "handshake_timeout_ms": 3000}
+    }))
+    .await;
+
+    // 中转机：VMess 入口，全部经 SOCKS5 出站。
+    let echo = Echo::udp("127.0.0.1").await;
+    let mut v = config(None);
+    v["outbounds"] = json!([
+        {"type": "direct", "tag": "direct"},
+        {"type": "socks5", "tag": "up", "endpoint": upstream.address.to_string()}
+    ]);
+    v["route"] = json!({"default": "up"});
+    let server = Running::start(v).await;
+
+    let io = TcpStream::connect(server.address).await.unwrap();
+    let mut c = Client::start(
+        io,
+        Request::new(2, client::target(echo.address), 3, 0),
+        None,
+    )
+    .await;
+    let payload = b"vmess-via-socks";
+    let frame = c.wire(payload);
+    c.io.write_all(&frame).await.unwrap();
+    c.io.flush().await.unwrap();
+    assert_eq!(c.recv().await, payload, "经 SOCKS5 出站的 UDP 回程应一致");
+    c.finish().await;
+
+    drop(c);
+    idle(&server).await;
+    server.shutdown().await;
+    upstream.shutdown().await;
+}

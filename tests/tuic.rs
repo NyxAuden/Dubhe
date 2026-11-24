@@ -912,3 +912,67 @@ async fn wrong_password_is_rejected() {
     drop(endpoint);
     running.shutdown().await;
 }
+
+/// TUIC 的 UDP 经 SOCKS5 出站转发。
+///
+/// 修复前 `udp_session_loop` 调用 `ctx.allowed()`，选到任何代理出站都返回
+/// `Unsupported`——链式部署下 TUIC 的 UDP 直接失败，只有 TCP 能用。
+#[tokio::test]
+async fn datagram_relays_through_a_socks5_outbound() {
+    // 落地机：SOCKS5 入口，出站直连。
+    let upstream = Running::start(json!({
+        "version": 1,
+        "inbounds": [{"type": "socks5", "tag": "up", "listen": "127.0.0.1:0"}],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {"default": "direct"},
+        "limits": {"shutdown_timeout_ms": 100, "handshake_timeout_ms": 3000}
+    }))
+    .await;
+
+    // 中转机：TUIC 入口，全部经 SOCKS5 出站。
+    let echo = Echo::udp("127.0.0.1").await;
+    let cert = common::Certificate::new();
+    let mut value = config(&cert);
+    value["outbounds"] = json!([
+        {"type": "direct", "tag": "direct"},
+        {"type": "socks5", "tag": "up", "endpoint": upstream.address.to_string()}
+    ]);
+    value["route"] = json!({"default": "up"});
+    let running = Running::start(value).await;
+    let (endpoint, connection) = connect(&running, &cert).await;
+    authenticate(&connection).await;
+
+    let payload = b"tuic-via-socks";
+    let mut datagram = vec![VERSION, Command::Packet.byte()];
+    datagram.extend_from_slice(&reference_udp_body(
+        3,
+        1,
+        1,
+        1,
+        &reference_ipv4(
+            match echo.address.ip() {
+                std::net::IpAddr::V4(ip) => ip.octets(),
+                std::net::IpAddr::V6(_) => panic!("echo 应绑定 IPv4"),
+            },
+            echo.address.port(),
+        ),
+        payload,
+    ));
+    connection
+        .send_datagram(prost::bytes::Bytes::from(datagram))
+        .unwrap();
+
+    let reply = timeout(Duration::from_secs(5), connection.read_datagram())
+        .await
+        .expect("经 SOCKS5 出站的 UDP 回包超时")
+        .unwrap();
+    assert_eq!(&reply[..2], &[VERSION, Command::Packet.byte()]);
+    assert!(
+        reply.windows(payload.len()).any(|window| window == payload),
+        "回程载荷应一致：{reply:?}"
+    );
+
+    drop(endpoint);
+    running.shutdown().await;
+    upstream.shutdown().await;
+}

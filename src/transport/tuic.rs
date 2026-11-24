@@ -1047,7 +1047,7 @@ async fn udp_session_loop(mut receiver: mpsc::Receiver<UdpPacket>, info: Arc<Udp
     let mut defrag = Defrag::new();
     let mut sockets: [Option<Arc<UdpSocket>>; 2] = [None, None];
     let mut readers: Vec<JoinHandle<()>> = Vec::new();
-    let mut targets: HashMap<Target, SocketAddr> = HashMap::new();
+    let mut targets: HashMap<Target, UdpTarget> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -1080,17 +1080,73 @@ async fn udp_session_loop(mut receiver: mpsc::Receiver<UdpPacket>, info: Arc<Udp
                         continue;
                     }
                 };
-                if info
-                    .shared
-                    .allowed(&info.tag, crate::session::Network::Udp, &target)
-                    .await
-                    .is_err()
+                // 先选路：`udp_selected` 会拒绝 reject 规则、HTTP 出站与链式出站，
+                // 并允许代理出站；`allowed` 只允许直连，会让 TUIC 的 UDP 在
+                // 链式部署下直接失败。
+                let proxied = match info.shared.udp_selected(&info.tag, &target).await {
+                    Ok(selected) => selected.proxy.is_some(),
+                    Err(_) => {
+                        // 路由拒绝已在 Context 分类并计入 rejected，这里不重复计数。
+                        continue;
+                    }
+                };
+                // 路由变化可能改变同一目标的出站方式；旧映射不再适用。
+                if targets
+                    .get(&target)
+                    .is_some_and(|entry| entry.is_proxied() != proxied)
                 {
-                    // `Context::allowed` 已在路由拒绝时计入 rejected，这里不重复计数。
+                    targets.remove(&target);
+                }
+
+                if proxied {
+                    if !targets.contains_key(&target) {
+                        if targets.len() >= info.max_udp_targets {
+                            info.shared.stats.drop_packet();
+                            continue;
+                        }
+                        let Ok(outlet) = crate::udp::RoutedUdp::new(
+                            info.shared.clone(),
+                            info.tag.clone(),
+                            target.clone(),
+                        )
+                        .await
+                        else {
+                            info.shared.stats.drop_packet();
+                            continue;
+                        };
+                        let (outgoing, rx) = mpsc::channel::<Vec<u8>>(64);
+                        let task = spawn_proxied_reply_reader(target.clone(), outlet, rx, info.clone());
+                        targets.insert(
+                            target.clone(),
+                            UdpTarget::Proxied { outgoing, task },
+                        );
+                    }
+                    let Some(UdpTarget::Proxied { outgoing, .. }) = targets.get(&target) else {
+                        info.shared.stats.drop_packet();
+                        continue;
+                    };
+                    match outgoing.send(packet.payload.clone()).await {
+                        Ok(()) => {
+                            info.shared
+                                .stats
+                                .uplink
+                                .fetch_add(packet.payload.len() as u64, Ordering::Relaxed);
+                            if let Some(traffic) = &info.traffic {
+                                traffic.add(true, packet.payload.len());
+                            }
+                            info.touch();
+                        }
+                        Err(_) => info.shared.stats.drop_packet(),
+                    }
                     continue;
                 }
-                let address = if let Some(address) = targets.get(&target) {
-                    *address
+
+                let address = if let Some(entry) = targets.get(&target) {
+                    match entry {
+                        UdpTarget::Direct(address) => *address,
+                        // 已验证 `proxied` 为假，不会走到这里。
+                        UdpTarget::Proxied { .. } => continue,
+                    }
                 } else {
                     if targets.len() >= info.max_udp_targets {
                         info.shared.stats.drop_packet();
@@ -1109,7 +1165,7 @@ async fn udp_session_loop(mut receiver: mpsc::Receiver<UdpPacket>, info: Arc<Udp
                             continue;
                         }
                     };
-                    targets.insert(target.clone(), resolved);
+                    targets.insert(target.clone(), UdpTarget::Direct(resolved));
                     resolved
                 };
 
@@ -1181,6 +1237,117 @@ impl UdpSessionInfo {
 }
 
 /// 每个套接字一个读取任务：只做 `recv_from` 与回包，不接触 UDP 会话表。
+/// 把会话目标转成线格式地址。
+///
+/// 放在这里而不是 `tuic/wire.rs`：那个文件是纯编解码模块（会被 `tests/tuic.rs`
+/// 以 `#[path]` 复用），不应依赖 `session` 类型。
+fn wire_address_of(target: &Target) -> wire::WireAddress {
+    match &target.host {
+        Host::Ip(IpAddr::V4(ip)) => wire::WireAddress::Ipv4 {
+            octets: ip.octets(),
+            port: target.port,
+        },
+        Host::Ip(IpAddr::V6(ip)) => wire::WireAddress::Ipv6 {
+            octets: ip.octets(),
+            port: target.port,
+        },
+        Host::Domain(name) => wire::WireAddress::Domain {
+            name: name.clone(),
+            port: target.port,
+        },
+    }
+}
+
+/// 单目标的出站方式。
+///
+/// 直连仍按地址族共享 socket（`sockets[0]`/`sockets[1]`），只记解析后的地址；
+/// 代理出站每目标一个 `RoutedUdp`（它构造时固定目标，`recv()` 不带目标）。
+enum UdpTarget {
+    Direct(SocketAddr),
+    Proxied {
+        outgoing: mpsc::Sender<Vec<u8>>,
+        /// 会话结束时 abort，避免任务挂在 `RoutedUdp::recv` 上。
+        task: JoinHandle<()>,
+    },
+}
+
+impl UdpTarget {
+    fn is_proxied(&self) -> bool {
+        matches!(self, Self::Proxied { .. })
+    }
+}
+
+impl Drop for UdpTarget {
+    fn drop(&mut self) {
+        if let Self::Proxied { task, .. } = self {
+            task.abort();
+        }
+    }
+}
+
+/// 代理目标的回程：从 `RoutedUdp` 读，报头用**构造时捕获的目标**。
+///
+/// 直连分支的回程地址来自 `recv_from` 的真实源地址；代理分支拿不到源地址
+/// （SOCKS5 只回 payload），只能用原目标。这是 UDP 中继的固有限制，
+/// 与共享 `Association` 的处理一致。
+fn spawn_proxied_reply_reader(
+    target: Target,
+    mut outlet: crate::udp::RoutedUdp,
+    mut outgoing: mpsc::Receiver<Vec<u8>>,
+    info: Arc<UdpSessionInfo>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let destination = wire_address_of(&target);
+        loop {
+            tokio::select! {
+                biased;
+                _ = info.cancel.cancelled() => return,
+                packet = outgoing.recv() => {
+                    let Some(payload) = packet else { return };
+                    if outlet.send(&payload).await.is_err() {
+                        return;
+                    }
+                }
+                datagram = outlet.recv() => {
+                    let Ok(datagram) = datagram else { return };
+                    let payload = datagram.payload;
+                    info.touch();
+                    if payload.len() > info.max_udp_payload {
+                        info.shared.stats.drop_packet();
+                        continue;
+                    }
+                    let Some(_budget) = reserve_budget(&info.shared, payload.len()) else {
+                        info.shared.stats.drop_packet();
+                        continue;
+                    };
+                    let packet_id = info.packet_id.fetch_add(1, Ordering::Relaxed);
+                    match send_udp_reply(
+                        &info.connection,
+                        info.carrier,
+                        info.session_id,
+                        packet_id,
+                        &destination,
+                        &payload,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            info.shared
+                                .stats
+                                .downlink
+                                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            if let Some(traffic) = &info.traffic {
+                                traffic.add(false, payload.len());
+                            }
+                        }
+                        Err(_) => info.shared.stats.drop_packet(),
+                    }
+                }
+            }
+        }
+    })
+}
+
 fn spawn_reply_reader(socket: Arc<UdpSocket>, info: Arc<UdpSessionInfo>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut buffer = vec![0u8; 65536];

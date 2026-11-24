@@ -62,7 +62,12 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 ) -> io::Result<()> {
     let fixed = match &accepted.mode {
         Mode::Udp(target) => {
-            ctx.allowed(&inbound, Network::Udp, target).await?;
+            // 这里只需要确认「该目标被允许」，不应限制出站方式。
+            // `allowed` 走 `selected(..., allow_udp_proxy: false)`，选到代理就
+            // 直接 `Unsupported`，使 fixed 模式在链式部署下握手即失败；
+            // 而数据面（`Association::send`）本来就用 `udp_selected`，允许代理。
+            // 改用 `udp_selected` 让两侧一致。
+            ctx.udp_selected(&inbound, target).await?;
             Some(target.clone())
         }
         Mode::PacketAddr => None,
