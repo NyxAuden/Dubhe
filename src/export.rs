@@ -76,7 +76,14 @@ pub enum Transport {
         mode: String,
     },
     /// mKCP 自带加密层，没有 TLS/REALITY。
-    Kcp,
+    /// 只有裸 KCP（`security: none` + 无 seed + 无 header）与 Xray 互通；
+    /// 其余模式改变线格式，导出必须明确拒绝而不是生成连不上的配置。
+    Kcp {
+        /// 该入口的 mKCP 是否为 Xray 可互通的裸模式。
+        bare: bool,
+        /// 不为裸模式时的原因，写进导出报告。
+        reason: Option<String>,
+    },
     /// V2Ray HTTP 传输（h1/h2）。
     Http {
         path: String,
@@ -219,13 +226,15 @@ pub fn nodes(config: &Config, host: &str, report: &mut ExportReport) -> Vec<Node
                 inbound.tag()
             ));
         }
-        // Shadowsocks 多用户导出的是身份密钥，不是任何一个用户的密钥。
+        // SS2022 EIH 的客户端密码是 `身份密钥:用户密钥`；导出取第一个用户。
         if let Some(users) = shadowsocks_users(inbound)
             && !users.is_empty()
         {
             report.notes.push(format!(
-                "[all] {} 是多用户 Shadowsocks，导出的是身份密钥；每个用户需手工替换 password",
-                inbound.tag()
+                "[all] {} 是多用户 Shadowsocks，导出的是身份密钥 + 用户 {} 的密钥；\
+                 其余用户请手工复制成多条",
+                inbound.tag(),
+                users[0].name
             ));
         }
         match node_from(inbound, host) {
@@ -243,6 +252,37 @@ fn shadowsocks_users(inbound: &Inbound) -> Option<&[crate::config::User]> {
     match inbound {
         Inbound::Shadowsocks { users, .. } => users.as_deref(),
         _ => None,
+    }
+}
+
+/// mKCP 的线格式是否与 Xray 默认/裸模式一致。
+///
+/// 导出只能表达 `network: "kcp"`；`security`、`seed`、`header` 都会改变
+/// 两端如何解释同一个数据包，丢掉它们生成的配置能加载但业务不通。
+fn kcp_transport(kcp: &crate::config::Kcp) -> Transport {
+    let mut reasons = Vec::new();
+    if kcp.security != crate::config::KcpSecurity::None {
+        reasons.push("security 不是 none");
+    }
+    if kcp.seed.is_some() {
+        reasons.push("使用了 seed");
+    }
+    if !matches!(kcp.header, crate::config::KcpHeader::None) {
+        reasons.push("使用了混淆 header");
+    }
+    if reasons.is_empty() {
+        Transport::Kcp {
+            bare: true,
+            reason: None,
+        }
+    } else {
+        Transport::Kcp {
+            bare: false,
+            reason: Some(format!(
+                "mKCP {}，Xray 侧无法等价表达；请改用裸 KCP（security: none、无 seed、无 header）",
+                reasons.join("、")
+            )),
+        }
     }
 }
 
@@ -313,7 +353,10 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
 
     let node = match inbound {
         Inbound::VlessKcp {
-            users, decryption, ..
+            users,
+            decryption,
+            kcp,
+            ..
         } => {
             let vless_encryption = vless_encryption_of(decryption)?;
             let Some(user) = users.first() else {
@@ -322,7 +365,7 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
             base(
                 Protocol::Vless,
                 Security::None,
-                Transport::Kcp,
+                kcp_transport(kcp),
                 Credential::Uuid {
                     uuid: user.uuid.clone(),
                     flow: None,
@@ -330,14 +373,14 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 vless_encryption,
             )
         }
-        Inbound::VmessKcp { users, .. } => {
+        Inbound::VmessKcp { users, kcp, .. } => {
             let Some(user) = users.first() else {
                 return Ok(None);
             };
             base(
                 Protocol::Vmess,
                 Security::None,
-                Transport::Kcp,
+                kcp_transport(kcp),
                 Credential::Uuid {
                     uuid: user.uuid.clone(),
                     flow: None,
@@ -345,14 +388,14 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
                 None,
             )
         }
-        Inbound::TrojanKcp { users, .. } => {
+        Inbound::TrojanKcp { users, kcp, .. } => {
             let Some(user) = users.first() else {
                 return Ok(None);
             };
             base(
                 Protocol::Trojan,
                 Security::None,
-                Transport::Kcp,
+                kcp_transport(kcp),
                 Credential::Password {
                     password: user.password.clone(),
                 },
@@ -672,17 +715,28 @@ fn node_from(inbound: &Inbound, host: &str) -> Result<Option<Node>> {
             )
         }
         Inbound::Shadowsocks {
-            method, password, ..
-        } => base(
-            Protocol::Shadowsocks,
-            Security::None,
-            Transport::Tcp,
-            Credential::Shadowsocks {
-                method: method_name(*method),
-                password: password.0.clone(),
-            },
-            None,
-        ),
+            method,
+            password,
+            users,
+            ..
+        } => {
+            // SS2022 EIH：客户端密码是 `身份密钥:用户密钥`。只写身份密钥会
+            // 让客户端通过身份校验、却解不开任何用户（实测业务 EOF）。
+            let credential = match users.as_deref().and_then(<[crate::config::User]>::first) {
+                Some(user) => format!("{}:{}", password.0, user.password),
+                None => password.0.clone(),
+            };
+            base(
+                Protocol::Shadowsocks,
+                Security::None,
+                Transport::Tcp,
+                Credential::Shadowsocks {
+                    method: method_name(*method),
+                    password: credential,
+                },
+                None,
+            )
+        }
         Inbound::Hysteria2 {
             users,
             obfs,
@@ -1249,8 +1303,11 @@ fn xray_outbound(node: &Node) -> std::result::Result<Value, String> {
             xhttp.insert("mode".into(), json!(mode));
             stream.insert("xhttpSettings".into(), Value::Object(xhttp));
         }
-        Transport::Kcp => {
-            // 具体的 mtu/tti 由服务端 kcp 配置决定；导出时只声明承载类型。
+        Transport::Kcp { bare, ref reason } => {
+            if !bare {
+                return Err(reason.clone().unwrap_or_else(|| "mKCP 无法导出".to_owned()));
+            }
+            // 裸 KCP：Xray 侧只有 `network: "kcp"`，与 security=none 一致。
             stream.insert("network".into(), json!("kcp"));
         }
         Transport::Http { .. } => {
@@ -1577,7 +1634,7 @@ fn sing_box_outbound(node: &Node) -> std::result::Result<Value, String> {
         Transport::Xhttp { .. } => {
             return Err("sing-box 没有 XHTTP 承载（Xray/Mihomo 才有）".to_owned());
         }
-        Transport::Kcp => {
+        Transport::Kcp { .. } => {
             return Err("sing-box 没有 mKCP 承载".to_owned());
         }
         Transport::Http { ref path, ref host } => Some(json!({
@@ -1814,7 +1871,10 @@ fn mihomo_proxy(node: &Node) -> std::result::Result<Value, String> {
             }
             out.insert("xhttp-opts".into(), opts);
         }
-        Transport::Kcp => {
+        Transport::Kcp { bare, ref reason } => {
+            if !bare {
+                return Err(reason.clone().unwrap_or_else(|| "mKCP 无法导出".to_owned()));
+            }
             out.insert("network".into(), json!("mkcp"));
         }
         Transport::Http { ref path, ref host } => {
@@ -1986,7 +2046,7 @@ fn anywhere_proxy(node: &Node, index: usize) -> std::result::Result<Value, Strin
                 }
                 Some(xhttp)
             }
-            Transport::Kcp => {
+            Transport::Kcp { .. } => {
                 return Err("Anywhere 的 AJSON 没有 mKCP 承载".to_owned());
             }
             Transport::Http { .. } => {
@@ -2449,10 +2509,26 @@ mod transport_matrix_tests {
                 "xhttp": {"path": "/x", "mode": "packet-up"},
                 "certificate": "/tmp/c.pem", "private_key": "/tmp/k.pem"
             }),
+            // 只有裸 KCP 能导出；默认是 legacy，必须显式写 security: none。
             "kcp" => json!({
                 "type": "vless-kcp", "tag": "n", "listen": "0.0.0.0:443",
                 "users": [{"name": "a", "uuid": UUID}],
+                "kcp": {"security": "none"}
+            }),
+            "kcp-legacy" => json!({
+                "type": "vless-kcp", "tag": "n", "listen": "0.0.0.0:443",
+                "users": [{"name": "a", "uuid": UUID}],
                 "kcp": {}
+            }),
+            "kcp-seed" => json!({
+                "type": "vless-kcp", "tag": "n", "listen": "0.0.0.0:443",
+                "users": [{"name": "a", "uuid": UUID}],
+                "kcp": {"security": "legacy", "seed": "s3cret-seed"}
+            }),
+            "kcp-header" => json!({
+                "type": "vless-kcp", "tag": "n", "listen": "0.0.0.0:443",
+                "users": [{"name": "a", "uuid": UUID}],
+                "kcp": {"security": "none", "header": {"type": "srtp"}}
             }),
             other => panic!("未覆盖的承载 {other}"),
         };
@@ -2562,6 +2638,31 @@ mod transport_matrix_tests {
             anywhere["proxies"][0]["transport"]["serviceName"],
             "/TunService/Tun"
         );
+    }
+
+    /// 只有裸 KCP 与 Xray 互通；legacy / seed / header 都会改变线格式，
+    /// 必须明确拒绝而不是生成一份能加载但业务不通的配置。
+    #[test]
+    fn only_bare_kcp_is_exported() {
+        // mKCP 没有 TLS；Xray 只允许明文出站指向私有地址。
+        let mut bare = node_for("kcp");
+        bare.host = "192.168.1.10".to_owned();
+        let (xray, _) = get(Target::Xray, &bare);
+        assert_eq!(xray["outbounds"][0]["streamSettings"]["network"], "kcp");
+
+        for kind in ["kcp-legacy", "kcp-seed", "kcp-header"] {
+            let mut node = node_for(kind);
+            node.host = "192.168.1.10".to_owned();
+            let report = rejected(Target::Xray, &node);
+            assert!(
+                report
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("mKCP") && note.contains("无法等价表达")),
+                "{kind}: {:?}",
+                report.notes
+            );
+        }
     }
 
     /// 双路径服务：单流客户端仍然可用，三家都应导出单流配置。
@@ -3477,12 +3578,31 @@ mod shadowsocks_multiuser_tests {
         .expect("配置应合法");
         let mut report = ExportReport::default();
         let nodes = nodes(&config, "example.com", &mut report);
-        // 身份密钥本身仍可用，因此照常导出单条。
         assert_eq!(nodes.len(), 1);
+        // 客户端必须拿到 `身份密钥:用户密钥`：只给身份密钥能通过身份校验，
+        // 却解不开任何用户（实测 sing-box 业务 EOF）。
+        let Credential::Shadowsocks { password, .. } = &nodes[0].credential else {
+            panic!("应为 Shadowsocks 凭据");
+        };
+        assert_eq!(
+            password, "EREREREREREREREREREREQ==:IiIiIiIiIiIiIiIiIiIiIg==",
+            "{password}"
+        );
         assert!(
-            report.notes.iter().any(|note| note.contains("身份密钥")),
-            "{:?}",
+            report.notes.iter().any(|note| note.contains("用户 u")),
+            "应说明选了哪个用户：{:?}",
             report.notes
+        );
+
+        let sing = export(
+            Target::SingBox,
+            std::slice::from_ref(&nodes[0]),
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(
+            sing["outbounds"][0]["password"],
+            "EREREREREREREREREREREQ==:IiIiIiIiIiIiIiIiIiIiIg=="
         );
     }
 }

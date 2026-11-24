@@ -49,6 +49,7 @@ def main():
 
     failed = 0
     skipped = 0
+    checked = 0
     for filename, (binary_name, args) in CHECKS.items():
         path = export_dir / filename
         if not path.is_file():
@@ -66,6 +67,7 @@ def main():
             arg.format(file=str(path), home=str(home)) for arg in args
         ]
         result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        checked += 1
         if result.returncode == 0:
             print(f"通过 {filename}（{binary_name}）")
         else:
@@ -76,8 +78,14 @@ def main():
                 print(f"    {line}")
 
     print()
-    print(f"结果：失败 {failed}，跳过 {skipped}")
-    return 1 if failed else 0
+    print(f"结果：失败 {failed}，执行 {checked}，跳过 {skipped}")
+    if failed:
+        return 1
+    if checked == 0:
+        # 空目录或缺少全部客户端时，退出码不能让调用方以为校验通过。
+        print("没有执行任何检查；请先导出配置或安装参考客户端", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

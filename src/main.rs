@@ -140,7 +140,16 @@ async fn execute(cli: Cli) -> Result<()> {
             // `--to all` 不能留下半套文件，更不能把纯直连配置冒充成导出结果。
             let mut rendered = Vec::with_capacity(targets.len());
             for target in targets {
-                let value = dubhe::export::export(target, &nodes, &mut report)?;
+                // 失败时也要把跳过原因打出来，否则用户只看到「没有可用节点」。
+                let value = match dubhe::export::export(target, &nodes, &mut report) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if !report.notes.is_empty() {
+                            eprintln!("{}", report.notes.join("\n"));
+                        }
+                        return Err(error);
+                    }
+                };
                 rendered.push((target, serde_json::to_string_pretty(&value)? + "\n"));
             }
             std::fs::create_dir_all(&output)?;
