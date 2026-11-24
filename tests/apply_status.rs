@@ -594,10 +594,13 @@ async fn tls_rotation_keeps_revision_and_deployment_id() {
     cli.terminate().await;
 }
 
-/// 重建后立刻再来一次 HUP，不能把刚重建那一代的终态挤掉。
+/// 重建后立刻再来一次 HUP，最终状态必须仍指向重建成功的那一版。
 ///
-/// 时序：A 在跑 → 重建到 B 成功 → 新 future 尚未轮询 → 第二次 HUP 抢先
-/// `begin()`。旧实现会把 B 的暂存结果判为过期，最终 B 在服务但状态仍称 A。
+/// **边界**：这条用例在撤销 ready 屏障后仍然通过（实测 5/5）。原因是新的
+/// `run_with_tasks` 在第一次 poll 内就走到 `ready` 并提交，信号来不及插进
+/// 那段同步路径。所以它是一条语义冒烟，不是该竞态的确定性复现；屏障本身
+/// 由实现保证，`apply::tests::stale_attempt_cannot_overwrite_newer_record`
+/// 覆盖底层的不变量。
 #[tokio::test]
 async fn second_hangup_after_rebind_does_not_lose_the_applied_revision() {
     let echo = Echo::tcp("127.0.0.1", false).await;
@@ -610,17 +613,75 @@ async fn second_hangup_after_rebind_does_not_lose_the_applied_revision() {
     let next = config(next_proxy, api, Some(&deployment_id(0x0f)));
     cli.write_config(&next);
     cli.hangup();
-    // 不等终态，紧接着再发一次；第二次是无效候选，应当被拒且不抹掉前一次。
+
+    // 不等终态，紧接着发第二次：它必须在重建那一代提交之后才被处理。
+    // 这条用例测的是「信号先于 ready 到达」的时序；可靠性由协调器的
+    // ready 屏障保证，而不是由这里的时间间隔保证。
+    cli.write_config(&json!({"version": 1, "inbounds": []}));
     cli.hangup();
 
-    let settled = cli.wait_apply(api, 0).await;
-    // 无论先后，最终生效的必须是 B（重建那一版），且 revision 已推进。
-    assert_eq!(settled["active_revision"], 2, "{settled}");
+    // 必须等到**第二次**尝试进入终态：只看第一次终态会漏掉这个时序。
+    let settled = cli.wait_apply(api, 1).await;
+    assert_eq!(
+        settled["active_revision"], 2,
+        "重建那一代不得被后续 HUP 挤掉: {settled}"
+    );
     assert_eq!(
         settled["active_deployment_id"],
         deployment_id(0x0f),
-        "重建结果不得被后续 HUP 挤掉: {settled}"
+        "生效的必须仍是重建后的版本: {settled}"
+    );
+    assert_eq!(
+        settled["last_apply"]["result"], "rejected",
+        "第二次是无效候选: {settled}"
     );
     assert_eq!(connect_status(next_proxy, echo.address).await, 0);
     cli.terminate().await;
+}
+
+/// 重绑等待 ready 的屏障不能吞掉退出信号。
+///
+/// 之前的实现里，屏障内的 `interrupt`/`terminate` 分支是空块再 `continue`，
+/// 会跳过统一的取消与排空；一次 SIGTERM 不足以让进程退出。
+#[tokio::test]
+async fn sigterm_during_rebind_exits_on_first_signal() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let proxy = reserve_port();
+    let api = reserve_port();
+    let mut cli = Cli::spawn(&config(proxy, api, Some(&deployment_id(0x10))));
+    cli.wait_ready(proxy).await;
+
+    // 保持一条活连接，让旧实例的排空确实花时间，从而稳定落在屏障内。
+    let (mut live, _) = common::socks(
+        1,
+        address(echo.address),
+        SocketAddr::from(([127, 0, 0, 1], proxy)),
+    )
+    .await;
+    live.write_all(b"hold").await.unwrap();
+    let mut echoed = [0u8; 4];
+    live.read_exact(&mut echoed).await.unwrap();
+
+    let next_proxy = reserve_port();
+    cli.write_config(&config(next_proxy, api, Some(&deployment_id(0x11))));
+    cli.hangup();
+    // 立刻发一次 TERM：此时重绑正在进行，可能停在等待 ready 的分支。
+    let status = std::process::Command::new("/bin/kill")
+        .args(["-TERM", &cli.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let code = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = cli.child.try_wait().unwrap() {
+                return status;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("一次 SIGTERM 必须让进程退出，不能被重绑屏障吞掉");
+    assert!(code.success(), "退出码应为 0：{code:?}");
+    drop(live);
 }

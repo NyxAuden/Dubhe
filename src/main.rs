@@ -470,15 +470,23 @@ async fn run(path: PathBuf, mut config: Config) -> Result<()> {
                 // 等新实例 ready 提交终态，再重新接受 HUP。否则下一次 `begin()`
                 // 会把本次暂存结果判为过期：B 在服务，状态却仍称 A 生效。
                 // 等待期间仍响应退出与启动失败。
+                let mut exit = false;
                 tokio::select! {
                     result = &mut running => return result,
-                    _ = interrupt.recv() => {}
-                    _ = terminate.recv() => {}
+                    // 退出信号必须落到下面的统一排空：之前 `{}` + `continue`
+                    // 会吞掉这一次信号，进程要等第二次 TERM 才退出。
+                    _ = interrupt.recv() => exit = true,
+                    _ = terminate.recv() => exit = true,
                     _ = async {
                         while apply.has_staged() {
                             tokio::time::sleep(Duration::from_millis(5)).await;
                         }
                     } => {}
+                }
+                if exit {
+                    stop.cancel();
+                    running.await?;
+                    return Ok(());
                 }
                 continue;
             }
