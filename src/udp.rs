@@ -75,6 +75,26 @@ struct Packet {
     native: Option<(SocketAddr, u64)>,
 }
 impl Packet {
+    /// 从切片构造：**先拿字节额度，再复制**。
+    ///
+    /// 热路径（UDP 读循环）每包都会走到这里。此前先 `to_vec()` 再检查预算，
+    /// 预算不足时这次复制完全是浪费——高包率下等于给被丢弃的流量白付一次
+    /// 内存分配与拷贝。
+    fn reserve_slice(ctx: &Context, target: Target, payload: &[u8]) -> Option<Self> {
+        let permit = ctx
+            .udp_bytes
+            .clone()
+            .try_acquire_many_owned(u32::try_from(payload.len().max(1)).ok()?)
+            .ok()?;
+        Some(Self {
+            target,
+            payload: payload.to_vec(),
+            _budget: permit,
+            session: None,
+            native: None,
+        })
+    }
+
     fn reserve(ctx: &Context, target: Target, payload: Vec<u8>) -> Option<Self> {
         let permit = ctx
             .udp_bytes
@@ -217,7 +237,8 @@ impl RoutedUdp {
         if payload.len() > self.association.ctx.limits.max_udp_payload {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "UDP 载荷过长"));
         }
-        let packet = Packet::reserve(&self.association.ctx, self.target.clone(), payload.to_vec())
+        // 先领额度再复制：预算不足时不再白做一次 `to_vec`。
+        let packet = Packet::reserve_slice(&self.association.ctx, self.target.clone(), payload)
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "UDP 字节预算耗尽"))?;
         let result = timeout(
             Duration::from_millis(self.association.ctx.limits.dial_timeout_ms),
@@ -297,7 +318,7 @@ struct Mapping {
 }
 /// 上游 UDP 中继；具体承载由出站协议决定。
 struct Relay {
-    proxy: ProxyOutbound,
+    proxy: Arc<ProxyOutbound>,
     uplink: Uplink,
     tasks: JoinSet<()>,
     last_used: Arc<std::sync::Mutex<Instant>>,
@@ -530,8 +551,9 @@ impl Association {
                 "同一 UDP 关联不能混用反向 Portal 与其它上游",
             ));
         }
-        let proxy = selected.proxy.map(|proxy| (*proxy).clone());
-        if let Some(proxy) = proxy {
+        // 直接传递 `Arc`：此前每包都深拷贝一份出站配置，高包率下等于给
+        // 每个数据报额外做若干次字符串/结构分配。
+        if let Some(proxy) = selected.proxy.clone() {
             return self.send_proxy(proxy, &target, payload).await;
         }
         self.prepare_direct(&target).await?;
@@ -556,8 +578,8 @@ impl Association {
         if let Some(tag) = selected.reverse {
             return self.prepare_reverse(tag, target).await;
         }
-        if let Some(proxy) = selected.proxy {
-            return self.prepare_proxy((*proxy).clone(), target).await;
+        if let Some(proxy) = selected.proxy.clone() {
+            return self.prepare_proxy(proxy, target).await;
         }
         self.prepare_direct(target).await
     }
@@ -605,7 +627,7 @@ impl Association {
                         continue;
                     }
                     let Some(mut packet) =
-                        Packet::reserve(&ctx, address.into(), buffer[..n].to_vec())
+                        Packet::reserve_slice(&ctx, address.into(), &buffer[..n])
                     else {
                         ctx.stats.drop_packet();
                         continue;
@@ -726,7 +748,11 @@ impl Association {
         }
     }
 
-    async fn prepare_proxy(&mut self, proxy: ProxyOutbound, target: &Target) -> io::Result<()> {
+    async fn prepare_proxy(
+        &mut self,
+        proxy: Arc<ProxyOutbound>,
+        target: &Target,
+    ) -> io::Result<()> {
         if let Some(relay) = &self.relay {
             if relay.proxy != proxy {
                 return Err(io::Error::new(
@@ -775,7 +801,7 @@ impl Association {
 
     async fn send_proxy(
         &mut self,
-        proxy: ProxyOutbound,
+        proxy: Arc<ProxyOutbound>,
         target: &Target,
         payload: &[u8],
     ) -> io::Result<()> {
@@ -886,13 +912,13 @@ impl Association {
 
     fn establish_relay(
         &mut self,
-        proxy: ProxyOutbound,
+        proxy: Arc<ProxyOutbound>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + '_>> {
         // 多协议拨号状态机只在建立关联时分配，避免嵌入每个 UDP 数据面的 future。
         Box::pin(self.establish_relay_impl(proxy))
     }
 
-    async fn establish_relay_impl(&mut self, proxy: ProxyOutbound) -> io::Result<()> {
+    async fn establish_relay_impl(&mut self, proxy: Arc<ProxyOutbound>) -> io::Result<()> {
         let uplink = match proxy.kind {
             crate::config::OutboundKind::Socks5 => {
                 if proxy.via.is_some() {
@@ -926,8 +952,7 @@ impl Association {
                             ctx.stats.drop_packet();
                             continue;
                         }
-                        let Some(mut packet) = Packet::reserve(&ctx, target, payload.to_vec())
-                        else {
+                        let Some(mut packet) = Packet::reserve_slice(&ctx, target, payload) else {
                             ctx.stats.drop_packet();
                             continue;
                         };
@@ -1060,7 +1085,7 @@ impl Association {
                         }
                         let target = from_shadowsocks_address(address);
                         let Some(mut packet) =
-                            Packet::reserve(&ctx, target, buffer[..length].to_vec())
+                            Packet::reserve_slice(&ctx, target, &buffer[..length])
                         else {
                             ctx.stats.drop_packet();
                             continue;
@@ -2206,6 +2231,33 @@ mod tests {
             "出队并释放后才归还额度"
         );
     }
+    /// 预算不足时必须先拒绝，不能先复制再拒绝。
+    ///
+    /// 用测试专用计数分配器直接观测：预算只有 4 字节时，对 1 MiB 切片调用
+    /// `reserve_slice` 不允许发生任何分配。先复制再检查的实现会在这里分配
+    /// 1 MiB。
+    #[test]
+    fn reserve_slice_checks_budget_before_copying() {
+        let ctx = context(4, 4);
+        let target = Target::from("127.0.0.1:9".parse::<SocketAddr>().unwrap());
+        let payload = vec![1u8; 1024 * 1024];
+        let (result, allocations, bytes) =
+            crate::alloc_count::measure(|| Packet::reserve_slice(&ctx, target.clone(), &payload));
+        assert!(result.is_none(), "超出预算必须返回 None");
+        assert_eq!(
+            allocations, 0,
+            "预算不足时不得复制载荷，实际发生 {allocations} 次分配 / {bytes} 字节"
+        );
+        // 预算没有被这次失败消耗。
+        assert_eq!(ctx.udp_bytes.available_permits(), 4);
+        // 额度够时仍要正常工作。
+        let packet = Packet::reserve_slice(&ctx, target.clone(), &[2u8; 4]).unwrap();
+        assert_eq!(packet.payload.len(), 4);
+        assert_eq!(ctx.udp_bytes.available_permits(), 0);
+        drop(packet);
+        assert_eq!(ctx.udp_bytes.available_permits(), 4);
+    }
+
     #[tokio::test]
     async fn byte_budget_empty_packets_and_full_queue_release_permits() {
         let ctx = context(4, 1);

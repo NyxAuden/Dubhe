@@ -1206,7 +1206,7 @@ struct UdpInner {
 }
 
 struct MuxRelay {
-    proxy: ProxyOutbound,
+    proxy: Arc<ProxyOutbound>,
     socket: Arc<UdpSocket>,
     // 仅用于保活；丢弃连接即通知上游释放 UDP 关联。
     _control: crate::forward::RelayControl,
@@ -1297,7 +1297,8 @@ impl UdpInner {
         // `reverse` 出站的 proxy 为空，但它是独立上游；只判断 `.proxy`
         // 会把它当直连，把反向目标当普通目标发出去。
         selected.udp_proxied()?;
-        let proxy = selected.proxy.map(|proxy| (*proxy).clone());
+        // 传 `Arc`：此前每包深拷贝一份出站配置。
+        let proxy = selected.proxy.clone();
         if payload.len() > self.ctx.limits.max_udp_payload {
             return Err(invalid("Mux UDP 载荷过长"));
         }
@@ -1412,7 +1413,7 @@ impl UdpInner {
     /// 经 SOCKS5 上游转发；同一关联只允许一个上游。
     async fn send_proxy(
         self: &Arc<Self>,
-        proxy: ProxyOutbound,
+        proxy: Arc<ProxyOutbound>,
         target: Target,
         payload: &[u8],
         deadline: Duration,
@@ -1432,7 +1433,7 @@ impl UdpInner {
             previous.task.abort();
         }
         if let Some(existing) = relay.as_ref() {
-            if existing.proxy != proxy {
+            if !Arc::ptr_eq(&existing.proxy, &proxy) && *existing.proxy != *proxy {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "同一 Mux UDP 关联只能使用同一个上游代理",
