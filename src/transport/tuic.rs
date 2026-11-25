@@ -574,6 +574,19 @@ impl SessionShared {
             self.ctx.stats.drop_packet();
             return;
         }
+        // 新会话准入：到期账户不应开新 UDP 关联。
+        let identity = match &*self.auth.borrow() {
+            AuthState::Authenticated(index) => self
+                .options
+                .users
+                .get(*index)
+                .map(|credential| credential.name.as_str()),
+            _ => None,
+        };
+        if !self.ctx.stats.admit_user(&self.tag, identity) {
+            self.ctx.stats.drop_packet();
+            return;
+        }
         let Ok(slot) = self.ctx.udp_slots.clone().try_acquire_owned() else {
             self.ctx.stats.drop_packet();
             return;

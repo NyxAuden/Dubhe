@@ -564,3 +564,58 @@ async fn exhausted_quota_rejects_new_authenticated_connections() {
     drop(stream);
     server.shutdown().await;
 }
+
+/// 到期账户不能开新业务，且拒绝时必须**没有上游副作用**。
+///
+/// astra 复核发现若干入口只计字节、不查准入：Mixed/ShadowTLS 的 SOCKS、
+/// BIND、HTTPS H2、Naive H2、Snell、Mux 新子流、UDP 新关联、反向载体。
+/// 这条用例用真实连接验证「拒绝发生在上游连接之前」。
+#[tokio::test]
+async fn expired_user_creates_no_upstream_connection() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+
+    let mut config = socks_config();
+    config["inbounds"][0] = json!({
+        "type": "socks5",
+        "tag": "socks",
+        "listen": "127.0.0.1:0",
+        "users": [{"name": "alice", "password": "secret-password"}]
+    });
+    config["api"] = json!({"listen":"127.0.0.1:0","token":TOKEN});
+    let server = Running::start(config).await;
+    let api = server.api_address.expect("API 已绑定");
+
+    let (head, _) = request(
+        api,
+        format!(
+            "POST /stats/users/limits?inbound=socks&user=alice&expires_at_ms=1 \
+             HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 0\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    stream.write_all(&[5, 1, 2]).await.unwrap();
+    let mut method = [0u8; 2];
+    stream.read_exact(&mut method).await.unwrap();
+    let mut auth = vec![1, 5];
+    auth.extend_from_slice(b"alice");
+    auth.push(b"secret-password".len() as u8);
+    auth.extend_from_slice(b"secret-password");
+    stream.write_all(&auth).await.unwrap();
+    let mut status = [0u8; 2];
+    stream.read_exact(&mut status).await.unwrap();
+    assert_eq!(status, [1, 0]);
+
+    let mut connect_request = vec![5, 1, 0];
+    connect_request.extend(domain("localhost", echo.address.port()));
+    stream.write_all(&connect_request).await.unwrap();
+    let mut reply = [0u8; 2];
+    let read = timeout(Duration::from_secs(2), stream.read_exact(&mut reply)).await;
+    let rejected = !matches!(&read, Ok(Ok(_))) || reply[1] != 0;
+    assert!(rejected, "到期账户不能建立新业务连接: {read:?} {reply:?}");
+    drop(stream);
+    server.shutdown().await;
+}

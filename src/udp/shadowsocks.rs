@@ -449,6 +449,14 @@ impl Dispatcher {
                 if !accepting {
                     return Err(io::ErrorKind::Interrupted.into());
                 }
+                // 准入在申请槽与建 socket 之前：到期账户不应开新 UDP 会话。
+                let name = self.prepared.user_name(key.identity);
+                if !self.ctx.stats.admit_user(&self.tag, name.as_deref()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "账户配额已用尽或已到期",
+                    ));
+                }
                 let slot = self
                     .ctx
                     .udp_slots

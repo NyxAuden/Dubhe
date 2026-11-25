@@ -737,6 +737,18 @@ impl Mux {
                     self.enqueue(encode_end(id, true)).await?;
                     return Ok(());
                 }
+                // 每条**新子流**都要准入：承载在认证时已通过一次，但到期或
+                // 配额用尽的账户不能再开新子流。
+                if !self
+                    .ctx
+                    .stats
+                    .admit_user(&self.inbound, self.user_id.as_deref())
+                {
+                    self.ctx.stats.reject();
+                    self.discard(payload);
+                    self.enqueue(encode_end(id, true)).await?;
+                    return Ok(());
+                }
                 let generation = next_token();
                 match network {
                     Network::Tcp => self.create_tcp(id, generation, target, payload).await?,
@@ -807,7 +819,13 @@ impl Mux {
             self.enqueue(encode_end(id, true)).await?;
             return Ok(());
         }
-        if self.ctx.udp_selected(&self.inbound, &target).await.is_err() {
+        // `udp_selected` 本身不会因 reverse 报错；这里一并拒绝，
+        // 让会话在建立阶段就以 End 失败关闭，而不是等到发送才失败。
+        let allowed = match self.ctx.udp_selected(&self.inbound, &target).await {
+            Ok(selected) => selected.udp_proxied().is_ok(),
+            Err(_) => false,
+        };
+        if !allowed {
             self.discard(payload);
             self.enqueue(encode_end(id, true)).await?;
             return Ok(());
@@ -1275,12 +1293,11 @@ impl UdpInner {
     async fn send(self: &Arc<Self>, target: Target, payload: &[u8]) -> io::Result<()> {
         // QUIC Initial SNI 只参与出站选择，实际发送目标保持不变。
         let route = self.ctx.udp_route_target(&self.inbound, &target, payload);
-        let proxy = self
-            .ctx
-            .udp_selected(&self.inbound, &route)
-            .await?
-            .proxy
-            .map(|proxy| (*proxy).clone());
+        let selected = self.ctx.udp_selected(&self.inbound, &route).await?;
+        // `reverse` 出站的 proxy 为空，但它是独立上游；只判断 `.proxy`
+        // 会把它当直连，把反向目标当普通目标发出去。
+        selected.udp_proxied()?;
+        let proxy = selected.proxy.map(|proxy| (*proxy).clone());
         if payload.len() > self.ctx.limits.max_udp_payload {
             return Err(invalid("Mux UDP 载荷过长"));
         }

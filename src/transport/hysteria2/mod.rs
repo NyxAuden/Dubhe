@@ -706,8 +706,9 @@ async fn run_connection(
         let udp_traffic = user
             .as_ref()
             .map(|name| ctx.stats.user_counter(&options.tag, name));
+        let udp_user = user.clone();
         tasks.spawn(async move {
-            udp_loop(udp_connection, udp_options, udp_ctx, udp_traffic).await;
+            udp_loop(udp_connection, udp_options, udp_ctx, udp_traffic, udp_user).await;
         });
     }
     let streams = Arc::new(Semaphore::new(options.max_streams));
@@ -844,6 +845,8 @@ async fn udp_loop(
     options: Arc<Options>,
     ctx: Arc<Context>,
     traffic: Option<Arc<crate::telemetry::UserCounters>>,
+    // 已认证用户名；准入要按账户判定，而 `traffic` 只是计数器。
+    user: Option<String>,
 ) {
     let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -881,6 +884,7 @@ async fn udp_loop(
         };
         dispatch_packet(
             &sessions,
+            user.as_deref(),
             &mut tasks,
             &connection,
             &ctx,
@@ -901,6 +905,7 @@ type Activity = Arc<Mutex<Instant>>;
 #[allow(clippy::too_many_arguments)]
 fn dispatch_packet(
     sessions: &SessionMap,
+    user: Option<&str>,
     tasks: &mut JoinSet<()>,
     connection: &Connection,
     ctx: &Arc<Context>,
@@ -914,6 +919,11 @@ fn dispatch_packet(
     let sender = match existing {
         Some(sender) => sender,
         None => {
+            // 新会话准入：到期账户不应开新 UDP 关联。
+            if !ctx.stats.admit_user(&options.tag, user) {
+                ctx.stats.reject();
+                return;
+            }
             let Ok(slot) = ctx.udp_slots.clone().try_acquire_owned() else {
                 ctx.stats.reject();
                 return;

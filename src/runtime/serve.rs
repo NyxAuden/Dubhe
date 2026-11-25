@@ -12,12 +12,21 @@ pub(super) const REVERSE_TARGET: &str = "v1.rvs.cool";
 pub(super) fn serve_reverse<S>(
     stream: S,
     inbound: &str,
+    user: Option<&str>,
     declared: Option<&str>,
     ctx: Arc<Context>,
 ) -> io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // 反向载体也是「新业务」：到期或配额用尽的账户不能再注册隧道，
+    // 否则它仍能把 Portal 的流量引到自己这里。
+    if !ctx.stats.admit_user(inbound, user) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "账户配额已用尽或已到期",
+        ));
+    }
     // 优先用 `users[].reverse.tag` 声明的归属（Xray 写法）。
     // 未声明时默认拒绝：否则任何已认证账户只要命中 reverse 路由就能成为
     // Portal 载体。旧行为需显式打开 `reverse_route_fallback`。
@@ -70,9 +79,9 @@ pub(super) async fn serve_controlled_vless<
         return match accepted.vision {
             Some(uuid) => {
                 let stream = tls::vision::Vision::new(stream, uuid);
-                serve_reverse(stream, tag, declared.as_deref(), ctx)
+                serve_reverse(stream, tag, user.as_deref(), declared.as_deref(), ctx)
             }
-            None => serve_reverse(stream, tag, declared.as_deref(), ctx),
+            None => serve_reverse(stream, tag, user.as_deref(), declared.as_deref(), ctx),
         };
     }
     // 命令 3 与「命令 1 + v1.mux.cool」都进入复用层；Vision 包装保持不变。
@@ -201,9 +210,9 @@ pub(super) async fn serve_plain_vision_vless_impl<
         return match accepted.vision {
             Some(uuid) => {
                 let stream = tls::vision::Vision::new_plain(stream, uuid);
-                serve_reverse(stream, tag, declared.as_deref(), ctx)
+                serve_reverse(stream, tag, user.as_deref(), declared.as_deref(), ctx)
             }
-            None => serve_reverse(stream, tag, declared.as_deref(), ctx),
+            None => serve_reverse(stream, tag, user.as_deref(), declared.as_deref(), ctx),
         };
     }
     // 命令 3 与「命令 1 + v1.mux.cool」都进入复用层；Vision 包装保持不变。
@@ -679,7 +688,7 @@ pub(crate) async fn serve_plain_vless_scoped<
         timeout(deadline, vless::reply(&mut stream))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "应答超时"))??;
-        return serve_reverse(stream, tag, declared.as_deref(), ctx);
+        return serve_reverse(stream, tag, user.as_deref(), declared.as_deref(), ctx);
     }
     let request = match accepted {
         vless::Accepted::Single(request) => request,
@@ -795,6 +804,14 @@ where
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "握手超时"))??;
     drop(handshake);
+    // 准入必须在拨号/建监听之前：`serve_socks5_stream` 没有便宜的身份传递
+    // 路径，所以在这里查一次。
+    if !ctx.stats.admit_user(tag, request.user.as_deref()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "账户配额已用尽或已到期",
+        ));
+    }
     match request.command {
         Command::Connect => serve_socks5_connect(stream, tag, ctx, deadline, request.target).await,
         _ => Err(io::Error::new(
@@ -833,7 +850,15 @@ pub(super) async fn serve_socks5(
             )
             .await
         }
-        Command::Bind => serve_socks5_bind(stream, tag, ctx, deadline, request.target).await,
+        Command::Bind => {
+            if !ctx.stats.admit_user(tag, user.as_deref()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "账户配额已用尽或已到期",
+                ));
+            }
+            serve_socks5_bind(stream, tag, ctx, deadline, request.target).await
+        }
     }
 }
 
@@ -853,6 +878,12 @@ where
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "握手超时"))??;
     drop(handshake);
+    if !ctx.stats.admit_user(tag, request.user.as_deref()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "账户配额已用尽或已到期",
+        ));
+    }
     match request.command {
         Command::Connect => serve_socks5_connect(stream, tag, ctx, deadline, request.target).await,
         Command::UdpAssociate | Command::Bind => {
@@ -1144,6 +1175,15 @@ where
                     Ok(send) => send,
                     Err(_) => break,
                 };
+                // 准入必须在回 200 与拨号之前：否则到期账户仍能触发 DNS/
+                // 上游连接，并从状态码区分目标是否可达。
+                if !ctx.stats.admit_user(tag, user.as_deref()) {
+                    let _ = respond.send_response(
+                        Response::builder().status(StatusCode::FORBIDDEN).body(()).unwrap(),
+                        true,
+                    );
+                    continue;
+                }
                 let tunnel = crate::transport::xhttp::Tunnel::new(
                     crate::transport::xhttp::H2Reader::new(request.into_body()),
                     crate::transport::xhttp::H2Writer::new(send),

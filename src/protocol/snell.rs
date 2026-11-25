@@ -373,6 +373,15 @@ where
                     .map(|name| ctx.stats.user_counter(tag, name));
                 drop(handshake.take());
 
+                // 准入在拨号之前：到期/超配额账户不应触发 DNS 或上游连接。
+                let name = user.and_then(|user| user.name.as_deref());
+                if !ctx.stats.admit_user(tag, name) {
+                    // 与上游一致：先回失败应答再关闭，不让客户端干等。
+                    let writer = io.writer(&prepared.psk).await?;
+                    let _ = writer.write_record(&[REPLY_TUNNEL, 1]).await;
+                    return Ok(());
+                }
+
                 let target = request
                     .target
                     .ok_or_else(|| invalid("Snell CONNECT 缺少目标地址"))?;
@@ -429,6 +438,13 @@ where
                 drop(handshake.take());
                 if !early.is_empty() {
                     return Err(invalid("Snell UDP 请求携带多余数据"));
+                }
+                let name = user.and_then(|user| user.name.as_deref());
+                if !ctx.stats.admit_user(tag, name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "账户配额已用尽或已到期",
+                    ));
                 }
 
                 let writer = io.writer(&prepared.psk).await?;

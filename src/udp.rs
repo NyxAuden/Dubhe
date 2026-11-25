@@ -1639,6 +1639,13 @@ pub async fn socks(
     user: Option<&str>,
 ) -> io::Result<()> {
     let traffic = user.map(|user| ctx.stats.user_counter(&inbound, user));
+    // 准入在申请关联槽与建 socket 之前：到期账户不应开新 UDP 关联。
+    if !ctx.stats.admit_user(&inbound, user) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "账户配额已用尽或已到期",
+        ));
+    }
     let deadline = Duration::from_millis(ctx.limits.handshake_timeout_ms);
     let prepared = async {
         let slot = ctx
@@ -2058,6 +2065,13 @@ async fn framed<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     user: Option<&str>,
 ) -> io::Result<()> {
     let traffic = user.map(|user| ctx.stats.user_counter(&inbound, user));
+    // 准入在申请关联槽之前：到期账户不应开新 UDP 关联。
+    if !ctx.stats.admit_user(&inbound, user) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "账户配额已用尽或已到期",
+        ));
+    }
     let _slot = ctx
         .udp_slots
         .clone()

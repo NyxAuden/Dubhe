@@ -480,7 +480,7 @@ impl Selected {
     /// UDP 快路径（dokodemo / TUIC / Hysteria2 / Snell / Shadowsocks）只实现
     /// 直连与共享代理中继。`reverse` 是独立上游，`proxy` 为空但绝不是直连；
     /// 在这些路径里必须失败关闭，不能把反向目标当成本地上游发出去。
-    pub(crate) fn udp_proxied(&self) -> std::io::Result<bool> {
+    pub fn udp_proxied(&self) -> std::io::Result<bool> {
         if self.reverse.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -2719,5 +2719,51 @@ mod udp_reverse_tests {
             },
         );
         assert!(!direct.udp_proxied().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod mux_udp_reverse_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Mux 的 UDP 快路径同样不能把 `reverse` 当直连。
+    ///
+    /// 这正是 dokodemo / TUIC / Hysteria2 / Snell / SS 已修过、但 Mux 漏掉的
+    /// 同一类问题：`reverse` 的 `proxy` 为空，只看 `.proxy` 就会静默直连。
+    #[test]
+    fn mux_udp_rejects_reverse_instead_of_dialing_direct() {
+        let config = Config::from_json(
+            &json!({
+                "version": 1,
+                "inbounds": [{"type": "socks5", "tag": "socks", "listen": "127.0.0.1:0"}],
+                "outbounds": [
+                    {"type": "direct", "tag": "direct"},
+                    {"type": "reverse", "tag": "portal", "domain": "v1.rvs.cool"}
+                ],
+                "route": {"default": "direct", "rules": [
+                    {"domains": ["portal.test"], "outbound": "portal"}
+                ]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let router = Router::new(&config).unwrap();
+        let selected = router.select_outbound(
+            "socks",
+            Network::Udp,
+            &Target {
+                host: Host::Domain("portal.test".to_owned()),
+                port: 443,
+            },
+        );
+        assert!(
+            selected.proxy.is_none(),
+            "reverse 出站不应带 proxy，这正是它会被误判为直连的原因"
+        );
+        assert!(
+            selected.udp_proxied().is_err(),
+            "Mux UDP 必须对 reverse 失败关闭"
+        );
     }
 }
