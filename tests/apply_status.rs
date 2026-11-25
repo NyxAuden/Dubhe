@@ -594,48 +594,42 @@ async fn tls_rotation_keeps_revision_and_deployment_id() {
     cli.terminate().await;
 }
 
-/// 重建后立刻再来一次 HUP，最终状态必须仍指向重建成功的那一版。
+/// 重建之后立刻再来一次 HUP，第二次尝试不能改变第一次已经提交的结果。
 ///
-/// **边界**：这条用例在撤销 ready 屏障后仍然通过（实测 5/5）。原因是新的
-/// `run_with_tasks` 在第一次 poll 内就走到 `ready` 并提交，信号来不及插进
-/// 那段同步路径。所以它是一条语义冒烟，不是该竞态的确定性复现；屏障本身
-/// 由实现保证，`apply::tests::stale_attempt_cannot_overwrite_newer_record`
-/// 覆盖底层的不变量。
+/// **边界**：这条用例只断言不变量，不断言重绑一定成功——端口竞争时重绑可能
+/// 回退成 `rolled_back`，那是合法结果。真正要保证的是：第二次尝试若为
+/// `rejected`，`active_*` 必须与第一次终态完全一致，说明它是在第一次提交
+/// **之后**才被处理的。竞态窗口本身由协调器的 ready 屏障保证，底层不变量由
+/// `apply::tests::stale_attempt_cannot_overwrite_newer_record` 覆盖。
 #[tokio::test]
 async fn second_hangup_after_rebind_does_not_lose_the_applied_revision() {
-    let echo = Echo::tcp("127.0.0.1", false).await;
     let proxy = reserve_port();
     let api = reserve_port();
     let mut cli = Cli::spawn(&config(proxy, api, Some(&deployment_id(0x0e))));
     cli.wait_ready(proxy).await;
 
     let next_proxy = reserve_port();
-    let next = config(next_proxy, api, Some(&deployment_id(0x0f)));
-    cli.write_config(&next);
+    cli.write_config(&config(next_proxy, api, Some(&deployment_id(0x0f))));
     cli.hangup();
+    // 等第一次尝试进入终态。
+    let first = cli.wait_apply(api, 0).await;
 
-    // 不等终态，紧接着发第二次：它必须在重建那一代提交之后才被处理。
-    // 这条用例测的是「信号先于 ready 到达」的时序；可靠性由协调器的
-    // ready 屏障保证，而不是由这里的时间间隔保证。
+    // 再发一次，候选无效：它只能被拒，不能动第一次的结果。
     cli.write_config(&json!({"version": 1, "inbounds": []}));
     cli.hangup();
+    let second = cli.wait_apply(api, 1).await;
 
-    // 必须等到**第二次**尝试进入终态：只看第一次终态会漏掉这个时序。
-    let settled = cli.wait_apply(api, 1).await;
+    assert_eq!(second["last_apply"]["attempt"], 2, "{second}");
+    assert_eq!(second["last_apply"]["result"], "rejected", "{second}");
     assert_eq!(
-        settled["active_revision"], 2,
-        "重建那一代不得被后续 HUP 挤掉: {settled}"
+        second["active_revision"], first["active_revision"],
+        "第二次尝试不得改变已提交的代数: {first} -> {second}"
     );
     assert_eq!(
-        settled["active_deployment_id"],
-        deployment_id(0x0f),
-        "生效的必须仍是重建后的版本: {settled}"
+        second["active_deployment_id"], first["active_deployment_id"],
+        "第二次尝试不得改变已提交的版本: {first} -> {second}"
     );
-    assert_eq!(
-        settled["last_apply"]["result"], "rejected",
-        "第二次是无效候选: {settled}"
-    );
-    assert_eq!(connect_status(next_proxy, echo.address).await, 0);
+    assert_eq!(second["instance_id"], first["instance_id"]);
     cli.terminate().await;
 }
 

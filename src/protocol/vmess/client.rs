@@ -163,10 +163,17 @@ pub(crate) async fn handshake_request<S: AsyncWrite + Unpin>(
     )?;
     let encrypted_header = seal_request(&command_key, &id, &connection_nonce, false, &header)?;
 
-    io.write_all(&id).await?;
-    io.write_all(&encrypted_length).await?;
-    io.write_all(&connection_nonce).await?;
-    io.write_all(&encrypted_header).await?;
+    // 一次写入：上游 sing-vmess 的默认保护路径只读一次，初读不足就判
+    // `bad header`。分四次写会让单次读取只拿到前缀，实测对 sing-box 服务端
+    // 3/3 首包失败（合写后 3/3 通过）。
+    let mut request = Vec::with_capacity(
+        id.len() + encrypted_length.len() + connection_nonce.len() + encrypted_header.len(),
+    );
+    request.extend_from_slice(&id);
+    request.extend_from_slice(&encrypted_length);
+    request.extend_from_slice(&connection_nonce);
+    request.extend_from_slice(&encrypted_header);
+    io.write_all(&request).await?;
     io.flush().await?;
     Ok(State {
         security,
@@ -174,4 +181,71 @@ pub(crate) async fn handshake_request<S: AsyncWrite + Unpin>(
         key,
         iv,
     })
+}
+
+#[cfg(test)]
+mod request_write_tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    /// 记录每次 `poll_write` 的载荷长度，用来断言请求头是**一次**写出。
+    struct Recorder {
+        writes: Vec<usize>,
+        total: usize,
+    }
+
+    impl AsyncWrite for Recorder {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.push(buf.len());
+            self.total += buf.len();
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// VMess AEAD 请求头必须一次写出。
+    ///
+    /// 上游 sing-vmess 的默认保护路径只读一次，初读不足 100 B 就判
+    /// `bad header`。此前分四次 `write_all`（id / 长度 / nonce / 头），
+    /// 实测对 sing-box 服务端 3/3 首包失败；合写后 3/3 通过。
+    #[tokio::test]
+    async fn request_head_is_written_in_one_piece() {
+        let uuid = [0x11; 16];
+        let target = Target {
+            host: crate::session::Host::Domain("example.test".to_owned()),
+            port: 443,
+        };
+        let mut io = Recorder {
+            writes: Vec::new(),
+            total: 0,
+        };
+        handshake_request(&mut io, &uuid, &target, 3, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            io.writes.len(),
+            1,
+            "请求头必须一次写出，实际分 {} 次：{:?}",
+            io.writes.len(),
+            io.writes
+        );
+        // id(16) + 长度密文 + nonce(8) + 头密文：至少要能满足上游一次读完。
+        assert!(
+            io.total >= 100,
+            "单次写入应足够上游一次读完，实际 {} 字节",
+            io.total
+        );
+    }
 }
