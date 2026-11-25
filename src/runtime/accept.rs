@@ -353,6 +353,35 @@ pub(super) async fn accept_loop(
     }
 }
 
+/// VLESS 认证收尾：超时、释放握手许可、交给业务分派。
+///
+/// 快路径与 `handle_inner` 的 `Vless`/无 TLS 分支共用这一份实现，避免两处
+/// 分叉——此前快路径漏掉 `set_nodelay` 正是分叉造成的。
+///
+/// `serve_plain_vless` 自身已处理 Single / Mux / 反向三种 `Accepted`，
+/// 所以这里不需要回落到完整分派。
+async fn vless_accept<S>(
+    mut stream: S,
+    tag: &str,
+    users: &[crate::config::VlessUser],
+    xudp: bool,
+    ctx: Arc<Context>,
+    deadline: Duration,
+    handshake: HandshakePermits,
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let accepted = timeout(
+        deadline,
+        vless::handshake_with_xudp(&mut stream, users, xudp),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "认证超时"))??;
+    drop(handshake);
+    serve_plain_vless(stream, accepted, tag, ctx, deadline, xudp).await
+}
+
 // 入站分派的固定上下文：共享资源用 Arc，协议专用状态用 Option。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle(
@@ -365,10 +394,35 @@ pub(super) async fn handle(
     ctx: Arc<Context>,
     handshake: HandshakePermits,
 ) -> io::Result<()> {
-    // 这个函数把 26 个协议分支内联在同一个 match 里，future 大小等于各分支
-    // 的并集。实测每连接约 97 KB（3000 条半开连接 +285 MB；握手完成后
-    // 降到 4.8 KB，说明大头是握手期的状态机，不是稳态缓冲）。
-    // 整体装箱后，调用方按值复制的不再是巨型状态机，而是一个指针。
+    // 两条路径都需要的 socket 初始化，放在分派之前，保证恰好执行一次。
+    stream.set_nodelay(true)?;
+    // 最省内存的形态先分派出去：明文 VLESS（无 TLS、无 Encryption、
+    // 无 fallback）。它的 future 只含认证与转发所需状态，不再与
+    // gRPC/XHTTP/REALITY 等分支共享暂停状态。
+    //
+    // 收益来源是 future 布局，不是「少用了某个协议分支」：`handle_inner`
+    // 的 future 是 26 个分支的并集，release 布局 44,400 B；明文专用入口
+    // 10,528 B。每连接节省约 33 KiB 的状态机，另有 RSS 差额来自分配器。
+    if tls.is_none()
+        && vless_encryption.is_none()
+        && let Inbound::Vless {
+            tag,
+            users,
+            xudp,
+            fallbacks,
+            ..
+        } = config
+        && fallbacks.is_empty()
+    {
+        let deadline = Duration::from_millis(ctx.limits.handshake_timeout_ms);
+        return Box::pin(vless_accept(
+            stream, tag, users, *xudp, ctx, deadline, handshake,
+        ))
+        .await;
+    }
+    // 其余分支仍走完整分派：这个函数把 26 个协议分支内联在同一个 match 里，
+    // future 大小等于各分支的并集。整体装箱后，调用方按值复制的不再是巨型
+    // 状态机，而是一个指针。
     Box::pin(handle_inner(
         stream,
         config,
@@ -393,7 +447,6 @@ async fn handle_inner(
     ctx: Arc<Context>,
     handshake: HandshakePermits,
 ) -> io::Result<()> {
-    stream.set_nodelay(true)?;
     let deadline = Duration::from_millis(ctx.limits.handshake_timeout_ms);
     match config {
         Inbound::Socks5 { tag, users, .. } => {
@@ -527,7 +580,8 @@ async fn handle_inner(
             let Some(acceptor) = tls else {
                 // 无 TLS：Xray 明文 VLESS；VLESS Encryption 可作为协议层加密，
                 // Vision/fallback 仍由配置校验拒绝。
-                let mut stream: Box<dyn tls::Io> = match vless_encryption {
+                // 共享认证收尾：与前置快路径同一份实现。
+                let stream: Box<dyn tls::Io> = match vless_encryption {
                     Some(decryption) => Box::new(
                         timeout(deadline, decryption.accept(stream))
                             .await
@@ -537,14 +591,7 @@ async fn handle_inner(
                     ),
                     None => Box::new(stream),
                 };
-                let accepted = timeout(
-                    deadline,
-                    vless::handshake_with_xudp(&mut stream, users, *xudp),
-                )
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "认证超时"))??;
-                drop(handshake);
-                return serve_plain_vless(stream, accepted, tag, ctx, deadline, *xudp).await;
+                return vless_accept(stream, tag, users, *xudp, ctx, deadline, handshake).await;
             };
             if users
                 .iter()
