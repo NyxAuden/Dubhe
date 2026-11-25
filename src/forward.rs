@@ -1356,6 +1356,27 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    relay_sized(client, target, stats, COPY_BLOCK, COPY_BLOCK).await
+}
+
+/// 默认中继块；与 Tokio 的 `DEFAULT_BUF_SIZE` 一致。
+pub(crate) const COPY_BLOCK: usize = 8 * 1024;
+
+/// 双向块大小不对称的中继：`uplink` 是 client→target，`downlink` 是 target→client。
+///
+/// 只给确有证据的协议使用。块越大，每条连接多占 `uplink + downlink - 16 KiB`
+/// 的常驻缓冲；不要全局放大。
+pub(crate) async fn relay_sized<S, T>(
+    client: S,
+    target: T,
+    stats: Arc<Stats>,
+    uplink: usize,
+    downlink: usize,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     let _flow = stats.enter(Gauge::Tcp);
     let idle = stats.idle_timeout();
     let client = Counted {
@@ -1369,7 +1390,7 @@ where
         uplink: true,
     };
     // Tokio 的双向复制在单向 EOF 后关闭对应写端，继续排空另一方向。
-    copy_with_idle(client, target, idle).await
+    copy_with_idle_sizes(client, target, idle, uplink, downlink).await
 }
 
 /// 带空闲超时的双向复制；供不经 `relay` 的中继路径复用同一语义。
@@ -1378,10 +1399,26 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    copy_with_idle_sizes(client, target, idle, COPY_BLOCK, COPY_BLOCK).await
+}
+
+/// 同 [`copy_with_idle`]，但两个方向可以各自指定块大小。
+async fn copy_with_idle_sizes<S, T>(
+    client: S,
+    target: T,
+    idle: Option<Duration>,
+    uplink: usize,
+    downlink: usize,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     let Some(idle) = idle else {
         let mut client = client;
         let mut target = target;
-        tokio::io::copy_bidirectional(&mut client, &mut target).await?;
+        tokio::io::copy_bidirectional_with_sizes(&mut client, &mut target, uplink, downlink)
+            .await?;
         return Ok(());
     };
     let activity = Arc::new(std::sync::atomic::AtomicU64::new(now_millis()));
@@ -1394,7 +1431,7 @@ where
         activity: activity.clone(),
     };
     tokio::select! {
-        result = tokio::io::copy_bidirectional(&mut client, &mut target) => {
+        result = tokio::io::copy_bidirectional_with_sizes(&mut client, &mut target, uplink, downlink) => {
             result?;
         }
         () = idle_watchdog(activity, idle) => {

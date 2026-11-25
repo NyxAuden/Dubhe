@@ -664,7 +664,15 @@ impl DecryptedReader {
 enum EncryptWriteState {
     AssembleHeader,
     AssemblePacket,
-    Writing { pos: usize },
+    Writing {
+        pos: usize,
+        /// 组装这条记录时实际加密的明文长度。
+        ///
+        /// 不能在写完时返回当前 `buf.len()`：底层返回 `Pending` 后，复制器
+        /// 可以再读一些数据，把**同一前缀、更长的 slice** 传回来。那时
+        /// `buf.len()` 大于真正发送的字节数，复制器会跳过从未发送的尾部。
+        plain_len: usize,
+    },
 }
 
 /// Writer wrapper that will encrypt data automatically
@@ -870,7 +878,8 @@ impl EncryptedWriter {
                     unsafe { self.buffer.advance_mut(self.cipher.tag_len()) };
 
                     // Step 3. Write all
-                    self.state = EncryptWriteState::Writing { pos: 0 };
+                    let plain_len = buf.len();
+                    self.state = EncryptWriteState::Writing { pos: 0, plain_len };
                 }
 
                 EncryptWriteState::AssemblePacket => {
@@ -899,9 +908,13 @@ impl EncryptedWriter {
                     unsafe { self.buffer.advance_mut(self.cipher.tag_len()) };
 
                     // Step 3. Write all
-                    self.state = EncryptWriteState::Writing { pos: 0 };
+                    let plain_len = buf.len();
+                    self.state = EncryptWriteState::Writing { pos: 0, plain_len };
                 }
-                EncryptWriteState::Writing { ref mut pos } => {
+                EncryptWriteState::Writing {
+                    ref mut pos,
+                    plain_len,
+                } => {
                     while *pos < self.buffer.len() {
                         let n =
                             ready!(Pin::new(&mut *stream).poll_write(cx, &self.buffer[*pos..]))?;
@@ -915,9 +928,103 @@ impl EncryptedWriter {
                     self.state = EncryptWriteState::AssemblePacket;
                     self.buffer.clear();
 
-                    return Ok(buf.len()).into();
+                    // 调用方在 `Pending` 之后必须用同一前缀重试；切片变短说明
+                    // 它换了一份数据，继续按旧记录返回成功会错位。
+                    if buf.len() < plain_len {
+                        return Err(ErrorKind::InvalidInput.into()).into();
+                    }
+                    return Ok(plain_len).into();
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod write_length_tests {
+    use super::*;
+    use std::task::{Poll, Waker};
+
+    /// 短写之后再 `Pending`，复制器会用**更长**的切片重试；此时只能确认
+    /// 本次真正加密的明文长度。
+    ///
+    /// 修复前返回当前 `buf.len()`：本用例第一次加密 3 字节、只写出 3 字节
+    /// 后 Pending，重试传入 6 字节；旧实现报成功 6，复制器会跳过从未加密的
+    /// 后 3 字节。
+    #[test]
+    fn pending_retry_does_not_confirm_bytes_that_were_never_encrypted() {
+        struct ShortThenPending {
+            output: Vec<u8>,
+            /// 0 = 只接受 3 字节；1 = Pending；>=2 = 全部接受。
+            stage: u8,
+        }
+
+        impl tokio::io::AsyncWrite for ShortThenPending {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut task::Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                match self.stage {
+                    0 => {
+                        self.stage = 1;
+                        let n = buf.len().min(3);
+                        self.output.extend_from_slice(&buf[..n]);
+                        Poll::Ready(Ok(n))
+                    }
+                    1 => {
+                        self.stage = 2;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    _ => {
+                        self.output.extend_from_slice(buf);
+                        Poll::Ready(Ok(buf.len()))
+                    }
+                }
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut writer = EncryptedWriter::new(
+            StreamType::Client,
+            CipherKind::AEAD2022_BLAKE3_AES_128_GCM,
+            &[0x11; 16],
+            &[0x22; 16],
+        );
+        let mut io = ShortThenPending {
+            output: Vec::new(),
+            stage: 0,
+        };
+        let mut cx = task::Context::from_waker(Waker::noop());
+
+        // 第一次：加密 3 字节；写出 3 字节后 Pending。
+        assert!(
+            writer
+                .poll_write_encrypted(&mut cx, &mut io, b"abc".as_ref())
+                .is_pending()
+        );
+        // 重试：复制器此时已经多读了数据，传入更长的同前缀切片。
+        let reported = loop {
+            match writer.poll_write_encrypted(&mut cx, &mut io, b"abcdef") {
+                Poll::Ready(result) => break result.unwrap(),
+                Poll::Pending => continue,
+            }
+        };
+        assert_eq!(
+            reported, 3,
+            "重试只能确认已加密的 3 字节，不能把新切片长度当作已发送"
+        );
     }
 }

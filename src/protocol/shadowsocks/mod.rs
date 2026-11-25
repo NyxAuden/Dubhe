@@ -194,5 +194,18 @@ pub(crate) async fn serve_generic<S: DetourStream + 'static>(
     let (stream, route, dial) =
         crate::transport::sniff::sniff_route(&ctx, tag, stream, &target).await;
     let target = ctx.connect_routed(tag, &route, &dial).await?;
+    // SS2022 的线上记录此前只有约 8 KiB（受中继块限制），而 sing-box 是
+    // 16 KiB 级：每 GiB 多出约 8 倍记录数。只把**下行**放大到 32 KiB，
+    // 代价是每条已建立连接多 24 KiB；上行保持 8 KiB，避免双向翻倍。
+    if is_2022 {
+        return forward::relay_sized(
+            stream,
+            target,
+            ctx.stats.clone(),
+            forward::COPY_BLOCK,
+            32 * 1024,
+        )
+        .await;
+    }
     forward::relay(stream, target, ctx.stats.clone()).await
 }
