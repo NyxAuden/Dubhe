@@ -1388,6 +1388,23 @@ where
 /// 尝试过的自适应实现两次都失败（半关闭、buffered writer 的 flush 时机），
 /// 已回退。要重做时**不要重写复制语义**：沿用 Tokio 的
 /// `copy_bidirectional_with_sizes`，只在段与段之间换块；上游也都是这么做的。
+///
+/// # 已核实的上限（不要重复调查）
+///
+/// - **TLS 读方向不是 16 KiB 天花板。** rustls 的
+///   `DEFAULT_RECEIVED_PLAINTEXT_LIMIT = 16 KiB` 是接收明文队列的背压阈值；
+///   `tokio_rustls::server::TlsStream::poll_read` 本身**会跨记录循环**，只要
+///   调用方 ReadBuf 还有空间，就能在一次 poll 内填满更大的缓冲。因此把目标
+///   方向调大是**真正生效**的，不存在「收益只有一半」。
+/// - **裸 TCP 有向量读可用**：`TcpStream::try_read_vectored` 已存在，不必
+///   自己注册 `AsyncFd`。但 `Upstream` 是 `Box<dyn AsyncStream>`，取不回具体
+///   类型；要按 fd 批量读必须先把具体类型保留到装箱之前。
+/// - **不要重写双向复制状态机。** 三次失败的教训：`read_done` 的判据是
+///   「本次读到的 filled == 读之前的 cap」，不是「== buf.len()」；
+///   短写后必须继续循环（`Ready(Ok(n))` 不登记唤醒）；读阻塞且
+///   `pos == cap` 时必须先 flush；EOF 后要先 flush 再**持久化**进入
+///   shutdown 阶段（重复从 flush 开始会卡住 H3 这类「flush 和 FIN 是两条
+///   命令」的传输）。
 pub(crate) const COPY_BLOCK: usize = 8 * 1024;
 
 /// 实验用块大小覆盖：`DUBHE_RELAY_UP_KIB` / `DUBHE_RELAY_DOWN_KIB`。
