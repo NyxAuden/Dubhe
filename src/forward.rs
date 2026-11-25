@@ -1164,10 +1164,20 @@ impl Upstream {
         )
     }
 
-    /// 管理接口请求关闭后，读写立即失败以终止转发循环。
+    /// 管理接口是否已请求关闭。**只做一次原子读**，不登记 waker。
     ///
-    /// 同时登记当前任务 waker：关闭请求会主动唤醒停在 socket 等待上的转发任务。
-    fn closed(&self, cx: &mut std::task::Context<'_>) -> Option<io::Error> {
+    /// 转发路径每次 poll 都调用它；此前这里每次都拿一把互斥锁登记 waker，
+    /// 即使绝大多数字节都由 `Ready(Ok(_))` 直接返回。
+    fn close_error(&self) -> Option<io::Error> {
+        let session = self.session.as_ref()?;
+        session
+            .is_closed()
+            .then(|| io::Error::new(io::ErrorKind::ConnectionAborted, "连接已被管理接口关闭"))
+    }
+
+    /// 底层返回 `Pending` 时登记 waker，并复查一次关闭状态，避免「登记前
+    /// 刚被取消」导致漏唤醒。
+    fn park(&self, cx: &mut std::task::Context<'_>) -> Option<io::Error> {
         let session = self.session.as_ref()?;
         session.register_waker(cx.waker());
         session
@@ -1187,15 +1197,23 @@ impl AsyncRead for Upstream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        if let Some(error) = self.closed(cx) {
+        if let Some(error) = self.close_error() {
             return std::task::Poll::Ready(Err(error));
         }
         let before = buf.filled().len();
         let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let std::task::Poll::Ready(Ok(())) = &result
-            && let Some(session) = &self.session
-        {
-            session.add_download((buf.filled().len() - before) as u64);
+        match &result {
+            std::task::Poll::Ready(Ok(())) => {
+                if let Some(session) = &self.session {
+                    session.add_download((buf.filled().len() - before) as u64);
+                }
+            }
+            std::task::Poll::Pending => {
+                if let Some(error) = self.park(cx) {
+                    return std::task::Poll::Ready(Err(error));
+                }
+            }
+            std::task::Poll::Ready(Err(_)) => {}
         }
         result
     }
@@ -1207,14 +1225,22 @@ impl AsyncWrite for Upstream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        if let Some(error) = self.closed(cx) {
+        if let Some(error) = self.close_error() {
             return std::task::Poll::Ready(Err(error));
         }
         let result = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let std::task::Poll::Ready(Ok(written)) = &result
-            && let Some(session) = &self.session
-        {
-            session.add_upload(*written as u64);
+        match &result {
+            std::task::Poll::Ready(Ok(written)) => {
+                if let Some(session) = &self.session {
+                    session.add_upload(*written as u64);
+                }
+            }
+            std::task::Poll::Pending => {
+                if let Some(error) = self.park(cx) {
+                    return std::task::Poll::Ready(Err(error));
+                }
+            }
+            std::task::Poll::Ready(Err(_)) => {}
         }
         result
     }
@@ -1223,10 +1249,16 @@ impl AsyncWrite for Upstream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        if let Some(error) = self.closed(cx) {
+        if let Some(error) = self.close_error() {
             return std::task::Poll::Ready(Err(error));
         }
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        let result = std::pin::Pin::new(&mut self.inner).poll_flush(cx);
+        if let std::task::Poll::Pending = &result
+            && let Some(error) = self.park(cx)
+        {
+            return std::task::Poll::Ready(Err(error));
+        }
+        result
     }
 
     fn poll_shutdown(
@@ -1241,14 +1273,22 @@ impl AsyncWrite for Upstream {
         cx: &mut std::task::Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> std::task::Poll<io::Result<usize>> {
-        if let Some(error) = self.closed(cx) {
+        if let Some(error) = self.close_error() {
             return std::task::Poll::Ready(Err(error));
         }
         let result = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
-        if let std::task::Poll::Ready(Ok(written)) = &result
-            && let Some(session) = &self.session
-        {
-            session.add_upload(*written as u64);
+        match &result {
+            std::task::Poll::Ready(Ok(written)) => {
+                if let Some(session) = &self.session {
+                    session.add_upload(*written as u64);
+                }
+            }
+            std::task::Poll::Pending => {
+                if let Some(error) = self.park(cx) {
+                    return std::task::Poll::Ready(Err(error));
+                }
+            }
+            std::task::Poll::Ready(Err(_)) => {}
         }
         result
     }

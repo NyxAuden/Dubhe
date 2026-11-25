@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::Waker,
     time::{SystemTime, UNIX_EPOCH},
@@ -72,6 +72,7 @@ impl Registry {
                 download: 0,
             },
             close: CancellationToken::new(),
+            closed: AtomicBool::new(false),
             waker: Mutex::new(None),
             upload: AtomicU64::new(0),
             download: AtomicU64::new(0),
@@ -139,6 +140,12 @@ pub(crate) struct Connection {
     id: u64,
     entry: Entry,
     close: CancellationToken,
+    /// `close` 的廉价镜像。
+    ///
+    /// `CancellationToken::is_cancelled()` 需要拿一把内部锁；而转发路径每次
+    /// poll 都要判断是否已被管理接口关闭。用原子变量把这条检查变成一次
+    /// relaxed/acquire 读取，锁只在真正取消时用。
+    closed: AtomicBool,
     /// 转发任务最近一次的 waker；取消时主动唤醒，避免任务停在 socket 等待上。
     waker: Mutex<Option<Waker>>,
     upload: AtomicU64,
@@ -148,7 +155,8 @@ pub(crate) struct Connection {
 impl Connection {
     /// 管理接口是否已请求关闭该连接；`Upstream` 在读写前检查。
     pub(crate) fn is_closed(&self) -> bool {
-        self.close.is_cancelled()
+        // 与 `cancel()` 的 store 配对：读到 true 后，取消效果对读方可见。
+        self.closed.load(Ordering::Acquire)
     }
 
     pub(crate) fn add_upload(&self, bytes: u64) {
@@ -174,6 +182,7 @@ impl Connection {
     }
 
     fn cancel(&self) {
+        self.closed.store(true, Ordering::Release);
         self.close.cancel();
         let waker = self
             .waker

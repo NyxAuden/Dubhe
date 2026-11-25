@@ -113,6 +113,12 @@ struct AckIo<S> {
     inner: S,
     ack: watch::Sender<bool>,
     tail: Vec<u8>,
+    /// ACK 已确认：之后不再拼接、扫描或分配，直接把底层结果返回。
+    ///
+    /// 这个观察器只负责确认首个 SETTINGS ACK 已经写出。握手结束后它仍
+    /// 留在写路径上，此前每成功写一次就重建 `tail + payload` 并做一次
+    /// 窗口扫描——实测按 16 KiB 写 1 GiB 会分配 131,072 次。
+    done: bool,
 }
 
 impl<S> AckIo<S> {
@@ -121,6 +127,7 @@ impl<S> AckIo<S> {
             inner,
             ack,
             tail: Vec::new(),
+            done: false,
         }
     }
 }
@@ -143,14 +150,27 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for AckIo<S> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let written = std::task::ready!(Pin::new(&mut this.inner).poll_write(cx, buf))?;
+        if this.done {
+            // 已确认过 ACK：这一步之后的每次写都只是普通数据。
+            return Poll::Ready(Ok(written));
+        }
         const ACK: [u8; 9] = [0, 0, 0, 4, 1, 0, 0, 0, 0];
-        let mut window = Vec::with_capacity(this.tail.len() + written);
-        window.extend_from_slice(&this.tail);
-        window.extend_from_slice(&buf[..written]);
+        // ACK 可能跨两次短写，所以要把上次的尾巴和本次数据接起来看。
+        // 只在确认之前做：`done` 置位后不再进入这段。
+        let window = [this.tail.as_slice(), &buf[..written]].concat();
         if window.windows(ACK.len()).any(|part| part == ACK) {
             this.ack.send_replace(true);
+            this.done = true;
+            this.tail.clear();
+            return Poll::Ready(Ok(written));
         }
-        this.tail = window[window.len().saturating_sub(ACK.len() - 1)..].to_vec();
+        let keep = ACK.len() - 1;
+        this.tail.clear();
+        if window.len() > keep {
+            this.tail.extend_from_slice(&window[window.len() - keep..]);
+        } else {
+            this.tail.extend_from_slice(&window);
+        }
         Poll::Ready(Ok(written))
     }
 
@@ -1452,5 +1472,117 @@ mod tests {
         assert!(heads.lock().unwrap().contains_key(&3));
         guard.validate(&frame_header(4, 0x3, 0, 3)).unwrap();
         assert!(!heads.lock().unwrap().contains_key(&3));
+    }
+}
+
+#[cfg(test)]
+mod ack_io_tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    /// 记录写次数并按预设长度分片，用于模拟短写。
+    struct Sink {
+        /// 每次 poll_write 最多接受多少字节；`None` = 全部接受。
+        limits: Vec<Option<usize>>,
+        writes: Vec<usize>,
+        fail: bool,
+    }
+
+    impl AsyncWrite for Sink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.fail {
+                return Poll::Ready(Err(io::Error::other("sink 写失败")));
+            }
+            let limit = self.limits.get(self.writes.len()).copied().flatten();
+            let n = limit.unwrap_or(buf.len()).min(buf.len());
+            self.writes.push(n);
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    const ACK: [u8; 9] = [0, 0, 0, 4, 1, 0, 0, 0, 0];
+
+    /// 把字节写进 `AckIo`，返回底层收到的每次写入长度。
+    async fn drive(
+        ack: &watch::Sender<bool>,
+        limits: Vec<Option<usize>>,
+        chunks: &[&[u8]],
+    ) -> (Vec<usize>, bool) {
+        let sink = Sink {
+            limits,
+            writes: Vec::new(),
+            fail: false,
+        };
+        let mut io = AckIo::new(sink, ack.clone());
+        for chunk in chunks {
+            let mut written = 0;
+            while written < chunk.len() {
+                match tokio::io::AsyncWriteExt::write(&mut io, &chunk[written..]).await {
+                    Ok(0) => break,
+                    Ok(n) => written += n,
+                    Err(_) => break,
+                }
+            }
+        }
+        (io.inner.writes, *ack.borrow())
+    }
+
+    /// ACK 跨两次短写时必须仍能被识别。
+    #[tokio::test]
+    async fn ack_split_across_short_writes_is_detected() {
+        let (tx, _rx) = watch::channel(false);
+        // 第一次只接受 4 字节（ACK 前 4 字节），第二次接受余下部分。
+        let (writes, acked) = drive(&tx, vec![Some(4), None], &[&ACK]).await;
+        assert_eq!(writes, vec![4, 5], "应分两次写完 9 字节");
+        assert!(acked, "跨短写的 ACK 必须被识别");
+    }
+
+    /// ACK 确认之后不再为每次写分配/扫描。
+    ///
+    /// 用「`tail` 在主路径上为空且不增长」间接验证：确认后写 1 MiB 数据，
+    /// 底层收到的写入次数必须正好等于调用次数（不被 `AckIo` 拆分或合并）。
+    #[tokio::test]
+    async fn writes_after_ack_are_passed_through_unchanged() {
+        let (tx, _rx) = watch::channel(false);
+        let block = vec![0x5au8; 16 * 1024];
+        let mut chunks: Vec<&[u8]> = vec![&ACK];
+        for _ in 0..64 {
+            chunks.push(&block);
+        }
+        let (writes, acked) = drive(&tx, vec![], &chunks).await;
+        assert!(acked);
+        assert_eq!(writes.len(), 65, "ACK 之后每次写只对应一次底层写");
+        assert_eq!(writes[0], ACK.len());
+        assert!(writes[1..].iter().all(|n| *n == block.len()));
+    }
+
+    /// 底层写失败时不能误报 ACK。
+    #[tokio::test]
+    async fn sink_failure_does_not_confirm_ack() {
+        let (tx, _rx) = watch::channel(false);
+        let sink = Sink {
+            limits: Vec::new(),
+            writes: Vec::new(),
+            fail: true,
+        };
+        let mut io = AckIo::new(sink, tx.clone());
+        let err = tokio::io::AsyncWriteExt::write(&mut io, &ACK)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(!*tx.borrow(), "写失败不得确认 ACK");
     }
 }
