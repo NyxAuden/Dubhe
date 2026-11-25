@@ -229,6 +229,23 @@ pub(super) async fn accept_loop(
                         biased;
                         _ = force.cancelled() => {},
                         result = async {
+                            // 普通 VLESS / REALITY 与运输分支**互斥装箱**：只把
+                            // 需要的那一侧的状态机放进外层 future。仅用提前
+                            // `return` 不够——另一侧的 future 仍会被算进并集。
+                            if matches!(&*config, Inbound::Vless { .. } | Inbound::VlessReality { .. }) {
+                                Box::pin(handle(
+                                    stream,
+                                    &config,
+                                    tls,
+                                    prepared,
+                                    reality,
+                                    vless_encryption,
+                                    ctx.clone(),
+                                    handshake_permit,
+                                ))
+                                .await
+                            } else {
+                                Box::pin(async {
                             if matches!(&*config, Inbound::VlessGrpc { .. } | Inbound::VmessGrpc { .. } | Inbound::TrojanGrpc { .. }) {
                                 crate::transport::grpc::serve(stream, config.clone(), security, vmess, ctx.clone(), handshake_permit, grpc_slots, stop, force.clone()).await
                             } else if matches!(&*config, Inbound::Naive { .. }) {
@@ -297,6 +314,9 @@ pub(super) async fn accept_loop(
                                 ))
                                 .await
                             }
+                                })
+                                .await
+                            }
                         } => {
                             if let Err(error) = result {
                                 // 新入口的路由拒绝已在 Context 分类；其余旧入口统计语义保持不变。
@@ -351,6 +371,33 @@ pub(super) async fn accept_loop(
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// TLS VLESS 快路径：无 Vision、无 fallback、无 Encryption。
+///
+/// 与 `handle_inner` 的对应分支语义一致：TLS 握手 → 普通 VLESS 认证 →
+/// `serve_plain_vless`。fallback 为空时不会走 `Recording` 的回放分支，
+/// 因此这里只保留 TLS 与认证所需的状态。
+#[allow(clippy::too_many_arguments)]
+async fn serve_tls_vless_entry(
+    stream: TcpStream,
+    tag: &str,
+    users: &[crate::config::VlessUser],
+    xudp: bool,
+    ctx: Arc<Context>,
+    deadline: Duration,
+    handshake: HandshakePermits,
+    acceptor: tls::ServerTls,
+) -> io::Result<()> {
+    let tls_stream = timeout(deadline, acceptor.accept(stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS超时"))??;
+    // `fallbacks` 为空（前置条件已保证），`Recording` 的回放分支不可达，
+    // 因此不需要为它累积读到的字节。装箱还有第二个作用：`vless_accept`
+    // 只按 `Box<dyn tls::Io>` 单态化一次，而不是按
+    // `Recording<TlsStream<TcpStream>>` 生成一份更大的实例。
+    let stream: Box<dyn tls::Io> = Box::new(tls_stream);
+    vless_accept(stream, tag, users, xudp, ctx, deadline, handshake).await
 }
 
 /// VLESS 认证收尾：超时、释放握手许可、交给业务分派。
@@ -420,6 +467,43 @@ pub(super) async fn handle(
         ))
         .await;
     }
+    // TLS VLESS（无 Vision、无 fallback、无 Encryption）：公网最常见的
+    // 形态。它的认证要经过 `Recording` 以便 fallback 回放，但 fallback
+    // 为空时那条路径不可达，可以只保留 TLS + 认证 + 转发所需状态。
+    if vless_encryption.is_none()
+        && let Inbound::Vless {
+            tag,
+            users,
+            xudp,
+            fallbacks,
+            ..
+        } = config
+        && fallbacks.is_empty()
+        && !users
+            .iter()
+            .any(|user| user.flow == crate::config::VlessFlow::Vision)
+        && let Some(acceptor) = &tls
+    {
+        let deadline = Duration::from_millis(ctx.limits.handshake_timeout_ms);
+        return Box::pin(serve_tls_vless_entry(
+            stream,
+            tag,
+            users,
+            *xudp,
+            ctx,
+            deadline,
+            handshake,
+            acceptor.clone(),
+        ))
+        .await;
+    }
+    // SOCKS5 入口在完整分派里本来就是一行调用，前置后它不再与
+    // gRPC/XHTTP/REALITY 共享暂停状态。Chat 出口/ShadowTLS 内层 SOCKS
+    // 走的是别的变体，不会误入这里。
+    if let Inbound::Socks5 { tag, users, .. } = config {
+        let deadline = Duration::from_millis(ctx.limits.handshake_timeout_ms);
+        return Box::pin(serve_socks5(stream, tag, users, ctx, deadline, handshake)).await;
+    }
     // 其余分支仍走完整分派：这个函数把 26 个协议分支内联在同一个 match 里，
     // future 大小等于各分支的并集。整体装箱后，调用方按值复制的不再是巨型
     // 状态机，而是一个指针。
@@ -449,9 +533,9 @@ async fn handle_inner(
 ) -> io::Result<()> {
     let deadline = Duration::from_millis(ctx.limits.handshake_timeout_ms);
     match config {
-        Inbound::Socks5 { tag, users, .. } => {
-            serve_socks5(stream, tag, users, ctx, deadline, handshake).await
-        }
+        // SOCKS5 已在 `handle` 前置分派，这里不可达；保留是为了让 match
+        // 保持穷尽，避免未来新增变体时漏掉。
+        Inbound::Socks5 { .. } => Err(io::Error::other("SOCKS5 已前置分派")),
         Inbound::Http { tag, users, .. } => {
             serve_http(stream, tag, users, tls, ctx, deadline, handshake).await
         }
