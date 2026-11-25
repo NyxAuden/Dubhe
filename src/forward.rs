@@ -1356,11 +1356,62 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    relay_sized(client, target, stats, COPY_BLOCK, COPY_BLOCK).await
+    let (uplink, downlink) = relay_blocks();
+    relay_sized(client, target, stats, uplink, downlink).await
 }
 
 /// 默认中继块；与 Tokio 的 `DEFAULT_BUF_SIZE` 一致。
 pub(crate) const COPY_BLOCK: usize = 8 * 1024;
+
+/// 实验用块大小覆盖：`DUBHE_RELAY_UP_KIB` / `DUBHE_RELAY_DOWN_KIB`。
+///
+/// 只为基准测试存在，**不是**配置项：生产部署不应依赖它。读完一次后缓存，
+/// 热路径上只是一次原子读。
+///
+/// 已测结论（同机回环、VLESS、四流、同轮配对）：
+///
+/// | 上行/下行 | 下载 | 上传 | 每连接增量 |
+/// |---|---:|---:|---:|
+/// | 8/8 KiB（默认） | 18.2–18.5 | 22.3–22.5 | 47.8–48.9 KiB |
+/// | 1/12 KiB | 23.9–24.1 | **4.7–4.85** | 46.0–46.5 KiB |
+/// | 16/32 KiB | 28.0–28.5 | 24.0 | **81.5–81.9 KiB** |
+///
+/// 也就是说：`1/12` 用**上传掉 79%** 换来下载 +32%，绝不能当默认值；
+/// `16/32` 能到 28 Gbit/s，但每连接多占约 33 KiB，会输掉内存优势。
+/// 默认保持 8/8，除非将来能证明业务是纯下行。
+fn relay_block_override(side: RelaySide) -> usize {
+    use std::sync::OnceLock;
+    static UP: OnceLock<usize> = OnceLock::new();
+    static DOWN: OnceLock<usize> = OnceLock::new();
+    let cell = match side {
+        RelaySide::Uplink => &UP,
+        RelaySide::Downlink => &DOWN,
+    };
+    *cell.get_or_init(|| {
+        let name = match side {
+            RelaySide::Uplink => "DUBHE_RELAY_UP_KIB",
+            RelaySide::Downlink => "DUBHE_RELAY_DOWN_KIB",
+        };
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|kib| (1..=1024).contains(kib))
+            .map_or(COPY_BLOCK, |kib| kib * 1024)
+    })
+}
+
+enum RelaySide {
+    Uplink,
+    Downlink,
+}
+
+/// 当前生效的（上行, 下行）中继块大小。
+fn relay_blocks() -> (usize, usize) {
+    (
+        relay_block_override(RelaySide::Uplink),
+        relay_block_override(RelaySide::Downlink),
+    )
+}
 
 /// 双向块大小不对称的中继：`uplink` 是 client→target，`downlink` 是 target→client。
 ///
