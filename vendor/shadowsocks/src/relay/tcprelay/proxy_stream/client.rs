@@ -33,7 +33,12 @@ use crate::{
 #[derive(Debug)]
 enum ProxyClientStreamWriteState {
     Connect(Address),
-    Connecting(BytesMut),
+    /// 首包已组装、正在写出。
+    ///
+    /// `plain_len` 是**组装这批首包时**接受的用户字节数。底层返回
+    /// `Pending` 后，调用方可以用更长的同前缀切片重试；此时不能返回
+    /// 新切片的长度，否则上层会跳过从未发送的尾部。
+    Connecting(BytesMut, usize),
     Connected,
 }
 
@@ -342,13 +347,22 @@ where
                     //
                     // Proactor APIs like IOCP on Windows, pointers of buffers have to be kept alive
                     // before IO completion.
-                    *(this.writer_state) = ProxyClientStreamWriteState::Connecting(buffer);
+                    *(this.writer_state) =
+                        ProxyClientStreamWriteState::Connecting(buffer, buf.len());
                 }
-                &mut ProxyClientStreamWriteState::Connecting(ref buffer) => {
+                &mut ProxyClientStreamWriteState::Connecting(ref buffer, plain_len) => {
                     let n = ready!(this.stream.poll_write_encrypted(cx, buffer))?;
 
-                    // In general, poll_write_encrypted should perform like write_all.
+                    // `poll_write_encrypted` 在底层 `Pending` 后会保留未写完的
+                    // 密文；这里要求本次已把整批首包写完。
                     debug_assert!(n == buffer.len());
+                    if n != buffer.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "SS 首包未能完整写出",
+                        ))
+                        .into();
+                    }
 
                     *(this.writer_state) = ProxyClientStreamWriteState::Connected;
 
@@ -360,7 +374,9 @@ where
                     //
                     // For protocols that requires *Server Hello* message, like FTP, clients won't send anything to the server until server sends handshake messages.
                     // This could be achieved by calling poll_write with an empty input buffer.
-                    return Ok(buf.len()).into();
+                    //
+                    // 只能确认**组装首包时**接受的那段明文字节，不是当前切片的长度。
+                    return Ok(plain_len).into();
                 }
                 ProxyClientStreamWriteState::Connected => {
                     return this

@@ -1204,15 +1204,8 @@ where
                         continue;
                     }
                 };
-                let send = match respond.send_response(
-                    Response::builder().status(StatusCode::OK).body(()).unwrap(),
-                    false,
-                ) {
-                    Ok(send) => send,
-                    Err(_) => break,
-                };
-                // 准入必须在回 200 与拨号之前：否则到期账户仍能触发 DNS/
-                // 上游连接，并从状态码区分目标是否可达。
+                // 准入必须在**任何**最终响应之前：H2 已经发出的 200 无法被
+                // 后续 403 替代，客户端只会看到成功。
                 if !ctx.stats.admit_user(tag, user.as_deref()) {
                     let _ = respond.send_response(
                         Response::builder().status(StatusCode::FORBIDDEN).body(()).unwrap(),
@@ -1220,6 +1213,13 @@ where
                     );
                     continue;
                 }
+                let send = match respond.send_response(
+                    Response::builder().status(StatusCode::OK).body(()).unwrap(),
+                    false,
+                ) {
+                    Ok(send) => send,
+                    Err(_) => break,
+                };
                 let tunnel = crate::transport::xhttp::Tunnel::new(
                     crate::transport::xhttp::H2Reader::new(request.into_body()),
                     crate::transport::xhttp::H2Writer::new(send),
