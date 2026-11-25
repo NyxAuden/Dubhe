@@ -77,6 +77,29 @@ impl ObfsUdpSocket {
         }))
     }
 
+    /// 无混淆时不要套这层：Linux 上标准 quinn 实现走 `sendmsg + UDP_SEGMENT`
+    /// （GSO）一次发多段，本层每次只发一个报文。
+    pub(super) fn endpoint(
+        socket: UdpSocket,
+        mode: Option<ObfsMode>,
+        server: Option<quinn::ServerConfig>,
+    ) -> io::Result<quinn::Endpoint> {
+        let Some(mode) = mode else {
+            return quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                server,
+                socket.into_std()?,
+                Arc::new(quinn::TokioRuntime),
+            );
+        };
+        quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            server,
+            Self::new(socket, Some(mode))?,
+            Arc::new(quinn::TokioRuntime),
+        )
+    }
+
     fn send_wire(&self, wire: &[u8], destination: std::net::SocketAddr) -> io::Result<()> {
         match self.io.try_send_to(wire, destination) {
             Ok(written) if written == wire.len() => Ok(()),
@@ -93,15 +116,45 @@ impl ObfsUdpSocket {
 //
 // - 没有协议理由。`mode == None` 时发送原样写出、接收直接写进 Quinn 给的
 //   缓冲，既不加盐也不填充，仍固定分配两块暂存区只是因为复用同一实现。
-// - **换回标准 Quinn socket 在 macOS 上不会恢复批量能力。** 本仓库没有启用
-//   `quinn-udp` 的 `fast-apple-datapath`（`cargo tree -e features -i
-//   quinn-udp` 只有 `log`/`tracing`），因此 `BATCH_SIZE = 1`：标准实现同样
-//   一次收 1 槽、发 1 段。批量 1→1，不是 1→多。
-// - Linux 上才有真实能力恢复（`recvmmsg` 至多 32 槽、条件性 GSO/GRO），
-//   但每端点接收区可能从 46 KiB 涨到 2.875 MiB，多 UDP 关联时是净增。
+// - **macOS 上换标准 socket 不恢复批量能力。** 本仓库没有启用 `quinn-udp`
+//   的 `fast-apple-datapath`（`cargo tree -e features -i quinn-udp` 只有
+//   `log`/`tracing`），`BATCH_SIZE = 1`，标准实现同样一次收 1 槽、发 1 段。
+// - Linux 上是真实能力恢复，且**收益几乎全来自发送端 GSO**。
 //
-// 结论：只有在「目标平台是 Linux」或「明确要 CPU/GiB 与多关联内存」时才
-// 值得做这个分支。不要把它当成本机 macOS 吞吐的解法。
+// Linux ARM64 回环实测（`dubhe 0.1.0`，HY2 无混淆，同时改两端时的四组合
+// 交替对照，4 秒窗口、同轮配对）：
+//
+// | 组合 | 下载 | 上传 |
+// |---|---:|---:|
+// | base + base | 3.30 | 3.33 |
+// | **new 服务端** + base 客户端 | 3.28 | **3.93** |
+// | base 服务端 + **new 客户端** | **3.85** | 3.33 |
+// | new + new | 4.93 | 4.88 |
+//
+// 结论：**谁发送谁受益**。只换接收端（`recvmmsg`）在下载方向量不出提升；
+// 换成发送端后 +17%~19%，两端都换 +47%~49%。CPU 秒/GiB 反而略降。
+//
+// 客户端改动已撤回（`open_udp` 每条 UDP 关联新建 endpoint，接收区会按关联
+// 线性放大，需单独作容量决策），所以当前只有服务端入站走标准实现：
+// 一个监听 endpoint 服务多条连接，内存摊薄。
+//
+// 真实客户端对照（sing-box 1.11.15 客户端 → dubhe 服务端，4 轮中位数）：
+//
+// | | 下载 | 上传 |
+// |---|---:|---:|
+// | 改前 | 2.85 | 3.25 |
+// | 改后 | 2.91 | **4.41** |
+//
+// 下载不变是客户端未改（发送端仍是逐段发出），不是服务端接收的问题。
+//
+// 与 sing-box 服务端同机对照（dubhe 客户端、不声明带宽走 auto，3 轮）：
+// 上传 dubhe 4.80 / sing-box 4.11，下载 dubhe 3.40 / sing-box 3.55。上传已反超。
+// 双方都声明带宽走 Brutal 时 sing-box 上传仍更高（5.0 / 3.94），差距来自
+// quic-go 的 20 KiB GSO 缓冲对 Quinn `MAX_TRANSMIT_SEGMENTS = 10`：实测
+// dubhe 已满 10 段（线上包长 14520 = 10 × 1452），无法靠配置再放大。
+//
+// 另：Linux 上中继块大小对 HY2 影响很小（8/8、16/32、32/32 均为 4.6–5.0），
+// 与 VLESS 对块大小敏感不同。
 impl fmt::Debug for ObfsUdpSocket {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // 不输出密码。

@@ -79,7 +79,7 @@ use std::{
     time::Duration,
 };
 
-use quinn::{Connection, Endpoint, IdleTimeout, TransportConfig, VarInt};
+use quinn::{Connection, IdleTimeout, TransportConfig, VarInt};
 
 pub(crate) use socket::ObfsMode;
 
@@ -252,13 +252,7 @@ pub(crate) async fn serve(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "TLS 配置无法用于 QUIC"))?;
     let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server.transport_config(Arc::new(transport));
-    let abstract_socket = ObfsUdpSocket::new(socket, options.obfs.clone())?;
-    let endpoint = Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
-        Some(server.clone()),
-        abstract_socket,
-        Arc::new(quinn::TokioRuntime),
-    )?;
+    let endpoint = ObfsUdpSocket::endpoint(socket, options.obfs.clone(), Some(server.clone()))?;
     let server = Arc::new(server);
 
     let options = Arc::new(options);
