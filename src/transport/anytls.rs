@@ -153,12 +153,7 @@ where
     let (mut read, mut write) = tokio::io::split(io);
     let (frames, mut outgoing) = mpsc::channel::<Vec<u8>>(64);
     let writer = ctx.children.spawn(async move {
-        while let Some(frame) = outgoing.recv().await {
-            if write.write_all(&frame).await.is_err() || write.flush().await.is_err() {
-                break;
-            }
-        }
-        let _ = write.shutdown().await;
+        let _ = write_frames(&mut write, &mut outgoing).await;
     });
     struct AbortOnDrop(tokio::task::AbortHandle);
     impl Drop for AbortOnDrop {
@@ -170,6 +165,35 @@ where
     let result = read_loop(&mut read, frames, tag, ctx, scheme, user).await;
     let _ = writer.await;
     result
+}
+
+/// 每批最多合并的帧数。
+///
+/// 不设上限时一个快消费者会把所有排队帧合成一次巨大的写；`MAX_BATCH` 保证
+/// 公平性，并让控制帧在有限个数据帧之后就能出队。
+const MAX_WRITE_BATCH: usize = 4;
+
+/// 把排队中的帧写到下游。
+///
+/// 只合并**已经在队列里**的帧，绝不为凑批等待下一帧：队列空时立即写出。
+/// 帧按入队顺序拼接，所以 FIN / SYNACK 等控制帧不会被它前面的数据帧越过。
+async fn write_frames<W>(write: &mut W, frames: &mut mpsc::Receiver<Vec<u8>>) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt as _;
+    while let Some(first) = frames.recv().await {
+        let mut batch = first;
+        for _ in 1..MAX_WRITE_BATCH {
+            match frames.try_recv() {
+                Ok(frame) => batch.extend_from_slice(&frame),
+                Err(_) => break,
+            }
+        }
+        write.write_all(&batch).await?;
+        write.flush().await?;
+    }
+    write.shutdown().await
 }
 
 async fn read_loop<R>(
@@ -686,6 +710,38 @@ mod tests {
             None
         );
         assert_eq!(settings_field(b"padding-md5\n", "padding-md5"), None);
+    }
+
+    /// 合批必须：按序输出、总字节不变、不丢帧、控制帧不被延后到后续批次。
+    #[tokio::test]
+    async fn write_frames_batches_in_order_without_losing_bytes() {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        // 12 帧：其中夹着 FIN，验证它不会被跨批丢掉或重排。
+        let frames: Vec<Vec<u8>> = (0..12u32)
+            .map(|index| {
+                if index == 7 {
+                    control(COMMAND_FIN, index, &[])
+                } else {
+                    control(COMMAND_PSH, index, &[index as u8; 32])
+                }
+            })
+            .collect();
+        for frame in &frames {
+            tx.send(frame.clone()).await.unwrap();
+        }
+        drop(tx);
+
+        let mut sink = Vec::new();
+        write_frames(&mut sink, &mut rx).await.unwrap();
+
+        let expected: Vec<u8> = frames.concat();
+        assert_eq!(sink, expected, "合批必须逐字节保持顺序与内容");
+        let fin = control(COMMAND_FIN, 7, &[]);
+        let position = sink
+            .windows(fin.len())
+            .position(|window| window == fin.as_slice())
+            .expect("FIN 必须存在");
+        assert_eq!(position, frames[..7].concat().len(), "FIN 顺序被改变");
     }
 
     #[test]
