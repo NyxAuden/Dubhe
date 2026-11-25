@@ -101,7 +101,9 @@ async fn serve_h2<S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
     // 首次认证成功前的绝对期限：H2 握手完成但客户端不发 CONNECT 时，
     // 不能只靠连接空闲超时，否则一条无凭据连接可长期占住握手名额。
     // 任一子流认证成功即视为「已认证」，此后不再占用握手名额。
-    let authenticated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 认证成功即通知 serve 循环归还握手许可；不等隧道结束。
+    let (auth_tx, mut auth_rx) = tokio::sync::watch::channel(false);
+    let authenticate_by = deadline;
     let mut handshake = Some(handshake);
     let mut streams = JoinSet::new();
     let slots = Arc::new(Semaphore::new(ctx.limits.max_grpc_streams_per_connection));
@@ -121,6 +123,8 @@ async fn serve_h2<S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
                 connection.graceful_shutdown();
             }
             _ = tokio::time::sleep_until(shutdown_deadline), if draining => break,
+            // 仍持有许可说明还没有任何子流认证成功；到点结束整条连接。
+            _ = tokio::time::sleep_until(authenticate_by), if handshake.is_some() => break,
             accepted = connection.accept() => {
                 let Some(request) = accepted else { break };
                 let (request, mut respond) = request.map_err(io::Error::other)?;
@@ -135,25 +139,21 @@ async fn serve_h2<S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
                 };
                 let (tag, users, ctx) = (tag.to_owned(), users.to_vec(), ctx.clone());
                 let children = ctx.children.clone();
-                let flag = authenticated.clone();
+                let auth = auth_tx.clone();
                 streams.spawn(children.track_future(async move {
                     let _slot = slot;
                     let _global = global_slot;
-                    let user = handle_stream(request, respond, &tag, &users, &ctx).await;
-                    if user.as_ref().is_ok_and(Option::is_some) {
-                        // 首次认证成功：通知 serve 循环归还握手许可。
-                        flag.store(true, std::sync::atomic::Ordering::Release);
-                    }
-                    user.map(|_| ())
+                    handle_stream(request, respond, &tag, &users, &ctx, &auth).await
                 }));
             }
             result = streams.join_next(), if !streams.is_empty() => {
                 if result.is_some_and(|result| result.is_err()) {
                     return Err(io::Error::other("Naive 流任务异常"));
                 }
-                if authenticated.load(std::sync::atomic::Ordering::Acquire) {
-                    handshake.take();
-                }
+            }
+            // 任一子流认证成功立刻归还许可，不等待该隧道结束。
+            _ = auth_rx.changed(), if handshake.is_some() => {
+                handshake.take();
             }
         }
     }
@@ -168,10 +168,11 @@ async fn handle_stream(
     tag: &str,
     users: &[crate::config::User],
     ctx: &Arc<Context>,
-) -> io::Result<Option<String>> {
+    auth: &tokio::sync::watch::Sender<bool>,
+) -> io::Result<()> {
     if request.method() != ::http::Method::CONNECT {
         reject(&mut respond, StatusCode::METHOD_NOT_ALLOWED)?;
-        return Ok(None);
+        return Ok(());
     }
     let authority = request
         .uri()
@@ -183,7 +184,7 @@ async fn handle_stream(
         Ok(target) => target,
         Err(_) => {
             reject(&mut respond, StatusCode::BAD_REQUEST)?;
-            return Ok(None);
+            return Ok(());
         }
     };
     // 客户端以 CONNECT 请求中的 `padding` 头声明能力；服务端仅在声明时
@@ -194,9 +195,14 @@ async fn handle_stream(
         .is_some_and(|value| !value.is_empty());
     let mut credentials = request.headers().get_all("proxy-authorization").iter();
     let authorization = credentials.next().and_then(|value| value.to_str().ok());
-    if credentials.next().is_some()
-        || proxy_http::authenticate_header(authorization, users).is_err()
-    {
+    // 只认证一次：此前对同一份凭据做了两遍（先 `is_err` 再取用户名）。
+    let user = match credentials.next() {
+        Some(_) => None,
+        None => proxy_http::authenticate_header(authorization, users)
+            .ok()
+            .flatten(),
+    };
+    if credentials.next().is_some() || (user.is_none() && !users.is_empty()) {
         // 认证失败必须计入 rejected：运维需要区分「无人连接」与
         // 「有人在反复猜密码」。与 Hysteria2/TUIC 的同类修复保持一致。
         ctx.stats.reject();
@@ -209,15 +215,16 @@ async fn handle_stream(
             true,
         );
         // 认证失败不是连接级致命错误：回 407 后让其它流继续。
-        return Ok(None);
+        return Ok(());
     }
-    let user = proxy_http::authenticate_header(authorization, users)
-        .ok()
-        .flatten();
+    if user.is_some() {
+        // 首次认证成功：立刻归还握手许可，不等隧道结束。
+        auth.send_replace(true);
+    }
     // 准入在拨号与回 200 之前：到期账户不应触发上游连接。
     if !ctx.stats.admit_user(tag, user.as_deref()) {
         reject(&mut respond, StatusCode::FORBIDDEN)?;
-        return Ok(user);
+        return Ok(());
     }
     let uot = (target.port == 0)
         .then(|| crate::udp::uot_version(&target))
@@ -246,7 +253,7 @@ async fn handle_stream(
         .map_err(io::Error::other)?;
     let tunnel = Tunnel::new(H2Reader::new(request.into_body()), H2Writer::new(send));
     let tunnel = crate::transport::naive_padding::PaddedStream::new(tunnel, padding);
-    let result = if let Some(version) = uot {
+    if let Some(version) = uot {
         crate::udp::uot(
             tunnel,
             ctx.clone(),
@@ -259,8 +266,7 @@ async fn handle_stream(
         // 按账户归因业务字节（此前 Naive H2 连用户名都没传下来）。
         let tunnel = ctx.stats.count_user(tag, user.as_deref(), tunnel);
         crate::forward::relay(tunnel, upstream.expect("非UoT已建目标"), ctx.stats.clone()).await
-    };
-    result.map(|()| user)
+    }
 }
 
 /// 只有正式UoT魔数允许0端口占位；普通HTTP代理目标规则保持不变。

@@ -312,42 +312,103 @@ async fn mixed_and_https_close_silent_handshakes() {
     running.shutdown().await;
 }
 
-/// H2 的握手名额必须「首次认证成功或期限到达」就归还。
+/// H2 首次认证必须受绝对期限约束，且认证成功即归还握手名额。
 ///
-/// 历史上有两种错误：把许可留到整条连接结束（长连接永久占名额），
-/// 以及握手后立刻释放（未认证的空闲连接完全不受期限约束）。
-/// 这条用例验证的是后者：只做 TLS、不发 CONNECT 的连接
-/// 必须在 `handshake_timeout_ms` 内被服务端关闭。
+/// 用 `max_handshakes: 1` 把「是否持有许可」变成可观测行为：
+/// - 未认证的连接到期限必须结束，否则第二条连接永远拿不到名额；
+/// - 已认证的长隧道不能继续占名额，否则第二条连接同样拿不到。
+///
+/// 这两条是「许可计数」的行为等价物，不需要侵入内部计数器。
 #[tokio::test]
-async fn unauthenticated_h2_connection_is_closed_by_handshake_deadline() {
+async fn h2_handshake_permit_is_bounded_and_released_on_auth() {
     let cert = common::Certificate::new();
+
+    // 场景 1：未认证连接占用名额 —— 到期限后必须释放。
     let mut value = config("http", json!([]));
     value["limits"] = json!({
         "handshake_timeout_ms": 400,
         "shutdown_timeout_ms": 300,
-        // 空闲超时远大于握手期限：若不生效，连接会一直挂着。
+        "max_handshakes": 1,
+        "per_ip_handshakes": 1,
         "idle_timeout_ms": 60_000
     });
     value["inbounds"][0]["certificate"] = json!(cert.dir.path().join("cert.pem"));
     value["inbounds"][0]["private_key"] = json!(cert.dir.path().join("key.pem"));
     let running = Running::start(value).await;
 
-    let mut stream = cert.connect_alpn(running.address, &[b"h2"]).await;
-    let started = std::time::Instant::now();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut buffer = [0u8; 256];
-    loop {
-        match tokio::time::timeout_at(deadline, stream.read(&mut buffer)).await {
-            Ok(Ok(0)) | Ok(Err(_)) => break,
-            Ok(Ok(_)) => continue,
-            Err(_) => panic!("未认证的 H2 连接没有在握手期限内关闭"),
-        }
-    }
+    // 关键：先完成 H2 握手（发出 preface/SETTINGS），但一个 CONNECT 都不发。
+    // 只做 TLS 不发 preface 时，服务端会卡在传输层握手的期限内，测不到
+    // 「认证前」这一段。
+    let silent = cert.connect_alpn(running.address, &[b"h2"]).await;
+    let (silent_request, silent_connection) = h2::client::handshake(silent).await.unwrap();
+    let silent_driver = tokio::spawn(async move {
+        let _ = silent_connection.await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(3),
-        "关闭应在握手期限内完成，实际 {:?}",
-        started.elapsed()
+        cert.try_connect_alpn(running.address, &[b"h2"])
+            .await
+            .is_err(),
+        "未认证连接在期限内必须占住唯一的握手名额"
     );
-    drop(stream);
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(stream) = cert.try_connect_alpn(running.address, &[b"h2"]).await {
+                return stream;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("未认证连接必须在期限内释放握手名额");
+    drop(second);
+    let _ = &silent_request;
+    silent_driver.abort();
+    running.shutdown().await;
+
+    // 场景 2：认证成功的长隧道必须立刻归还名额。
+    let mut value = config("http", json!([{"name": "u", "password": "p"}]));
+    value["limits"] = json!({
+        "handshake_timeout_ms": 5000,
+        "shutdown_timeout_ms": 300,
+        "max_handshakes": 1,
+        "per_ip_handshakes": 1,
+        "idle_timeout_ms": 60_000
+    });
+    value["inbounds"][0]["certificate"] = json!(cert.dir.path().join("cert.pem"));
+    value["inbounds"][0]["private_key"] = json!(cert.dir.path().join("key.pem"));
+    let running = Running::start(value).await;
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let target = authority(echo.address);
+
+    // 第一条：TLS + 认证 + CONNECT，保持长隧道。
+    let first = cert.connect_alpn(running.address, &[b"h2"]).await;
+    let (mut send_request, connection) = h2::client::handshake(first).await.unwrap();
+    let driver = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let encoded = STANDARD.encode("u:p");
+    let request = ::http::Request::builder()
+        .method("CONNECT")
+        .uri(&target)
+        .header("host", &target)
+        .header("proxy-authorization", format!("Basic {encoded}"))
+        .body(())
+        .unwrap();
+    let (response, _tunnel) = send_request.send_request(request, false).unwrap();
+    let status = response.await.unwrap().status().as_u16();
+    assert_eq!(status, 200, "认证成功后应建立隧道");
+
+    // 第二条必须能拿到名额，且不用等第一条隧道结束。
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        cert.try_connect_alpn(running.address, &[b"h2"]),
+    )
+    .await
+    .expect("已认证的长隧道不得继续占用握手名额")
+    .expect("第二条连接应能完成 TLS");
+    drop(second);
+    drop(_tunnel);
+    driver.abort();
     running.shutdown().await;
 }

@@ -1145,9 +1145,15 @@ where
     // 首次认证成功前的绝对期限：H2 握手完成后客户端可以一直不发 CONNECT，
     // 若此时释放握手许可，一条无需凭据的连接就能长期占住连接槽。
     let mut handshake = Some(handshake);
+    // 首次认证的绝对期限：H2 握手完成但客户端一直不发 CONNECT 时，许可会被
+    // 无限期扣住。到点直接结束连接，等价于 H1 的握手期限。
+    let authenticate_by = tokio::time::Instant::now() + deadline;
     let mut streams = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
+            biased;
+            // 只有仍持有许可（尚未认证成功）时才可能超时。
+            _ = tokio::time::sleep_until(authenticate_by), if handshake.is_some() => break,
             accepted = connection.accept() => {
                 let Some(accepted) = accepted else { break };
                 let (request, mut respond) = accepted.map_err(io::Error::other)?;
