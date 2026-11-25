@@ -98,7 +98,11 @@ async fn serve_h2<S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Naive h2握手超时"))?
         .map_err(io::Error::other)?;
-    drop(handshake);
+    // 首次认证成功前的绝对期限：H2 握手完成但客户端不发 CONNECT 时，
+    // 不能只靠连接空闲超时，否则一条无凭据连接可长期占住握手名额。
+    // 任一子流认证成功即视为「已认证」，此后不再占用握手名额。
+    let authenticated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut handshake = Some(handshake);
     let mut streams = JoinSet::new();
     let slots = Arc::new(Semaphore::new(ctx.limits.max_grpc_streams_per_connection));
     let mut draining = false;
@@ -107,6 +111,7 @@ async fn serve_h2<S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
         if draining && streams.is_empty() {
             break;
         }
+
         tokio::select! {
             biased;
             _ = force.cancelled() => break,
@@ -130,15 +135,24 @@ async fn serve_h2<S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
                 };
                 let (tag, users, ctx) = (tag.to_owned(), users.to_vec(), ctx.clone());
                 let children = ctx.children.clone();
+                let flag = authenticated.clone();
                 streams.spawn(children.track_future(async move {
                     let _slot = slot;
                     let _global = global_slot;
-                    handle_stream(request, respond, &tag, &users, &ctx).await
+                    let user = handle_stream(request, respond, &tag, &users, &ctx).await;
+                    if user.as_ref().is_ok_and(Option::is_some) {
+                        // 首次认证成功：通知 serve 循环归还握手许可。
+                        flag.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    user.map(|_| ())
                 }));
             }
             result = streams.join_next(), if !streams.is_empty() => {
                 if result.is_some_and(|result| result.is_err()) {
                     return Err(io::Error::other("Naive 流任务异常"));
+                }
+                if authenticated.load(std::sync::atomic::Ordering::Acquire) {
+                    handshake.take();
                 }
             }
         }
@@ -154,9 +168,10 @@ async fn handle_stream(
     tag: &str,
     users: &[crate::config::User],
     ctx: &Arc<Context>,
-) -> io::Result<()> {
+) -> io::Result<Option<String>> {
     if request.method() != ::http::Method::CONNECT {
-        return reject(&mut respond, StatusCode::METHOD_NOT_ALLOWED);
+        reject(&mut respond, StatusCode::METHOD_NOT_ALLOWED)?;
+        return Ok(None);
     }
     let authority = request
         .uri()
@@ -166,7 +181,10 @@ async fn handle_stream(
         .unwrap_or_default();
     let target = match authority_target(&authority) {
         Ok(target) => target,
-        Err(_) => return reject(&mut respond, StatusCode::BAD_REQUEST),
+        Err(_) => {
+            reject(&mut respond, StatusCode::BAD_REQUEST)?;
+            return Ok(None);
+        }
     };
     // 客户端以 CONNECT 请求中的 `padding` 头声明能力；服务端仅在声明时
     // 启用 PaddedData，避免改变普通浏览器/未实现该扩展客户端的字节流。
@@ -190,10 +208,16 @@ async fn handle_stream(
                 .expect("响应头合法"),
             true,
         );
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Naive 代理认证失败",
-        ));
+        // 认证失败不是连接级致命错误：回 407 后让其它流继续。
+        return Ok(None);
+    }
+    let user = proxy_http::authenticate_header(authorization, users)
+        .ok()
+        .flatten();
+    // 准入在拨号与回 200 之前：到期账户不应触发上游连接。
+    if !ctx.stats.admit_user(tag, user.as_deref()) {
+        reject(&mut respond, StatusCode::FORBIDDEN)?;
+        return Ok(user);
     }
     let uot = (target.port == 0)
         .then(|| crate::udp::uot_version(&target))
@@ -222,11 +246,21 @@ async fn handle_stream(
         .map_err(io::Error::other)?;
     let tunnel = Tunnel::new(H2Reader::new(request.into_body()), H2Writer::new(send));
     let tunnel = crate::transport::naive_padding::PaddedStream::new(tunnel, padding);
-    if let Some(version) = uot {
-        crate::udp::uot(tunnel, ctx.clone(), tag.to_owned(), version, None).await
+    let result = if let Some(version) = uot {
+        crate::udp::uot(
+            tunnel,
+            ctx.clone(),
+            tag.to_owned(),
+            version,
+            user.as_deref(),
+        )
+        .await
     } else {
+        // 按账户归因业务字节（此前 Naive H2 连用户名都没传下来）。
+        let tunnel = ctx.stats.count_user(tag, user.as_deref(), tunnel);
         crate::forward::relay(tunnel, upstream.expect("非UoT已建目标"), ctx.stats.clone()).await
-    }
+    };
+    result.map(|()| user)
 }
 
 /// 只有正式UoT魔数允许0端口占位；普通HTTP代理目标规则保持不变。

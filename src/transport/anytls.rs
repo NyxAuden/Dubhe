@@ -361,6 +361,18 @@ async fn serve_stream(
         bridge.finish().await;
         return;
     }
+    // 准入在拨号之前：到期账户不应触发 DNS 或上游连接。
+    if !ctx.stats.admit_user(&tag, Some(user.as_str())) {
+        if synack {
+            let _ = frames
+                .send(control(COMMAND_SYNACK, id, b"unauthorized"))
+                .await;
+        }
+        if !peer_closed.is_cancelled() {
+            let _ = frames.send(control(COMMAND_FIN, id, &[])).await;
+        }
+        return;
+    }
     let upstream = match ctx.connect(&tag, &target).await {
         Ok(upstream) => upstream,
         Err(_) => {
@@ -382,14 +394,7 @@ async fn serve_stream(
         let _ = frames.send(control(COMMAND_SYNACK, id, &[])).await;
     }
 
-    let admitted = ctx.stats.admit_user(&tag, Some(user.as_str()));
     let (relay, bridge) = start_bridge(id, incoming, frames, peer_closed.clone(), &ctx.children);
-    if !admitted {
-        // 配额/到期拒绝：丢弃中继让下行读到 EOF，`finish()` 会回送 FIN。
-        drop(relay);
-        bridge.finish().await;
-        return;
-    }
     let relay = ctx.stats.count_user(&tag, Some(user.as_str()), relay);
     // 对端 FIN 关闭整条流：取消时立即丢弃中继，连带关闭上游 TCP 连接。
     tokio::select! {

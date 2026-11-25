@@ -796,6 +796,14 @@ async fn handle_stream(
     // `sniff_route_read` 直接返回原样，零开销。
     //
     // 只用读侧：写侧还要在失败分支 `finish()`，不能与读侧合成一个对象。
+    // 准入在嗅探与拨号之前：到期账户不应触发 DNS 或上游连接，
+    // 也不应从「connect failed」与成功应答的差别判断目标可达性。
+    if !ctx.stats.admit_user(tag, user) {
+        let response = wire::encode_tcp_response(false, "unauthorized", &[])?;
+        let _ = timeout(handshake, send.write_all(&response)).await;
+        let _ = send.finish();
+        return Ok(());
+    }
     let (recv, route, dial) =
         crate::transport::sniff::sniff_route_read(ctx, tag, recv, &target).await;
     match ctx.connect_routed(tag, &route, &dial).await {
@@ -805,9 +813,7 @@ async fn handle_stream(
                 .await
                 .map_err(|_| timed_out())??;
             // 后续字节直接双向中继；已读首包由 `Prefixed` 原样回放。
-            let stream = ctx
-                .stats
-                .admit_counter(tag, user, tokio::io::join(recv, send))?;
+            let stream = ctx.stats.count_user(tag, user, tokio::io::join(recv, send));
             forward::relay(stream, upstream, ctx.stats.clone()).await?;
         }
         Err(_) => {

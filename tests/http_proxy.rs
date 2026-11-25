@@ -311,3 +311,43 @@ async fn mixed_and_https_close_silent_handshakes() {
     drop(silent);
     running.shutdown().await;
 }
+
+/// H2 的握手名额必须「首次认证成功或期限到达」就归还。
+///
+/// 历史上有两种错误：把许可留到整条连接结束（长连接永久占名额），
+/// 以及握手后立刻释放（未认证的空闲连接完全不受期限约束）。
+/// 这条用例验证的是后者：只做 TLS、不发 CONNECT 的连接
+/// 必须在 `handshake_timeout_ms` 内被服务端关闭。
+#[tokio::test]
+async fn unauthenticated_h2_connection_is_closed_by_handshake_deadline() {
+    let cert = common::Certificate::new();
+    let mut value = config("http", json!([]));
+    value["limits"] = json!({
+        "handshake_timeout_ms": 400,
+        "shutdown_timeout_ms": 300,
+        // 空闲超时远大于握手期限：若不生效，连接会一直挂着。
+        "idle_timeout_ms": 60_000
+    });
+    value["inbounds"][0]["certificate"] = json!(cert.dir.path().join("cert.pem"));
+    value["inbounds"][0]["private_key"] = json!(cert.dir.path().join("key.pem"));
+    let running = Running::start(value).await;
+
+    let mut stream = cert.connect_alpn(running.address, &[b"h2"]).await;
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut buffer = [0u8; 256];
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut buffer)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(_)) => continue,
+            Err(_) => panic!("未认证的 H2 连接没有在握手期限内关闭"),
+        }
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "关闭应在握手期限内完成，实际 {:?}",
+        started.elapsed()
+    );
+    drop(stream);
+    running.shutdown().await;
+}

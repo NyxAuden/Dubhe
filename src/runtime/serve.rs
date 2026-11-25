@@ -154,16 +154,31 @@ pub(super) async fn serve_controlled_vless<
         let Some(target) = target else {
             return Err(io::Error::other("Vision 会话缺少目标"));
         };
+        // 准入必须在嗅探/拨号之前：否则到期账户仍能触发 DNS 与上游连接，
+        // 并从握手结果区分目标是否可达。
+        if !ctx.stats.admit_user(tag, user.as_deref()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "账户配额已用尽或已到期",
+            ));
+        }
         let (stream, route, dial) =
             crate::transport::sniff::sniff_route(&ctx, tag, stream, &target).await;
         let upstream = ctx.connect_routed(tag, &route, &dial).await?;
-        let stream = ctx.stats.admit_counter(tag, user.as_deref(), stream)?;
+        let stream = ctx.stats.count_user(tag, user.as_deref(), stream);
         return forward::relay(stream, upstream, ctx.stats.clone()).await;
     }
     match accepted.accepted {
         vless::Accepted::Mux { .. } => Err(io::Error::other("Mux 已提前分派")),
         vless::Accepted::Reverse { .. } => unreachable!("反向 Mux 已提前分派"),
         vless::Accepted::Single(request) if request.command == Command::Connect => {
+            // 准入在嗅探/拨号之前，理由同 Vision 分支。
+            if !ctx.stats.admit_user(tag, user.as_deref()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "账户配额已用尽或已到期",
+                ));
+            }
             let (stream, route, dial) =
                 crate::transport::sniff::sniff_route(&ctx, tag, stream, &request.target).await;
             let target = ctx.connect_routed(tag, &route, &dial).await?;
@@ -171,7 +186,7 @@ pub(super) async fn serve_controlled_vless<
             timeout(deadline, vless::reply(&mut stream))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "应答超时"))??;
-            let stream = ctx.stats.admit_counter(tag, user.as_deref(), stream)?;
+            let stream = ctx.stats.count_user(tag, user.as_deref(), stream);
             forward::relay(stream, target, ctx.stats.clone()).await
         }
         vless::Accepted::Single(request) => {
@@ -285,16 +300,31 @@ pub(super) async fn serve_plain_vision_vless_impl<
         let Some(target) = target else {
             return Err(io::Error::other("Vision 会话缺少目标"));
         };
+        // 准入必须在嗅探/拨号之前：否则到期账户仍能触发 DNS 与上游连接，
+        // 并从握手结果区分目标是否可达。
+        if !ctx.stats.admit_user(tag, user.as_deref()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "账户配额已用尽或已到期",
+            ));
+        }
         let (stream, route, dial) =
             crate::transport::sniff::sniff_route(&ctx, tag, stream, &target).await;
         let upstream = ctx.connect_routed(tag, &route, &dial).await?;
-        let stream = ctx.stats.admit_counter(tag, user.as_deref(), stream)?;
+        let stream = ctx.stats.count_user(tag, user.as_deref(), stream);
         return forward::relay(stream, upstream, ctx.stats.clone()).await;
     }
     match accepted.accepted {
         vless::Accepted::Mux { .. } => Err(io::Error::other("Mux 已提前分派")),
         vless::Accepted::Reverse { .. } => unreachable!("反向 Mux 已提前分派"),
         vless::Accepted::Single(request) if request.command == Command::Connect => {
+            // 准入在嗅探/拨号之前，理由同 Vision 分支。
+            if !ctx.stats.admit_user(tag, user.as_deref()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "账户配额已用尽或已到期",
+                ));
+            }
             let (stream, route, dial) =
                 crate::transport::sniff::sniff_route(&ctx, tag, stream, &request.target).await;
             let target = ctx.connect_routed(tag, &route, &dial).await?;
@@ -302,7 +332,7 @@ pub(super) async fn serve_plain_vision_vless_impl<
             timeout(deadline, vless::reply(&mut stream))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "应答超时"))??;
-            let stream = ctx.stats.admit_counter(tag, user.as_deref(), stream)?;
+            let stream = ctx.stats.count_user(tag, user.as_deref(), stream);
             forward::relay(stream, target, ctx.stats.clone()).await
         }
         vless::Accepted::Single(request) => {
@@ -1106,13 +1136,15 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     use ::http::{Method, Response, StatusCode};
-    drop(handshake);
     let mut builder = h2::server::Builder::new();
     builder.max_concurrent_streams(64);
     let mut connection = timeout(deadline, builder.handshake(io))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP/2 代理握手超时"))?
         .map_err(io::Error::other)?;
+    // 首次认证成功前的绝对期限：H2 握手完成后客户端可以一直不发 CONNECT，
+    // 若此时释放握手许可，一条无需凭据的连接就能长期占住连接槽。
+    let mut handshake = Some(handshake);
     let mut streams = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
@@ -1131,7 +1163,11 @@ where
                     .get("proxy-authorization")
                     .and_then(|value| value.to_str().ok());
                 let user = match http::authenticate_header(auth, users) {
-                    Ok(user) => user,
+                    Ok(user) => {
+                        // 首次认证成功后才归还握手名额：此后按已认证连接处理。
+                        handshake.take();
+                        user
+                    }
                     Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                         // 与 H1 的 accept.rs 兜底保持一致：认证失败计入 rejected。
                         // 此前 H2 只回 407 就 continue，同一入口 H1 能看见爆破、

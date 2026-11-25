@@ -902,6 +902,20 @@ async fn handle_bi_stream(
             return;
         }
     };
+    // 准入在嗅探与拨号之前：到期账户不应触发 DNS 或上游连接。
+    let user = match &*auth.borrow() {
+        AuthState::Authenticated(index) => shared
+            .options
+            .users
+            .get(*index)
+            .map(|credential| credential.name.clone()),
+        _ => None,
+    };
+    if !shared.ctx.stats.admit_user(&shared.tag, user.as_deref()) {
+        let _ = recv.stop(VarInt::from_u32(0));
+        let _ = send.reset(VarInt::from_u32(0));
+        return;
+    }
     // 首包嗅探：TUIC 客户端通常紧接 Connect 头就发首包，因此这里有机会
     // 读到 TLS SNI / HTTP Host。未配置 `sniffing` 时直接返回空前缀。
     // 用 `sniff_route_parts` 而不是包装流：失败分支还要调用
@@ -917,20 +931,6 @@ async fn handle_bi_stream(
             return;
         }
     };
-    // 准入在包装/移走句柄之前判定：拒绝时必须能重置 QUIC 流。
-    let user = match &*auth.borrow() {
-        AuthState::Authenticated(index) => shared
-            .options
-            .users
-            .get(*index)
-            .map(|credential| credential.name.clone()),
-        _ => None,
-    };
-    if !shared.ctx.stats.admit_user(&shared.tag, user.as_deref()) {
-        let _ = recv.stop(VarInt::from_u32(0));
-        let _ = send.reset(VarInt::from_u32(0));
-        return;
-    }
     let recv = crate::transport::sniff::Prefixed::new(prefix, recv);
     let stream =
         shared

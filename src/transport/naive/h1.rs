@@ -30,6 +30,12 @@ where
             .then(|| crate::udp::uot_version(target))
             .flatten();
         let wait = Duration::from_millis(ctx.limits.handshake_timeout_ms);
+        // 准入在拨号与回 200 之前：到期账户不应触发上游连接，
+        // 也不应从 502 与 200 的差别判断目标可达性。
+        if !ctx.stats.admit_user(tag, user.as_deref()) {
+            let _ = tokio::time::timeout(wait, proxy_http::status_reply(&mut stream, 403)).await;
+            return Ok(());
+        }
         let upstream = if uot.is_some() {
             None
         } else {
@@ -56,7 +62,7 @@ where
         if let Some(version) = uot {
             crate::udp::uot(app, ctx, tag.to_owned(), version, user.as_deref()).await
         } else {
-            let app = ctx.stats.admit_counter(tag, user.as_deref(), app)?;
+            let app = ctx.stats.count_user(tag, user.as_deref(), app);
             crate::forward::relay(app, upstream.expect("非UoT已建目标"), ctx.stats.clone()).await
         }
     })

@@ -272,6 +272,10 @@ async fn handle(
     let uot = (target.port == 0)
         .then(|| crate::udp::uot_version(&target))
         .flatten();
+    // 准入在拨号与回 200 之前：到期账户不应触发上游连接。
+    if !ctx.stats.admit_user(tag, user.as_deref()) {
+        return reject(&mut stream, StatusCode::FORBIDDEN, &ctx).await;
+    }
     let upstream = if uot.is_some() {
         None
     } else {
@@ -313,7 +317,7 @@ async fn handle(
         )
         .await
     } else {
-        let tunnel = ctx.stats.admit_counter(tag, user.as_deref(), tunnel)?;
+        let tunnel = ctx.stats.count_user(tag, user.as_deref(), tunnel);
         crate::forward::relay(tunnel, upstream.expect("非UoT已建目标"), ctx.stats.clone()).await
     };
     let sent = writer.await.map_err(error)?;
