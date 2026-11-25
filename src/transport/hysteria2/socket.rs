@@ -89,6 +89,19 @@ impl ObfsUdpSocket {
     }
 }
 
+// 关于「无混淆也走这里」的已核实结论（2026-11，勿重复调查）：
+//
+// - 没有协议理由。`mode == None` 时发送原样写出、接收直接写进 Quinn 给的
+//   缓冲，既不加盐也不填充，仍固定分配两块暂存区只是因为复用同一实现。
+// - **换回标准 Quinn socket 在 macOS 上不会恢复批量能力。** 本仓库没有启用
+//   `quinn-udp` 的 `fast-apple-datapath`（`cargo tree -e features -i
+//   quinn-udp` 只有 `log`/`tracing`），因此 `BATCH_SIZE = 1`：标准实现同样
+//   一次收 1 槽、发 1 段。批量 1→1，不是 1→多。
+// - Linux 上才有真实能力恢复（`recvmmsg` 至多 32 槽、条件性 GSO/GRO），
+//   但每端点接收区可能从 46 KiB 涨到 2.875 MiB，多 UDP 关联时是净增。
+//
+// 结论：只有在「目标平台是 Linux」或「明确要 CPU/GiB 与多关联内存」时才
+// 值得做这个分支。不要把它当成本机 macOS 吞吐的解法。
 impl fmt::Debug for ObfsUdpSocket {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // 不输出密码。
