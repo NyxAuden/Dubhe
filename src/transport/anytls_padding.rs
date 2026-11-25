@@ -8,7 +8,7 @@ use std::{
 
 pub(super) const DEFAULT_SCHEME: &str = "stop=8\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n3=9-9,500-1000\n4=500-1000\n5=500-1000\n6=500-1000\n7=500-1000";
 const HEADER: usize = 7;
-const MAX_FRAME: usize = u16::MAX as usize;
+pub(super) const MAX_FRAME: usize = u16::MAX as usize;
 const MAX_SIZE: usize = 256 * 1024;
 const MAX_GENERATED: usize = 1024 * 1024;
 const MAX_ITEMS: usize = 128;
@@ -188,10 +188,24 @@ pub(super) struct PaddingState {
     stopped: bool,
 }
 impl PaddingState {
-    pub(super) fn shape(&mut self, data: &[u8], scheme: &Scheme) -> io::Result<Vec<Vec<u8>>> {
+    /// 是否已经停止塑形（`stop` 之后不再加填充）。
+    ///
+    /// 停止后 `shape` 只是把数据原样复制一遍；调用方可以直接写原切片，
+    /// 避免每个 PSH 都多一次整帧复制与结果容器分配。
+    pub(super) fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// 与 `shape` 相同的长度上限校验，供快路径复用。
+    pub(super) fn validate(data: &[u8]) -> io::Result<()> {
         if data.len() > MAX_FRAME + 1024 {
             return Err(invalid());
         }
+        Ok(())
+    }
+
+    pub(super) fn shape(&mut self, data: &[u8], scheme: &Scheme) -> io::Result<Vec<Vec<u8>>> {
+        Self::validate(data)?;
         if self.stopped {
             return Ok(vec![data.to_vec()]);
         }
@@ -328,5 +342,60 @@ mod tests {
         assert_eq!(shared.snapshot().handshake_size().unwrap(), 2);
         assert_eq!(other.snapshot().md5(), before.md5());
         assert!(Scheme::parse(&"x".repeat(65536)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod stopped_fast_path_tests {
+    use super::*;
+
+    /// 快路径的前提：`stop` 之后 `shape` 只原样返回一份数据，不再加填充。
+    ///
+    /// `write_blocks` 在 `is_stopped()` 为真时直接写原切片，因此这里必须
+    /// 保证两件事：状态判断准确、且 `shape` 在该状态下不改变字节。
+    #[test]
+    fn stopped_state_is_exact_and_adds_no_padding() {
+        let scheme = Scheme::parse("stop=2\n0=4-4\n1=9-9").unwrap();
+        let mut state = PaddingState::default();
+        let data = b"abcdefghijkl";
+
+        // 第 0 包：仍在塑形，会拆分并加 Waste。
+        assert!(!state.is_stopped());
+        let shaped = state.shape(data, &scheme).unwrap();
+        assert!(!shaped.is_empty());
+
+        // 第 1 包：`packet` 到达 stop，`shape` 自身把它置为停止。
+        let crossing = state.shape(data, &scheme).unwrap();
+        assert_eq!(
+            crossing,
+            vec![data.to_vec()],
+            "跨越 stop 的这一包不再加填充"
+        );
+        assert!(state.is_stopped(), "跨越 stop 后状态必须为停止");
+
+        // 之后：快路径与 shape 的输出必须完全一致。
+        let after = state.shape(data, &scheme).unwrap();
+        assert_eq!(
+            after,
+            vec![data.to_vec()],
+            "停止后 shape 必须原样返回，快路径才等价"
+        );
+        assert_eq!(after.len(), 1);
+    }
+
+    /// 快路径仍要拒绝超长帧，不能因为跳过 `shape` 就绕过上限。
+    #[test]
+    fn stopped_fast_path_still_rejects_oversized_frames() {
+        let mut state = PaddingState::default();
+        let scheme = Scheme::parse("stop=0\n").unwrap();
+        // stop=0：第一包即停止。
+        let _ = state.shape(b"x", &scheme);
+        assert!(state.is_stopped());
+        let oversized = vec![0u8; MAX_FRAME + 1025];
+        assert!(
+            PaddingState::validate(&oversized).is_err(),
+            "超长帧必须被拒绝"
+        );
+        assert!(state.shape(&oversized, &scheme).is_err());
     }
 }

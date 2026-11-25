@@ -597,12 +597,24 @@ enum Write {
     },
     Heart(u32),
 }
-async fn write_blocks(
-    write: &mut tokio::io::WriteHalf<Upstream>,
+async fn write_blocks<W>(
+    write: &mut W,
     padding: &mut PaddingState,
     schemes: &SharedScheme,
     bytes: &[u8],
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // 顺序有讲究：先校验长度（与 `shape` 的拒绝条件一致），再判断是否已停止
+    // 塑形，最后才可能去读共享方案快照。停止之后不再加填充，`shape` 只会
+    // 原样复制；此时直接写原切片，每 1 GiB 业务载荷省下约 1 GiB 复制和
+    // 每个 PSH 一次分配。
+    PaddingState::validate(bytes)?;
+    if padding.is_stopped() {
+        write.write_all(bytes).await?;
+        return write.flush().await;
+    }
     for block in padding.shape(bytes, &schemes.snapshot())? {
         write.write_all(&block).await?;
     }
@@ -886,3 +898,98 @@ impl Drop for Flow {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod stopped_write_tests {
+    use super::*;
+    use std::task::{Poll, Waker};
+
+    /// 收集写入的字节数，不做真实 I/O。
+    struct Recorder {
+        bytes: usize,
+        writes: usize,
+    }
+
+    impl tokio::io::AsyncWrite for Recorder {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.bytes += buf.len();
+            self.writes += 1;
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn poll_to_ready(future: impl std::future::Future<Output = io::Result<()>>) -> io::Result<()> {
+        let mut future = std::pin::pin!(future);
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => result,
+            // 本测试用的 sink 永远不 Pending，走到这里说明实现有额外等待。
+            Poll::Pending => panic!("Recorder 不应返回 Pending"),
+        }
+    }
+
+    /// 停止塑形后，满帧载荷不应再被整份复制。
+    ///
+    /// `shape` 在停止状态下返回 `vec![data.to_vec()]`——每 GiB 业务载荷就是
+    /// 一次整份复制。快路径直接写原切片，分配次数必须显著低于塑形路径。
+    #[test]
+    fn stopped_path_copies_far_less_than_shaping_path() {
+        // 默认方案 `stop=8`：喂 8 个小包即跨过停止点。
+        let shared = SharedScheme::default();
+        // 上限是 MAX_FRAME + 1024；取 MAX_FRAME 本身，仍是最大的单帧。
+        let payload = vec![0x5au8; crate::transport::anytls_padding::MAX_FRAME];
+
+        let mut stopped = PaddingState::default();
+        let mut sink = Recorder {
+            bytes: 0,
+            writes: 0,
+        };
+        for _ in 0..8 {
+            poll_to_ready(write_blocks(&mut sink, &mut stopped, &shared, b"x")).unwrap();
+        }
+        assert!(stopped.is_stopped(), "喂满 stop 后应处于停止状态");
+
+        // 停止后的满帧：快路径。写出字节必须**恰好**等于输入，不再有 Waste。
+        let before = sink.bytes;
+        let ((), fast_allocs, _) = crate::alloc_count::measure(|| {
+            poll_to_ready(write_blocks(&mut sink, &mut stopped, &shared, &payload)).unwrap();
+        });
+        assert_eq!(
+            sink.bytes - before,
+            payload.len(),
+            "快路径不得添加任何填充字节"
+        );
+
+        // 对照：全新状态下同样的 1 MiB 要走完整塑形。
+        let mut shaping = PaddingState::default();
+        let ((), shaping_allocs, _) = crate::alloc_count::measure(|| {
+            poll_to_ready(write_blocks(&mut sink, &mut shaping, &shared, &payload)).unwrap();
+        });
+
+        assert!(
+            fast_allocs < shaping_allocs,
+            "快路径分配应少于塑形路径：快 {fast_allocs}，塑形 {shaping_allocs}"
+        );
+        assert!(
+            fast_allocs <= 8,
+            "快路径不应随载荷大小分配：实际 {fast_allocs} 次"
+        );
+        let _ = shaping_allocs;
+    }
+}
