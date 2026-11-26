@@ -720,24 +720,41 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     force: CancellationToken,
 ) -> io::Result<()> {
     let head_limit = xhttp_config(&config)?.server_max_header_bytes() as u32;
-    let mut connection = h2::server::Builder::new()
-        .max_concurrent_streams(64)
-        .initial_window_size(65_535)
-        .initial_connection_window_size(65_535)
-        .max_frame_size(16_384)
-        .max_header_list_size(head_limit)
-        .handshake(io)
-        .await
-        .map_err(io::Error::other)?;
+    // H2 握手本身也受 `absolute` 约束：此前只有 TLS 握手受期限保护，
+    // 之后可以无限期停在 H2 握手或空转不发请求。
+    let mut connection = tokio::time::timeout_at(absolute, async {
+        h2::server::Builder::new()
+            .max_concurrent_streams(64)
+            .initial_window_size(65_535)
+            .initial_connection_window_size(65_535)
+            .max_frame_size(16_384)
+            .max_header_list_size(head_limit)
+            .handshake(io)
+            .await
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP h2握手超时"))?
+    .map_err(io::Error::other)?;
     let mut streams = JoinSet::new();
+    // 首个请求前的绝对期限。XHTTP 在外层 TLS 完成后就归还了握手许可
+    // （见上面 `drop(handshake)`），若这里不给期限，一条不认证的连接会
+    // 长期占住共享连接槽。
+    let mut first_request = true;
     loop {
         tokio::select! {
             biased;
             _ = force.cancelled() => break,
             _ = stop.cancelled() => break,
+            _ = tokio::time::sleep_until(absolute), if first_request => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "XHTTP 首个请求超时",
+                ));
+            }
             accepted = connection.accept() => {
                 let Some(accepted) = accepted else { break };
                 let (request, respond) = accepted.map_err(io::Error::other)?;
+                first_request = false;
                 let config = config.clone();
                 let vmess = vmess.clone();
                 let ctx = ctx.clone();

@@ -984,6 +984,34 @@ async fn silent_client_is_closed_at_handshake_deadline() {
     server.shutdown().await;
 }
 
+/// 回归：完成 H2 握手但**从不发任何 RPC** 的连接，必须在期限内失败关闭。
+///
+/// 此前服务端在 SETTINGS ACK 后立刻归还握手许可，之后的主循环没有首 RPC
+/// 期限。于是一条不认证的连接可以无限期占住全局连接槽，并绕过每源 IP 的
+/// 并发握手限额（许可已归还）。
+#[tokio::test]
+async fn h2_handshake_without_any_rpc_is_closed_at_deadline() {
+    let mut value = config(None, None);
+    value["limits"]["handshake_timeout_ms"] = json!(300);
+    let server = Running::start(value).await;
+
+    // 只做 h2 握手，拿住 driver，不发 send_request。
+    let io = timeout(WAIT, TcpStream::connect(server.address))
+        .await
+        .unwrap()
+        .unwrap();
+    let (_send_request, connection) = h2::client::handshake(io).await.unwrap();
+    let driver = tokio::spawn(connection);
+
+    // 连接应被服务端在期限内关闭：driver 会以错误结束。
+    let closed = timeout(Duration::from_secs(3), driver).await;
+    assert!(
+        closed.is_ok(),
+        "完成 H2 握手但不发 RPC 的连接必须在期限内被关闭"
+    );
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn truncated_authentication_message_never_dials() {
     let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

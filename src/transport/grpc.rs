@@ -643,8 +643,12 @@ pub(crate) async fn serve(
             _ = ack_rx.changed() => {}
         }
     }
-    drop(handshake.take());
+    // 此处**不再**提前归还握手许可。此前在 SETTINGS ACK 后就 `drop`，于是
+    // 一条不发任何 RPC 的连接可以无限期占住全局连接槽，并绕过每源 IP 的
+    // 并发握手限额（许可已归还，计数器归零）。改为：许可保留到第一个被接受
+    // 的 RPC，并由下面的 `authenticate_by` 给它一个绝对期限。
     for (request, respond) in pending.drain(..) {
+        handshake.take();
         let rpc_deadline = rpc_deadline(&respond, &heads, duration);
         accept_rpc(
             request,
@@ -662,6 +666,9 @@ pub(crate) async fn serve(
 
     let mut stopping = false;
     let mut drain_deadline: Option<Instant> = None;
+    // 首次 RPC 前的绝对期限：与 `runtime/serve.rs` 的 H2 入口同一语义。
+    // 没有它，SETTINGS ACK 之后客户端可以永不发 RPC，长期占住连接槽。
+    let authenticate_by = Instant::now() + duration;
     loop {
         let timer = async {
             match drain_deadline {
@@ -673,6 +680,13 @@ pub(crate) async fn serve(
         tokio::select! {
             biased;
             _ = force.cancelled() => break,
+            // 仍在等首个 RPC（许可未归还）时到点失败关闭。
+            _ = tokio::time::sleep_until(authenticate_by), if handshake.is_some() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "gRPC 首个 RPC 认证超时",
+                ));
+            }
             _ = timer => break,
             result = structure => {
                 // Ok(()) 表示到达绝对期限；Err 表示预算表不可用。两者都失败关闭。
@@ -702,6 +716,8 @@ pub(crate) async fn serve(
                             rpcs.spawn(reject(respond, StatusCode::SERVICE_UNAVAILABLE));
                             continue;
                         }
+                        // 第一个被接受的 RPC：此后按已认证连接处理，归还许可。
+                        handshake.take();
                         let rpc_deadline = rpc_deadline(&respond, &heads, duration);
                         accept_rpc(
                             request,
