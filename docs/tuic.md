@@ -25,7 +25,7 @@
 | 0-RTT | 可配置（`zero_rtt_handshake`，默认关闭；开启依赖 rustls 有状态票据单次消费；成功认证且观察到早期流时输出 debug 事件 `tuic_0rtt_accepted`） |
 | 拥塞控制 | `congestion_control`: `cubic`（默认）/`new_reno`/`bbr`，由 quinn 真实控制器执行 |
 
-sing-box 的 TUIC 入站默认不配置 ALPN，客户端也不发送 ALPN，因此服务端默认“完全不协商 ALPN”是兼容形态。rustls 的 QUIC 规则是：只要服务端或客户端任一方配置了 ALPN 而无法选中共同协议，握手即以 `no_application_protocol` 失败。因此：
+本入口保留不协商 ALPN 的客户端兼容性。与 sing-box 1.14.4 或 mihomo v1.19.34 联调时，若客户端发送 `h3`，在 dubhe 入站显式设置 `"alpn":["h3"]`，客户端也选择 `h3`。只要有一方要求 ALPN 而找不到共同值，QUIC 握手就会失败，尚未进入 TUIC 密码认证。因此：
 
 - 未配置 `alpn`：客户端也不得发送 ALPN；
 - 配置了 `alpn`：客户端必须发送其中至少一个值。

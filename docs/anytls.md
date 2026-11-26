@@ -116,8 +116,8 @@ AnyTLS 是**必须使用真实 TLS** 的独立入口，不与其他传输组合�
 
 - 每会话并发流：64（`MAX_STREAMS`）；超限回 FIN。
 - 每流排队帧：4（`STREAM_BUFFER`）；达到上限时暂停读取整个会话，形成背压。
-- 每流桥接双工缓冲：每个方向最多 64 KiB（`BRIDGE_BUFFER`）。
-- 会话下行帧队列：64 项；下行 PSH 单帧 16 KiB，小于 `u16` 上限。
+- TCP 每流只有上行经过 64 KiB 字节缓冲；下行在会话队列有空位时直接编码 PSH。UoT 仍使用每方向最多 64 KiB 的双工桥（`BRIDGE_BUFFER`）。
+- 会话下行队列：64 项，控制帧、PSH 和 flush 屏障共享；下行 PSH 每帧最多 16 KiB。TCP 流的 flush 在会话 writer 写完此前所有帧且底层 TLS flush 成功后才确认。
 - 单个 PSH 负载上限：65,535 字节（帧头长度字段决定）。
 - TLS 握手与认证前导共用 `limits.handshake_timeout_ms`。
 - 连接与并发握手分别受 `limits.max_connections`、`limits.max_handshakes` 约束。

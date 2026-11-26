@@ -25,7 +25,7 @@ mod upgrade;
 mod tests;
 
 const MAX_MESSAGE: usize = 1_048_576;
-const MAX_WRITE: usize = 16_384;
+const MAX_WRITE: usize = 65_536;
 const MAX_EVENTS: usize = 32;
 
 pub(crate) struct WebSocket<S> {

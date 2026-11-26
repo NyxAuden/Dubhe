@@ -293,6 +293,74 @@ async fn quota_exhausted_user_cannot_open_uot_stream() {
 }
 
 #[tokio::test]
+async fn tcp_and_uot_share_one_session_but_count_only_their_own_payload() {
+    let cert = Certificate::new();
+    let running = Running::start(config(&cert)).await;
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let udp = Echo::udp("127.0.0.1").await;
+    let mut stream = cert.connect(running.address).await;
+    prologue(&mut stream, PASSWORD, true).await;
+    let mut dest = address(tcp.local_addr().unwrap());
+    dest.extend_from_slice(b"tcp");
+    let mut packet = b"\x03\x17sp.v2.udp-over-tcp.arpa\0\0\x01".to_vec();
+    packet.extend(address(udp.address));
+    packet.extend_from_slice(b"\0\x03udp");
+    for (id, data) in [(1, dest), (2, packet)] {
+        stream.write_all(&frame(1, id, &[])).await.unwrap();
+        stream.write_all(&frame(2, id, &data)).await.unwrap();
+    }
+    stream.flush().await.unwrap();
+    let (mut target, _) = timeout(Duration::from_secs(3), tcp.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    // TCP 目标不回写；同会话中的 UoT 必须先独立完成。
+    let mut ack = [false; 3];
+    let mut reply = Vec::new();
+    while reply.len() < 5 {
+        let (cmd, id, b) = next_frame_timeout(&mut stream).await;
+        if cmd == 7 {
+            assert!(b.is_empty());
+            ack[id as usize] = true;
+        }
+        if cmd == 2 {
+            assert_eq!(id, 2);
+            assert!(ack[2]);
+            reply.extend(b);
+        }
+    }
+    assert_eq!(reply, b"\0\x03udp");
+    let mut request = [0; 3];
+    target.read_exact(&mut request).await.unwrap();
+    assert_eq!(&request, b"tcp");
+    target.write_all(&vec![42; 65537]).await.unwrap();
+    target.shutdown().await.unwrap();
+    let mut n = 0;
+    loop {
+        let (cmd, id, b) = next_frame_timeout(&mut stream).await;
+        assert_eq!(id, 1);
+        match cmd {
+            7 => {
+                assert!(b.is_empty());
+                ack[1] = true;
+            }
+            2 => {
+                assert!(ack[1]);
+                assert!(!b.is_empty() && b.len() <= 16384 && b.iter().all(|&v| v == 42));
+                n += b.len();
+            }
+            3 => break,
+            _ => panic!("unexpected {cmd}"),
+        }
+    }
+    assert_eq!(n, 65537);
+    let counter = running.stats.user_counter("anytls", "u");
+    assert_eq!((counter.uplink(), counter.downlink()), (6, 65540));
+    let total = running.stats.snapshot();
+    assert_eq!((total.uplink, total.downlink), (6, 65540));
+}
+
+#[tokio::test]
 async fn independent_streams_are_multiplexed() {
     let first = Echo::tcp("127.0.0.1", false).await;
     let second = Echo::tcp("127.0.0.1", false).await;

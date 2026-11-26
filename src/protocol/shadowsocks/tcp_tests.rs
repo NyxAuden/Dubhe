@@ -22,6 +22,39 @@ use tokio::{
 use crate::{config::Config, dns::Dns, route::Router, telemetry::Stats};
 
 const IO_LIMIT: Duration = Duration::from_secs(3);
+
+#[tokio::test]
+async fn relay_2022_delivers_ready_plaintext_without_eight_kib_write_amplification() {
+    struct Writes(Vec<usize>);
+    impl AsyncWrite for Writes {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+            b: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.push(b.len());
+            Poll::Ready(Ok(b.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    let payload = vec![42; 65537];
+    let mut up = Writes(vec![]);
+    let mut down = Writes(vec![]);
+    relay_2022(
+        tokio::io::join(&payload[..], &mut down),
+        tokio::io::join(&payload[..], &mut up),
+        Arc::new(Stats::default()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(up.0, [32768, 32768, 1]);
+    assert_eq!(down.0, [32768, 32768, 1]);
+}
 const TEST_LIMIT: Duration = Duration::from_secs(15);
 const FIRST: &[u8] = b"first payload survives the handshake";
 const RESPONSE: &[u8] = b"independently decrypted server response";

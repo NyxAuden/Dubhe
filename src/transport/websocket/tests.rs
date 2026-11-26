@@ -164,6 +164,51 @@ async fn early_data_raw_prefix_fragmentation_empty_binary_and_controls_are_order
 }
 
 #[tokio::test]
+async fn outbound_lengths_flush_and_replaced_pending_slice_match_the_wire() {
+    let io = Probe::new(vec![], 8192);
+    let written = io.output.clone();
+    let block = io.block.clone();
+    let mut socket = WebSocket::new(io, vec![], vec![]).await;
+    socket.write_all(b"ok").await.unwrap();
+    socket.flush().await.unwrap();
+    assert_eq!(written.lock().unwrap().as_slice(), b"\x82\x02ok");
+    let mut expected = written.lock().unwrap().clone();
+    for (n, header) in [
+        (125, &[125][..]),
+        (126, &[126, 0, 126]),
+        (65535, &[126, 255, 255]),
+        (65536, &[127, 0, 0, 0, 0, 0, 1, 0, 0]),
+    ] {
+        let payload = vec![n as u8; n];
+        socket.write_all(&payload).await.unwrap();
+        expected.push(0x82);
+        expected.extend_from_slice(header);
+        expected.extend_from_slice(&payload);
+    }
+    socket.flush().await.unwrap();
+    block.store(true, Ordering::Relaxed);
+    let data = vec![0x76; 65537];
+    assert_eq!(socket.write(&data).await.unwrap(), 65536);
+    assert!(futures_util::poll!(std::pin::pin!(socket.write(b"discard"))).is_pending());
+    block.store(false, Ordering::Relaxed);
+    // 可复现的伪随机短写；每次 Pending 后都可改用新的业务切片。
+    let mut seed = 7u32;
+    std::future::poll_fn(|cx| {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        socket.socket.get_mut().get_mut().limit = 1 + (seed >> 20) as usize;
+        Pin::new(&mut socket).poll_write(cx, &data[65536..])
+    })
+    .await
+    .map(|n| assert_eq!(n, 1))
+    .unwrap();
+    socket.flush().await.unwrap();
+    expected.extend_from_slice(&[0x82, 127, 0, 0, 0, 0, 0, 1, 0, 0]);
+    expected.extend_from_slice(&data[..65536]);
+    expected.extend_from_slice(&[0x82, 1, 0x76]);
+    assert_eq!(*written.lock().unwrap(), expected);
+}
+
+#[tokio::test]
 async fn short_writes_and_pending_accept_each_business_byte_once_with_fixed_segments() {
     for limit in [1, 7, 17] {
         let io = Probe::new(vec![], limit);

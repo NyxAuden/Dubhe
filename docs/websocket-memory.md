@@ -37,7 +37,7 @@
 | 输入帧、累计消息 | 各 1048576 字节 | 两者不是共享的一块 1 MiB 内存 |
 | 引擎 read_buffer_size | 16384 字节 | 不是接收缓冲永远不超过 16 KiB |
 | write_buffer_size / max_write_buffer_size | 0 / 131072 字节 | 128 KiB 限制的是逻辑排队长度，不是 Vec capacity 或 RSS |
-| 单次业务写 | 最多 16384 字节 | 编码期间仍有业务副本与输出 Vec 同时存在 |
+| 单次业务写 | 最多 65536 字节 | 编码期间仍有业务副本与输出 Vec 同时存在 |
 | early-data | 最多 8192 解码字节 | 不包含 HTTP 中编码值的原始存储 |
 | HTTP 头及尾部预读 | 合计最多 32768 字节 | 不包含 parser/Request 的结构与有界字段副本 |
 | 护栏 | 最多 14 字节头 | 原始尾部拥有自己的有界 Vec |
@@ -49,7 +49,7 @@
 - `split_to(len)`、`freeze()`、Frame 到未分片 Binary 一般共享或移动缓冲所有权，不复制整帧。一个短的 `Bytes` 视图仍可能钉住整块较大的 backing allocation；不能只累加 `Message::len()`。
 - 分片 Binary 的 `IncompleteMessage` 以独立 `Vec<u8>` 累积。每个 frame 的 `Bytes` 要复制进这个 Vec，期间帧缓冲和累积缓冲并存。累计长度在 extend 前检查，但 Vec 按增长策略保留多余容量；text 分片的 StringCollector 有相同的容量问题。生产适配器拒 text 不等于库在拒绝之前零分配。
 - 完成的分片 `Vec` 转 `Bytes` 会保留原 Vec 分配，必要时另分配小的共享元数据，并非强制 shrink 到消息长度。库交给外层的完成消息游标也占内存，必须排空后再取下一条，不能积攒多个完成消息。
-- 本批业务写先将最多 16 KiB 调用者切片复制为拥有所有权的 Vec/Bytes，再由 `format_into_buf` 复制进 `out_buffer`。写短返回时 `drain` 删除逻辑前缀，不代表释放 Vec capacity。自动 Pong 与 Ping 的 Bytes 可共享；待发槽只有一个，但仍可能保留其 backing。
+- 业务写先按实际长度复制调用者切片（最多 64 KiB），再由 `format_into_buf` 复制进 `out_buffer`。相对 16 KiB 版本，单帧临时 owned payload 峰值增加 **48 KiB**；没有提前为小写或握手分配 64 KiB。65536 字节载荷有 10 字节帧头，两条满帧不能同时排入 128 KiB。写短返回时 `drain` 删除逻辑前缀，不代表释放 Vec capacity。自动 Pong 与 Ping 的 Bytes 可共享；待发槽只有一个，但仍可能保留其 backing。
 
 ## 保守用户态缓冲容量模型
 
@@ -57,7 +57,7 @@
 
 为避免把共享 Bytes 当成零内存，或把 realloc 的旧块漏掉，按比正常生产组合更松的同时存活模型核算：
 
-- 令 `M=1048576`、`R=16384`、`H=32768`、`E=8192`、`W=131072`、`S=16384`。
+- 令 `M=1048576`、`R=16384`、`H=32768`、`E=8192`、`W=131072`、`S=65536`。
 - 对接收 backing 使用宽松额度 `C=4*(M+R+14)=4259896`。它给长度 reserve、已有部分读取、offset、倍增与头空间留余量，并不宣称库真的每次都申请 C。
 - 最多四份 C 同时计入：当前接收 backing、被完成消息/控制视图钉住的旧 backing，以及读缓冲换新时保守计入的旧/新块。共享时仍重复记账，从而不依赖零拷贝节省。
 - 再额外计入 `4*M`：分片累积 Vec 的容量和增长迁移旧块。完成消息若已计入 backing 仍重复记账。
@@ -90,7 +90,7 @@
 
 ### 实际运行结果
 
-2026-11-05主线执行，退出码0；macOS ARM64、rustc1.95.0。精确命令：
+2026-11-26 使用 64 KiB 出站上限重测，退出码 0；macOS ARM64、rustc 1.91.0。分配夹具先排入 65536+10 和 65522+4 字节，恰占 128 KiB；随后连 1 字节载荷也应拒绝。精确命令：
 
 ```sh
 cargo test --locked --offline --test websocket_library -- --nocapture --test-threads=1
@@ -100,8 +100,8 @@ cargo test --locked --offline --test websocket_library -- --nocapture --test-thr
 
 | 夹具 | peak_delta | retained_delta | end_delta | calls / reallocations | largest_request | requested_total |
 |---|---:|---:|---:|---:|---:|---:|
-| single_binary_1mib | 1196104 | 1196104 | 0 | 16 / 4 | 1064960 | 1458332 |
-| fragmented_binary_and_reserved_next_frame | 4276362 | 4276362 | 0 | 30 / 14 | 1048640 | 6848693 |
-| fragmented_text_and_reserved_next_frame | 4276362 | 4276362 | 0 | 30 / 14 | 1048640 | 6848693 |
+| single_binary_1mib | 1196092 | 1196092 | 0 | 9 / 2 | 1064960 | 1409137 |
+| fragmented_binary_and_reserved_next_frame | 4276350 | 4276350 | 0 | 24 / 12 | 1048640 | 6799554 |
+| fragmented_text_and_reserved_next_frame | 4276350 | 4276350 | 0 | 24 / 12 | 1048640 | 6799554 |
 
-最大观测请求峰值为4276362字节（约4.08MiB），不是32MiB阈值，也不是整条WS/WSS连接或OS/TLS/生产RSS峰值。零end_delta只说明这些测量窗口显式drop后请求增量归零。锁为`56b19d93fc724a1cf6b2cf0dd52264029112e41194bb5f0299ae8000d613b723`；后续平台或库输入须重新实际测量，不能将本表扩为所有输入的硬上界。
+最大观测请求峰值为 4276350 字节（约 4.08 MiB），发生在分片读夹具，并非单帧写的峰值。不能由此判定每次写的临时分配没有增长，也不能据此推算整条 WS/WSS 连接或进程 RSS。零 end_delta 只说明这些窗口显式 drop 后请求增量归零。

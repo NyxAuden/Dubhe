@@ -13,17 +13,19 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll, ready};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, PollSender};
 
 use crate::config::{Inbound, User};
 use crate::forward::{self, Context};
@@ -153,7 +155,7 @@ where
     S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (mut read, mut write) = tokio::io::split(io);
-    let (frames, mut outgoing) = mpsc::channel::<Vec<u8>>(64);
+    let (frames, mut outgoing) = mpsc::channel(64);
     let writer = ctx.children.spawn(async move {
         let _ = write_frames(&mut write, &mut outgoing).await;
     });
@@ -175,32 +177,138 @@ where
 /// 公平性，并让控制帧在有限个数据帧之后就能出队。
 const MAX_WRITE_BATCH: usize = 4;
 
+enum Outgoing {
+    Frame(Vec<u8>),
+    Flush(oneshot::Sender<()>),
+}
+
+/// TCP 下行只在会话队列给出空位后复制调用方切片，Pending 不持有其数据。
+struct PshWriter {
+    id: u32,
+    tx: PollSender<Outgoing>,
+    ack: Option<oneshot::Receiver<()>>,
+    fin: bool,
+    dirty: bool,
+}
+
+fn writer_closed() -> io::Error {
+    io::ErrorKind::BrokenPipe.into()
+}
+
+impl PshWriter {
+    fn new(id: u32, tx: mpsc::Sender<Outgoing>) -> Self {
+        Self {
+            id,
+            tx: PollSender::new(tx),
+            ack: None,
+            fin: false,
+            dirty: false,
+        }
+    }
+    fn reserve(&mut self, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        self.tx.poll_reserve(cx).map_err(|_| writer_closed())
+    }
+    fn send(&mut self, item: Outgoing) -> io::Result<()> {
+        self.tx.send_item(item).map_err(|_| writer_closed())
+    }
+}
+
+impl AsyncWrite for PshWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.fin {
+            return Poll::Ready(Err(writer_closed()));
+        }
+        if bytes.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if self.ack.is_some() {
+            ready!(self.as_mut().poll_flush(cx))?;
+        }
+        ready!(self.reserve(cx))?;
+        let n = bytes.len().min(16 * 1024);
+        let id = self.id;
+        self.send(control(COMMAND_PSH, id, &bytes[..n]))?;
+        self.dirty = true;
+        Poll::Ready(Ok(n))
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        if !self.dirty {
+            return Poll::Ready(Ok(()));
+        }
+        if self.ack.is_none() {
+            ready!(self.reserve(cx))?;
+            let (tx, rx) = oneshot::channel();
+            self.send(Outgoing::Flush(tx))?;
+            self.ack = Some(rx);
+        }
+        let ack = self.ack.as_mut().expect("已入队的 flush 屏障");
+        let result = ready!(Pin::new(ack).poll(cx));
+        self.ack = None;
+        result.map_err(|_| writer_closed())?;
+        self.dirty = false;
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        if !self.fin {
+            if self.ack.is_some() {
+                ready!(self.as_mut().poll_flush(cx))?;
+            }
+            ready!(self.reserve(cx))?;
+            let id = self.id;
+            self.send(control(COMMAND_FIN, id, &[]))?;
+            self.fin = true;
+            self.dirty = true;
+        }
+        self.poll_flush(cx)
+    }
+}
+
 /// 把排队中的帧写到下游。
 ///
 /// 只合并**已经在队列里**的帧，绝不为凑批等待下一帧：队列空时立即写出。
 /// 帧按入队顺序拼接，所以 FIN / SYNACK 等控制帧不会被它前面的数据帧越过。
-async fn write_frames<W>(write: &mut W, frames: &mut mpsc::Receiver<Vec<u8>>) -> io::Result<()>
+async fn write_frames<W>(write: &mut W, frames: &mut mpsc::Receiver<Outgoing>) -> io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt as _;
     while let Some(first) = frames.recv().await {
-        let mut batch = first;
+        let mut batch = match first {
+            Outgoing::Frame(frame) => frame,
+            Outgoing::Flush(ack) => {
+                // 每批末尾已经 flush；即使前面没有数据也要传播底层错误。
+                write.flush().await?;
+                let _ = ack.send(());
+                continue;
+            }
+        };
+        let mut barrier = None;
         for _ in 1..MAX_WRITE_BATCH {
             match frames.try_recv() {
-                Ok(frame) => batch.extend_from_slice(&frame),
+                Ok(Outgoing::Frame(frame)) => batch.extend_from_slice(&frame),
+                Ok(Outgoing::Flush(ack)) => {
+                    barrier = Some(ack);
+                    break;
+                }
                 Err(_) => break,
             }
         }
         write.write_all(&batch).await?;
         write.flush().await?;
+        if let Some(ack) = barrier {
+            let _ = ack.send(());
+        }
     }
     write.shutdown().await
 }
 
 async fn read_loop<R>(
     read: &mut R,
-    frames: mpsc::Sender<Vec<u8>>,
+    frames: mpsc::Sender<Outgoing>,
     tag: &str,
     ctx: &Arc<Context>,
     scheme: &super::anytls_padding::Scheme,
@@ -348,7 +456,7 @@ where
 async fn serve_stream(
     id: u32,
     incoming: mpsc::Receiver<Vec<u8>>,
-    frames: mpsc::Sender<Vec<u8>>,
+    frames: mpsc::Sender<Outgoing>,
     tag: String,
     ctx: Arc<Context>,
     synack: bool,
@@ -436,38 +544,47 @@ async fn serve_stream(
         let _ = frames.send(control(COMMAND_SYNACK, id, &[])).await;
     }
 
-    let (relay, bridge) = start_bridge(id, incoming, frames, peer_closed.clone(), &ctx.children);
-    let relay = ctx.stats.count_user(&tag, Some(user.as_str()), relay);
-    // 对端 FIN 关闭整条流：取消时立即丢弃中继，连带关闭上游 TCP 连接。
+    let (read, write) = tokio::io::simplex(BRIDGE_BUFFER);
+    let uplink =
+        tokio_util::task::AbortOnDropHandle::new(ctx.children.spawn(copy_uplink(incoming, write)));
+    let mut down = PshWriter::new(id, frames);
     tokio::select! {
+        biased;
         _ = peer_closed.cancelled() => {}
-        _ = forward::relay(relay, upstream, ctx.stats.clone()) => {}
+        _ = async {
+            let relay = ctx.stats.count_user(&tag, Some(user.as_str()), tokio::io::join(read, &mut down));
+            let _ = forward::relay(relay, upstream, ctx.stats.clone()).await;
+            // relay 出错也关闭流；正常 EOF 已由 relay 的 shutdown 发过 FIN。
+            let _ = down.shutdown().await;
+        } => {}
     }
-    bridge.finish().await;
+    uplink.abort();
+    let _ = uplink.await;
 }
 
-/// 建立 PSH 上行桥与下行读循环；TCP 与 UoT 共享同一帧生命周期。
+async fn copy_uplink(mut incoming: Incoming, mut write: impl AsyncWrite + Unpin) {
+    if write.write_all(&incoming.take_rest()).await.is_err() {
+        return;
+    }
+    while let Some(chunk) = incoming.recv().await {
+        if write.write_all(&chunk).await.is_err() {
+            return;
+        }
+    }
+    let _ = write.shutdown().await;
+}
+
+/// UoT 保留原来的双向字节流桥。
 fn start_bridge(
     id: u32,
-    mut incoming: Incoming,
-    frames: mpsc::Sender<Vec<u8>>,
+    incoming: Incoming,
+    frames: mpsc::Sender<Outgoing>,
     peer_closed: CancellationToken,
     children: &tokio_util::task::TaskTracker,
 ) -> (tokio::io::DuplexStream, Bridge) {
     let (relay, bridge) = tokio::io::duplex(BRIDGE_BUFFER);
-    let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge);
-    let uplink = children.spawn(async move {
-        let rest = incoming.take_rest();
-        if bridge_write.write_all(&rest).await.is_err() {
-            return;
-        }
-        while let Some(chunk) = incoming.recv().await {
-            if bridge_write.write_all(&chunk).await.is_err() {
-                return;
-            }
-        }
-        let _ = bridge_write.shutdown().await;
-    });
+    let (mut bridge_read, bridge_write) = tokio::io::split(bridge);
+    let uplink = children.spawn(copy_uplink(incoming, bridge_write));
     let downlink = children.spawn(async move {
         let mut buffer = vec![0u8; 16 * 1024];
         loop {
@@ -517,7 +634,11 @@ impl Drop for Bridge {
 }
 
 /// `COMMAND_SERVER_SETTINGS` 与其它控制帧共用的 7 字节头编码。
-fn control(command: u8, id: u32, payload: &[u8]) -> Vec<u8> {
+fn control(command: u8, id: u32, payload: &[u8]) -> Outgoing {
+    Outgoing::Frame(encode(command, id, payload))
+}
+
+fn encode(command: u8, id: u32, payload: &[u8]) -> Vec<u8> {
     // 上游 `writeFrame` 对超过 0xffff 的控制帧直接报错；本模块的调用点都远小于上限。
     debug_assert!(payload.len() <= usize::from(u16::MAX));
     let mut frame = Vec::with_capacity(FRAME_OVERHEAD + payload.len());
@@ -702,6 +823,89 @@ impl Incoming {
 mod tests {
     use super::*;
 
+    /// TLS 接受了明文、但 flush 尚未完成。旧 duplex 的 flush 在这里直接返回 Ok。
+    #[tokio::test]
+    async fn tcp_flush_waits_for_tls_and_cancelled_full_queue_write_is_not_replayed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Gate(Vec<u8>, Arc<AtomicBool>);
+        impl AsyncWrite for Gate {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut TaskContext<'_>,
+                b: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.0.extend_from_slice(b);
+                Poll::Ready(Ok(b.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+                if self.1.load(Ordering::Relaxed) {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                cx: &mut TaskContext<'_>,
+            ) -> Poll<io::Result<()>> {
+                self.poll_flush(cx)
+            }
+        }
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut stream = PshWriter::new(9, tx.clone());
+        let go = Arc::new(AtomicBool::new(false));
+        let mut sink = Gate(vec![], go.clone());
+        let mut cx = TaskContext::from_waker(std::task::Waker::noop());
+        stream.write_all(b"first").await.unwrap();
+        assert!(Pin::new(&mut stream).poll_flush(&mut cx).is_pending());
+        // 同批取出 PSH 与屏障；即使 write_all 已完成也不得提前确认。
+        {
+            let mut writer = std::pin::pin!(write_frames(&mut sink, &mut rx));
+            assert!(writer.as_mut().poll(&mut cx).is_pending());
+            assert!(Pin::new(&mut stream).poll_flush(&mut cx).is_pending());
+            go.store(true, Ordering::Relaxed);
+            assert!(writer.as_mut().poll(&mut cx).is_pending());
+            assert!(matches!(
+                Pin::new(&mut stream).poll_flush(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+        }
+        assert_eq!(sink.0, encode(COMMAND_PSH, 9, b"first"));
+        sink.0.clear();
+        go.store(false, Ordering::Relaxed);
+        let payload = vec![5; 32768];
+        tx.send(control(COMMAND_SYNACK, 9, &[])).await.unwrap();
+        assert_eq!(stream.write(&payload).await.unwrap(), 16384);
+        assert!(futures_util::poll!(std::pin::pin!(stream.write(b"cancel"))).is_pending());
+        {
+            let mut writer = std::pin::pin!(write_frames(&mut sink, &mut rx));
+            assert!(writer.as_mut().poll(&mut cx).is_pending());
+            stream.write_all(b"next").await.unwrap();
+            assert!(Pin::new(&mut stream).poll_flush(&mut cx).is_pending());
+            assert!(writer.as_mut().poll(&mut cx).is_pending());
+            assert!(Pin::new(&mut stream).poll_flush(&mut cx).is_pending());
+            go.store(true, Ordering::Relaxed);
+            assert!(writer.as_mut().poll(&mut cx).is_pending());
+            stream.flush().await.unwrap();
+            assert!(Pin::new(&mut stream).poll_shutdown(&mut cx).is_pending());
+            assert!(writer.as_mut().poll(&mut cx).is_pending());
+            stream.shutdown().await.unwrap();
+            stream.shutdown().await.unwrap();
+            drop((stream, tx));
+            writer.await.unwrap();
+        }
+        assert_eq!(
+            sink.0,
+            [
+                encode(COMMAND_SYNACK, 9, &[]),
+                encode(COMMAND_PSH, 9, &payload[..16384]),
+                encode(COMMAND_PSH, 9, b"next"),
+                encode(COMMAND_FIN, 9, &[])
+            ]
+            .concat()
+        );
+    }
+
     #[test]
     fn settings_version_uses_the_last_v_key() {
         assert_eq!(settings_version(b"v=2\nclient=sing-box\n"), 2);
@@ -733,19 +937,19 @@ mod tests {
     /// 合批必须：按序输出、总字节不变、不丢帧、控制帧不被延后到后续批次。
     #[tokio::test]
     async fn write_frames_batches_in_order_without_losing_bytes() {
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = mpsc::channel(64);
         // 12 帧：其中夹着 FIN，验证它不会被跨批丢掉或重排。
         let frames: Vec<Vec<u8>> = (0..12u32)
             .map(|index| {
                 if index == 7 {
-                    control(COMMAND_FIN, index, &[])
+                    encode(COMMAND_FIN, index, &[])
                 } else {
-                    control(COMMAND_PSH, index, &[index as u8; 32])
+                    encode(COMMAND_PSH, index, &[index as u8; 32])
                 }
             })
             .collect();
         for frame in &frames {
-            tx.send(frame.clone()).await.unwrap();
+            tx.send(Outgoing::Frame(frame.clone())).await.unwrap();
         }
         drop(tx);
 
@@ -754,7 +958,7 @@ mod tests {
 
         let expected: Vec<u8> = frames.concat();
         assert_eq!(sink, expected, "合批必须逐字节保持顺序与内容");
-        let fin = control(COMMAND_FIN, 7, &[]);
+        let fin = encode(COMMAND_FIN, 7, &[]);
         let position = sink
             .windows(fin.len())
             .position(|window| window == fin.as_slice())
@@ -777,7 +981,7 @@ mod tests {
     #[test]
     fn update_padding_scheme_frame_uses_standard_header() {
         let scheme = DEFAULT_PADDING_SCHEME.as_bytes();
-        let frame = control(COMMAND_UPDATE_PADDING_SCHEME, 0, scheme);
+        let frame = encode(COMMAND_UPDATE_PADDING_SCHEME, 0, scheme);
         let length = u16::try_from(scheme.len()).unwrap();
 
         assert_eq!(frame.len(), FRAME_OVERHEAD + scheme.len());
@@ -789,7 +993,7 @@ mod tests {
 
     #[test]
     fn frame_control_round_trips_header_fields() {
-        let frame = control(COMMAND_PSH, 0x0102_0304, b"abc");
+        let frame = encode(COMMAND_PSH, 0x0102_0304, b"abc");
         assert_eq!(frame[0], COMMAND_PSH);
         assert_eq!(&frame[1..5], &[1, 2, 3, 4]);
         assert_eq!(&frame[5..7], &[0, 3]);

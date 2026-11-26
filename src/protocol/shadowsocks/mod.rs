@@ -194,29 +194,17 @@ pub(crate) async fn serve_generic<S: DetourStream + 'static>(
     let (stream, route, dial) =
         crate::transport::sniff::sniff_route(&ctx, tag, stream, &target).await;
     let target = ctx.connect_routed(tag, &route, &dial).await?;
-    // SS2022 必须保留自己的块大小，**不能跟随公共默认值**。
-    //
-    // Linux ARM64 回环、客户端固定 sing-box、各 2–3 轮（Gbit/s）：
-    //
-    // | 上行/下行 | 下载 | 上传 |
-    // |---|---:|---:|
-    // | **8/32 KiB（此处）** | 15.0 | **23.0** |
-    // | 8/64 KiB | — | — |
-    // | 32/64 KiB（公共默认） | 20.2 | **15.0** |
-    //
-    // 上行放大到 32 KiB 会掉 35%（23.0 → 15.0），与 VLESS 的结论相反：
-    // SS2022 每条记录独立加密，块大小直接决定单条记录长度，而 VLESS 的
-    // 大块能摊薄 TLS 记录数。公开对照 sing-box 是 23.3/24.3，所以这里用
-    // 8/32 时下载落后约 36%、上传基本持平。
     if is_2022 {
-        return forward::relay_sized(
-            stream,
-            target,
-            ctx.stats.clone(),
-            forward::COPY_BLOCK,
-            32 * 1024,
-        )
-        .await;
+        return relay_2022(stream, target, ctx.stats.clone()).await;
     }
     forward::relay(stream, target, ctx.stats.clone()).await
+}
+
+/// 两个真实客户端的双向 A/B 见 docs/throughput-baseline.md；仅在成功拨号后分配。
+async fn relay_2022(
+    client: impl AsyncRead + AsyncWrite + Unpin,
+    target: impl AsyncRead + AsyncWrite + Unpin,
+    stats: Arc<crate::telemetry::Stats>,
+) -> io::Result<()> {
+    forward::relay_sized(client, target, stats, 32 * 1024, 32 * 1024).await
 }

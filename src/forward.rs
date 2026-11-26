@@ -1360,7 +1360,7 @@ where
     relay_sized(client, target, stats, uplink, downlink).await
 }
 
-/// 默认中继块；与 Tokio 的 `DEFAULT_BUF_SIZE` 一致。
+/// 历史 8 KiB 基准（与 Tokio 的 `DEFAULT_BUF_SIZE` 一致）。
 ///
 /// # 与上游实现的对照（2026-11，均为源码核实）
 ///
@@ -1405,8 +1405,7 @@ where
 ///   `pos == cap` 时必须先 flush；EOF 后要先 flush 再**持久化**进入
 ///   shutdown 阶段（重复从 flush 开始会卡住 H3 这类「flush 和 FIN 是两条
 ///   命令」的传输）。
-pub(crate) const COPY_BLOCK: usize = 8 * 1024;
-
+///
 /// 上行（client→target）中继块大小。
 ///
 /// Linux ARM64 原生回环、VLESS+TLS、客户端固定 sing-box 1.11.15、交替 A/B、

@@ -108,7 +108,7 @@ early-data 可以包含用户身份秘密。不要公开完整 URI、HTTP 头、
 | 单输入帧 / 累计消息 | 各 1048576 字节（1 MiB） |
 | 引擎 read buffer | 16384 字节 |
 | 引擎 write buffer | `write_buffer_size=0`，`max_write_buffer_size=131072`，含 framing |
-| 单次业务写入 | 最多 16384 字节形成一条 Binary；大写可能短返回 |
+| 单次业务写入 | 最多 65536 字节形成一条 Binary；更大的写短返回，小应答不等凑帧 |
 | 外层每次 poll 的非业务事件 | 至多 32 个，空消息 / Ping / Pong 等也消耗预算 |
 | 原始护栏每次外层 poll 的读取 | 至多 32 个新帧头起点 / 65536 原始字节 |
 | Close 等待 | 5 秒，仍可被 Server 强制停止提前取消 |

@@ -25,7 +25,7 @@ use tungstenite::{
 const MIB: usize = 1_048_576;
 const READ_BUFFER: usize = 16_384;
 const WRITE_BUFFER: usize = 131_072;
-const SINGLE_WRITE: usize = 16_384;
+const SINGLE_WRITE: usize = 65_536;
 
 #[global_allocator]
 static ALLOCATOR: allocation::TrackingAllocator = allocation::TrackingAllocator;
@@ -407,7 +407,7 @@ fn async_wouldblock_accepts_exactly_once() {
 }
 
 fn sync_write_buffer_full_returns_unaccepted_frame() {
-    let first = vec![0x41; SINGLE_WRITE];
+    let first = vec![0x41; 16_384];
     let rejected_payload = vec![0x42; SINGLE_WRITE];
     let mut output = Vec::new();
     let mut socket = WebSocket::from_raw_socket(
@@ -496,14 +496,13 @@ fn fragmented(wire: &mut Vec<u8>, text: bool) {
 }
 
 fn queue_bounded_writes(socket: &mut WebSocket<Probe<'_>>) {
-    for _ in 0..7 {
-        assert!(
-            matches!(socket.write(Message::binary(vec![0x55; SINGLE_WRITE])),
-            Err(Error::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
-        );
+    // 满尺寸帧用十字节头；第二个用四字节头，恰好填满逻辑预算。
+    for size in [SINGLE_WRITE, WRITE_BUFFER - SINGLE_WRITE - 10 - 4] {
+        assert!(matches!(socket.write(Message::binary(vec![0x55; size])),
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::WouldBlock));
     }
     assert!(matches!(
-        socket.write(Message::binary(vec![0x66; SINGLE_WRITE])),
+        socket.write(Message::binary(vec![0x66; 1])),
         Err(Error::WriteBufferFull(_))
     ));
     assert_eq!(socket.get_ref().written, 0);
