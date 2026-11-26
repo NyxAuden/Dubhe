@@ -12,7 +12,7 @@ use prost::bytes::{Buf, Bytes};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout};
 
 const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 
@@ -225,6 +225,232 @@ async fn packet_up_posts_feed_a_get_downlink() {
     assert!(head.contains("text/event-stream"), "{head}");
     let data = read_chunked_until(&mut stream, b"hello").await;
     assert!(data.windows(5).any(|window| window == b"hello"));
+}
+
+async fn packet_reply(
+    address: SocketAddr,
+    path: &str,
+    framing: &str,
+    body: &[u8],
+    fin: bool,
+) -> Vec<u8> {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    let head = format!(
+        "POST /GunService/Tun/{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{framing}\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let _ = stream.write_all(body).await;
+    if fin {
+        stream.shutdown().await.unwrap();
+    }
+    let mut reply = Vec::new();
+    match stream.read_to_end(&mut reply).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("{e}"),
+    }
+    reply
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packet_up_rejects_malformed_requests_and_closes() {
+    let server = Running::start(config("auto")).await;
+    let chunked = "Transfer-Encoding: chunked";
+    let overflow = format!("1\r\na\r\n{:x}\r\n", usize::MAX);
+    for (path, framing, body, fin, accepted) in [
+        (
+            "reorder/1",
+            chunked,
+            &b"1\r\na\r\n0\r\n\r\n"[..],
+            false,
+            true,
+        ),
+        ("reorder/0", "Content-Length: 1", &b"b"[..], false, true),
+        ("reorder/1", "Content-Length: 1", &b"a"[..], false, false),
+        ("long/0", "Content-Length: 1000001", &b""[..], false, false),
+        ("truncated/0", chunked, &b"3\r\na"[..], true, false),
+        ("partial-line/0", chunked, &b"1"[..], true, false),
+        ("bad-ending/0", chunked, &b"1\r\naXX"[..], false, false),
+        ("overflow/0", chunked, overflow.as_bytes(), false, false),
+        (
+            "seq/18446744073709551616",
+            "Content-Length: 1",
+            &b"a"[..],
+            false,
+            false,
+        ),
+    ] {
+        let start = Instant::now();
+        let reply = timeout(
+            Duration::from_secs(2),
+            packet_reply(server.address, path, framing, body, fin),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{path}: 未关闭"));
+        assert_eq!(
+            reply.starts_with(b"HTTP/1.1 200 "),
+            accepted,
+            "{path}: {}",
+            String::from_utf8_lossy(&reply)
+        );
+        eprintln!("XHTTP {path}: {:.6}s", start.elapsed().as_secs_f64());
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn incomplete_packet_up_without_fin_closes_at_handshake_deadline() {
+    let mut value = config("auto");
+    value["limits"]["handshake_timeout_ms"] = json!(300);
+    let server = Running::start(value).await;
+    let reply = timeout(
+        Duration::from_secs(2),
+        packet_reply(server.address, "normal/0", "Content-Length: 1", b"a", false),
+    )
+    .await
+    .unwrap();
+    assert!(reply.starts_with(b"HTTP/1.1 200 "));
+    let start = Instant::now();
+    let result = timeout(
+        Duration::from_secs(2),
+        packet_reply(
+            server.address,
+            "incomplete/0",
+            "Content-Length: 2",
+            b"a",
+            false,
+        ),
+    )
+    .await;
+    eprintln!(
+        "XHTTP incomplete without FIN: {:.3}s",
+        start.elapsed().as_secs_f64()
+    );
+    assert!(
+        !result
+            .expect("半帧未在握手期限内关闭")
+            .starts_with(b"HTTP/1.1 200 ")
+    );
+    server.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn queued_bytes_budget_is_shared_across_xhttp_listeners() {
+    use std::{
+        fs,
+        net::TcpListener,
+        process::{Child, Command, Stdio},
+    };
+
+    struct ServerProcess(Child);
+    impl Drop for ServerProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let ports = [(); 2].map(|_| TcpListener::bind("127.0.0.1:0").unwrap());
+    let addresses = ports.each_ref().map(|s| s.local_addr().unwrap());
+    let mut value = config("auto");
+    value["inbounds"][0]["listen"] = json!(addresses[0]);
+    let mut second = value["inbounds"][0].clone();
+    second["listen"] = json!(addresses[1]);
+    second["tag"] = json!("second");
+    value["inbounds"].as_array_mut().unwrap().push(second);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    fs::write(file.path(), value.to_string()).unwrap();
+    drop(ports);
+    let mut server = ServerProcess(
+        Command::new(
+            std::env::var_os("DUBHE_TEST_BINARY")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_dubhe").into()),
+        )
+        .arg("run")
+        .arg("-c")
+        .arg(file.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap(),
+    );
+    timeout(Duration::from_secs(5), async {
+        for address in addresses {
+            while TcpStream::connect(address).await.is_err() {
+                assert!(server.0.try_wait().unwrap().is_none(), "服务端启动失败");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    let proc_dir = format!("/proc/{}", server.0.id());
+    let rss = || -> u64 {
+        fs::read_to_string(format!("{proc_dir}/smaps_rollup"))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("Rss:"))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let cpu = || -> u64 {
+        let stat = fs::read_to_string(format!("{proc_dir}/stat")).unwrap();
+        stat.rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .skip(11)
+            .take(2)
+            .map(|v| v.parse::<u64>().unwrap())
+            .sum()
+    };
+    let payload = vec![0x41; 512 * 1024];
+    // 各入口先跑正常的 stream-one 回显，对照失败时不把停服当拒绝。
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    for address in addresses {
+        timeout(Duration::from_secs(2), async {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let mut body = vless_request(echo.address);
+            body.extend_from_slice(b"baseline");
+            stream.write_all(format!("POST /GunService/Tun HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            assert!(read_head(&mut stream).await.0.starts_with("HTTP/1.1 200 "));
+            assert!(read_chunked_until(&mut stream, b"baseline").await.ends_with(b"baseline"));
+        }).await.unwrap();
+    }
+    let (base, ticks, start) = (rss(), cpu(), Instant::now());
+    let mut peak = base;
+    let mut accepted = [0; 2];
+    for (i, address) in addresses.into_iter().enumerate() {
+        for seq in 0..24 {
+            let path = format!("budget-{seq}/0");
+            let reply = timeout(
+                Duration::from_secs(2),
+                packet_reply(address, &path, "Content-Length: 524288", &payload, false),
+            )
+            .await
+            .unwrap();
+            accepted[i] += usize::from(reply.starts_with(b"HTTP/1.1 200 "));
+            peak = peak.max(rss());
+        }
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "测试必须在会话 TTL 前完成"
+    );
+    eprintln!(
+        "XHTTP RSS baseline {base} KiB, sampled peak {peak} KiB, CPU {} ticks, {:.3}s, accepted {accepted:?}, rejected {}",
+        cpu() - ticks,
+        start.elapsed().as_secs_f64(),
+        48 - accepted.iter().sum::<usize>()
+    );
+    assert_eq!(accepted[0], 16, "单入口应正好接收 8 MiB");
+    assert_eq!(accepted[1], 0, "第二入口不能再占用已耗尽的预算");
 }
 
 #[tokio::test]

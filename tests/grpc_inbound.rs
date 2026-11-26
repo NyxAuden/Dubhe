@@ -1020,28 +1020,50 @@ async fn h2_handshake_without_any_rpc_is_closed_at_deadline() {
 #[tokio::test]
 async fn rpc_without_authentication_keeps_permit_and_is_closed_at_deadline() {
     let mut value = config(None, None);
-    value["limits"]["handshake_timeout_ms"] = json!(300);
+    value["limits"]["handshake_timeout_ms"] = json!(600);
+    value["limits"]["per_ip_handshakes"] = json!(1);
+    let echo = Echo::tcp("127.0.0.1", false).await;
     let server = Running::start(value).await;
-
-    let io = timeout(WAIT, TcpStream::connect(server.address))
+    let round_trip = || async {
+        let (mut send, mut body, driver) = plain_client(server.address, "/GunService/Tun").await;
+        timeout(
+            WAIT,
+            vless_tcp_round_trip(&mut send, &mut body, echo.address),
+        )
         .await
-        .unwrap()
         .unwrap();
-    let (mut send_request, connection) = h2::client::handshake(io).await.unwrap();
-    let driver = tokio::spawn(connection);
-    let (response, mut stream) = send_request
-        .send_request(request("/GunService/Tun"), false)
-        .unwrap();
-    // 只发一个不构成有效认证的短帧，然后保持连接不关。
-    let _ = stream.send_data(
-        prost::bytes::Bytes::from_static(&[0, 0, 0, 0, 2, 0xff]),
-        false,
-    );
-    drop(response);
+        driver.abort();
+        let _ = driver.await;
+    };
+    round_trip().await;
 
-    // 服务端应在期限内关闭；driver 以错误或结束收场。
-    let closed = timeout(Duration::from_secs(3), driver).await;
-    assert!(closed.is_ok(), "未完成认证的 RPC 不应让连接无限存活");
+    for round in 1..=3 {
+        let started = tokio::time::Instant::now();
+        let (mut stream, _body, driver) = plain_client(server.address, "/GunService/Tun").await;
+        stream
+            .send_data(
+                prost::bytes::Bytes::from_static(&[0, 0, 0, 0, 2, 0xff]),
+                false,
+            )
+            .unwrap();
+        let rejected_before = server.stats.snapshot().rejected;
+        let mut denied = TcpStream::connect(server.address).await.unwrap();
+        let result = timeout(Duration::from_millis(350), denied.read(&mut [0]))
+            .await
+            .expect("同源第二条连接应在第一条超时前被拒绝");
+        assert!(matches!(result, Ok(0) | Err(_)));
+        assert_eq!(server.stats.snapshot().rejected, rejected_before + 1);
+        timeout(Duration::from_secs(2), driver)
+            .await
+            .expect("未完成认证的 RPC 必须关闭")
+            .unwrap()
+            .ok();
+        eprintln!(
+            "gRPC round {round}: closed after {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+        round_trip().await;
+    }
     server.shutdown().await;
 }
 

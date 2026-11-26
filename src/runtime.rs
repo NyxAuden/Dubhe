@@ -553,8 +553,12 @@ impl Server {
                 let mut loaded = tls::load(certificate, private_key)?;
                 Arc::make_mut(&mut loaded).alpn_protocols = vec![b"h3".to_vec()];
                 let vmess = prepare_vmess(inbound, vmess_replay.clone())?;
-                let pool =
-                    transport::xhttp::Pool::new(xhttp, &config.limits, context.stats.clone());
+                let pool = transport::xhttp::Pool::new(
+                    xhttp,
+                    &config.limits,
+                    context.xhttp_bytes.clone(),
+                    context.stats.clone(),
+                );
                 let socket = UdpSocket::bind(inbound.listen()).await.map_err(|error| {
                     anyhow::anyhow!("入口 {} UDP绑定失败: {:?}", inbound.tag(), error.kind())
                 })?;
@@ -788,6 +792,7 @@ impl Server {
                 | Inbound::TrojanXhttp { xhttp, .. } => Some(crate::transport::xhttp::Pool::new(
                     xhttp,
                     &config.limits,
+                    context.xhttp_bytes.clone(),
                     context.stats.clone(),
                 )),
                 _ => None,

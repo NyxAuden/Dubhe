@@ -18,6 +18,7 @@ use dubhe::{
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 /// 按 Xray `xray.common.geodata.GeoSiteList` 编码最小 geosite.dat。
 ///
@@ -821,4 +822,57 @@ async fn ip_is_private_rule_applies_to_domain_targets_without_ip_strategy() {
         std::io::ErrorKind::PermissionDenied,
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn private_rule_is_consistent_over_socks_tcp() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    for reject in [false, true] {
+        let mut value = socks_config();
+        value["dns"] = json!({"hosts": {"private.test": ["127.0.0.1"]}});
+        value["sniffing"] =
+            json!({"enabled": true, "inbounds": ["socks"], "dest_override": ["http"]});
+        if reject {
+            value["route"]["rules"] = json!([{"ip_is_private": true, "outbound": "reject"}]);
+        }
+        let server = Running::start(value).await;
+        let port = echo.address.port();
+        for (kind, destination, payload) in [
+            ("IP", common::address(echo.address), &b"echo"[..]),
+            ("domain", common::domain("private.test", port), &b"echo"[..]),
+            (
+                "override",
+                common::address(([192, 0, 2, 1], port).into()),
+                &b"GET / HTTP/1.1\r\nHost: private.test\r\n\r\n"[..],
+            ),
+        ] {
+            let start = tokio::time::Instant::now();
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let mut client = TcpStream::connect(server.address).await.unwrap();
+                let mut request = vec![5, 1, 0, 5, 1, 0];
+                request.extend(destination);
+                request.extend(payload);
+                client.write_all(&request).await.unwrap();
+                let mut method = [0; 2];
+                client.read_exact(&mut method).await.unwrap();
+                assert_eq!(method, [5, 0]);
+                let (code, _) = common::read_socks_reply(&mut client).await;
+                assert_eq!(code, if reject { 2 } else { 0 }, "{kind}");
+                if reject {
+                    assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+                } else {
+                    let mut received = vec![0; payload.len()];
+                    client.read_exact(&mut received).await.unwrap();
+                    assert_eq!(received, payload);
+                }
+                eprintln!(
+                    "SOCKS {kind}: REP={code}, {:.6}s",
+                    start.elapsed().as_secs_f64()
+                );
+            })
+            .await
+            .expect("SOCKS 请求必须结束");
+        }
+        server.shutdown().await;
+    }
 }

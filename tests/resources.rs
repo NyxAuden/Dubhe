@@ -6,7 +6,7 @@ use common::*;
 use dubhe::telemetry::{Snapshot, Stats};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpListener, TcpSocket, TcpStream, UdpSocket},
     time::{Instant, sleep, timeout},
 };
 
@@ -123,6 +123,66 @@ async fn global_connection_limit_spans_inbounds_and_recovers_after_close() {
     exchange(&mut recovered, b"reused-global-slot").await;
     drop(recovered);
     wait_stats(&server.stats, empty).await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "使用默认 10s 期限的本地验收"]
+async fn default_handshake_limits_recover_after_deadline() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let mut config = socks_config();
+    config.as_object_mut().unwrap().remove("limits");
+    let server = Running::start(config).await;
+    let probe = || async {
+        let (mut client, _) = socks(1, address(echo.address), server.address).await;
+        exchange(&mut client, b"available").await;
+    };
+    probe().await;
+    wait_stats(&server.stats, empty).await;
+    let inbound = server.address;
+    let connect = |ip| async move {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::from(([127, 0, 0, ip], 0))).unwrap();
+        timeout(WAIT, socket.connect(inbound))
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let started = Instant::now();
+    let mut held = Vec::new();
+    for ip in 1..=8 {
+        for _ in 0..8 {
+            held.push(connect(ip).await);
+        }
+        if ip == 1 {
+            wait_stats(&server.stats, |s| s.connections == 8).await;
+            closed(&mut connect(1).await).await;
+            wait_stats(&server.stats, |s| s.rejected == 1).await;
+        }
+    }
+    wait_stats(&server.stats, |s| s.connections == 64).await;
+    for _ in 0..16 {
+        closed(&mut connect(9).await).await;
+    }
+    wait_stats(&server.stats, |s| s.rejected == 17 && s.connections == 64).await;
+    assert!(started.elapsed() < Duration::from_secs(3));
+    timeout(Duration::from_secs(11), async {
+        for client in &mut held {
+            let result = client.read(&mut [0]).await;
+            assert!(matches!(result, Ok(0) | Err(_)));
+        }
+    })
+    .await
+    .expect("未完成的握手必须关闭");
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_secs(9));
+    assert!(elapsed < Duration::from_secs(11));
+    wait_stats(&server.stats, empty).await;
+    probe().await;
+    eprintln!(
+        "SOCKS default limits: 64 closed in {:.3}s; 1 per-IP + 16 per-inbound rejected",
+        elapsed.as_secs_f64()
+    );
     server.shutdown().await;
 }
 

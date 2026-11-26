@@ -50,6 +50,8 @@ impl Pool {
     pub(crate) fn new(
         xhttp: &Xhttp,
         limits: &Limits,
+        // 进程级共享的排队字节预算；由 `Context` 持有并注入所有入口。
+        buffer_bytes: Arc<Semaphore>,
         stats: Arc<crate::telemetry::Stats>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -58,7 +60,7 @@ impl Pool {
             stats,
             max_buffered: xhttp.sc_max_buffered_posts,
             ttl: Duration::from_millis(xhttp.session_ttl_ms),
-            buffer_bytes: Arc::new(Semaphore::new(limits.xhttp_buffer_bytes)),
+            buffer_bytes,
         })
     }
 
@@ -731,7 +733,17 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
         let lane = pool.open(session_id.clone())?;
         write_status(&mut conn.io, xhttp, "200 OK").await?;
-        conn.stream_body(&head.body, &lane).await?;
+        // 正文读取同样受绝对期限约束：此前只有请求头有，半帧正文可以让
+        // 连接一直挂着（实测超出 0.3 s 期限 6 倍仍未关闭）。
+        match tokio::time::timeout_at(absolute, conn.stream_body(&head.body, &lane)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "XHTTP 上行正文超时",
+                ));
+            }
+        }
         return Ok(Some(conn));
     }
     // packet-up：有界读取后按 seq 入队。
@@ -742,16 +754,27 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         write_status(&mut conn.io, xhttp, "400 Bad Request").await?;
         return Ok(None);
     }
-    let body = match conn
-        .read_body(&head.body, xhttp.sc_max_each_post_bytes as usize)
-        .await
+    // packet-up 的正文读取也在认证之前，必须有同一绝对期限。
+    let body = match tokio::time::timeout_at(
+        absolute,
+        conn.read_body(&head.body, xhttp.sc_max_each_post_bytes as usize),
+    )
+    .await
     {
-        Ok(body) => body,
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-            write_status(&mut conn.io, xhttp, "413 Payload Too Large").await?;
-            return Ok(Some(conn));
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "XHTTP 上行正文超时",
+            ));
         }
-        Err(error) => return Err(error),
+        Ok(result) => match result {
+            Ok(body) => body,
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                write_status(&mut conn.io, xhttp, "413 Payload Too Large").await?;
+                return Ok(Some(conn));
+            }
+            Err(error) => return Err(error),
+        },
     };
     let payload = match uplink_payload(xhttp, &head.headers, body) {
         Ok(payload) => payload,

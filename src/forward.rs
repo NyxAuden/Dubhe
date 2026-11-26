@@ -73,6 +73,12 @@ pub struct Context {
     pub stats: Arc<Stats>,
     pub udp_slots: Arc<Semaphore>,
     pub udp_bytes: Arc<Semaphore>,
+    /// XHTTP 各会话认证前排队负载的**进程级共享**字节预算。
+    ///
+    /// 必须由 `Context` 持有、注入所有 XHTTP `Pool`：此前每个 `Pool` 各建
+    /// 一个信号量，于是配置里的 `xhttp_buffer_bytes` 实际是「每入口」，
+    /// 多入口会成倍放大。与 `udp_bytes` 同一模式。
+    pub xhttp_bytes: Arc<Semaphore>,
     pub children: tokio_util::task::TaskTracker,
     /// 跨热重载共享的出站后台资源停机信号，先取消再等children。
     pub(crate) outbound_stop: CancellationToken,
@@ -217,6 +223,7 @@ impl Context {
             stats: Arc::new(Stats::with_idle_timeout(config.limits.idle_timeout_ms)),
             udp_slots: Arc::new(Semaphore::new(config.limits.max_udp_associations)),
             udp_bytes: Arc::new(Semaphore::new(config.limits.udp_queue_bytes)),
+            xhttp_bytes: Arc::new(Semaphore::new(config.limits.xhttp_buffer_bytes)),
             children: tokio_util::task::TaskTracker::new(),
             outbound_stop: CancellationToken::new(),
             shutdown: CancellationToken::new(),
@@ -247,6 +254,7 @@ impl Context {
             stats: previous.stats.clone(),
             udp_slots: previous.udp_slots.clone(),
             udp_bytes: previous.udp_bytes.clone(),
+            xhttp_bytes: previous.xhttp_bytes.clone(),
             children: previous.children.clone(),
             outbound_stop: previous.outbound_stop.clone(),
             shutdown: CancellationToken::new(),

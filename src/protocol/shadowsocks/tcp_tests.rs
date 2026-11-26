@@ -153,6 +153,7 @@ impl Fixture {
             stats: Arc::new(Stats::default()),
             udp_slots: Arc::new(Semaphore::new(1)),
             udp_bytes: Arc::new(Semaphore::new(1)),
+            xhttp_bytes: Arc::new(Semaphore::new(1)),
             vless_encryption: std::collections::HashMap::new(),
             children: tokio_util::task::TaskTracker::new(),
             outbound_stop: tokio_util::sync::CancellationToken::new(),
