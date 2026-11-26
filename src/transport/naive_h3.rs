@@ -5,7 +5,7 @@ use super::{
     xhttp::{H3Reader, Tunnel},
 };
 use crate::{
-    config::{Inbound, User},
+    config::Inbound,
     forward::Context,
     protocol::http as proxy_http,
     telemetry::Gauge,
@@ -49,9 +49,9 @@ pub(crate) async fn serve(
     stop: CancellationToken,
     force: CancellationToken,
 ) -> io::Result<()> {
-    let Inbound::Naive { tag, users, .. } = &*config else {
+    if !matches!(&*config, Inbound::Naive { .. }) {
         return Err(io::Error::other("入口不是Naive"));
-    };
+    }
     let mut tls = (*tls).clone();
     tls.alpn_protocols = vec![b"h3".to_vec()];
     tls.max_early_data_size = 0;
@@ -87,14 +87,16 @@ pub(crate) async fn serve(
                 let Some(incoming)=incoming else {break};
                 let Ok(slot)=slots.clone().try_acquire_owned() else {ctx.stats.reject();incoming.refuse();continue};
                 let Ok(handshake)=handshakes.clone().try_acquire_owned() else {ctx.stats.reject();incoming.refuse();continue};
-                let (ctx,tag,users,streams)=(ctx.clone(),tag.clone(),users.clone(),streams.clone());
+                // 只共享 `Arc<Inbound>`：此前每个连接都 `users.clone()` 深复制
+                // 全部账户，成本按「连接数 × 账户数」增长。
+                let (ctx,config,streams)=(ctx.clone(),config.clone(),streams.clone());
                 let (stop,force)=(stop.clone(),force.clone());
                 let children=ctx.children.clone();
                 connections.spawn(children.track_future(async move {
                     let _slot=slot;let _gauge=ctx.stats.enter(Gauge::Connection);
                     let wait=Duration::from_millis(ctx.limits.handshake_timeout_ms);
                     let Ok(Ok(connection))=timeout(wait,incoming).await else {return};
-                    if let Err(error)=serve_connection(connection,&tag,&users,ctx,crate::runtime::HandshakePermits::new(handshake, None),streams,stop,force).await {
+                    if let Err(error)=serve_connection(connection,&config,ctx,crate::runtime::HandshakePermits::new(handshake, None),streams,stop,force).await {
                         tracing::debug!(?error,"Naive H3连接结束");
                     }
                 }));
@@ -119,8 +121,7 @@ pub(crate) async fn serve(
 #[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     connection: quinn::Connection,
-    tag: &str,
-    users: &[User],
+    config: &Arc<Inbound>,
     ctx: Arc<Context>,
     handshake: crate::runtime::HandshakePermits,
     slots: Arc<Semaphore>,
@@ -162,7 +163,10 @@ async fn serve_connection(
                     break;
                 };
                 let slots=slots.clone();
-                let (tag,users,ctx)=(tag.to_owned(),users.to_vec(),ctx.clone());
+                // 每个请求此前都 `users.to_vec()`，且发生在 `resolve_request()`
+                // 读取请求头**之前**：未认证请求即可按「账户数 × 并发请求数」
+                // 触发深复制。改为共享同一个 `Arc<Inbound>`。
+                let (config,ctx)=(config.clone(),ctx.clone());
                 let writers=writers.clone();let force=force.clone();let children=ctx.children.clone();
                 tasks.spawn(children.track_future(async move{
                     let _local=local_slot;
@@ -178,7 +182,7 @@ async fn serve_connection(
                         return;
                     };
                     let wait=Duration::from_millis(ctx.limits.dial_timeout_ms);
-                    if let Err(error)=handle(request,stream,&tag,&users,ctx,writers,force,wait).await {
+                    if let Err(error)=handle(request,stream,&config,ctx,writers,force,wait).await {
                         tracing::debug!(?error,"Naive H3流结束");
                     }
                 }));
@@ -231,13 +235,17 @@ async fn reject(
 async fn handle(
     request: http::Request<()>,
     mut stream: Stream,
-    tag: &str,
-    users: &[User],
+    config: &Inbound,
     ctx: Arc<Context>,
     writers: TaskTracker,
     force: CancellationToken,
     wait: Duration,
 ) -> io::Result<()> {
+    let Inbound::Naive { tag, users, .. } = config else {
+        return Err(io::Error::other("入口不是Naive"));
+    };
+    let tag = tag.as_str();
+    let users = users.as_slice();
     // Naive使用普通CONNECT：只有 :authority，不接受扩展 :protocol、scheme/path。
     if request.method() != http::Method::CONNECT
         || request.extensions().get::<h3::ext::Protocol>().is_some()

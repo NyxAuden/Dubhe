@@ -640,12 +640,17 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             Some(lane) => lane,
             None => pool.open(session_id.clone())?,
         };
-        lane.mark_connected();
+        // 同 `handle_h2`：标记必须晚于所有可能提前返回的步骤，
+        // 否则 TTL 回收器会跳过这个会话，槽位永久泄漏。
         let Some(rx) = lane.take_reader().await else {
             write_status(&mut conn.io, xhttp, "409 Conflict").await?;
             return Ok(None);
         };
-        write_stream_headers(&mut conn.io, xhttp).await?;
+        if let Err(error) = write_stream_headers(&mut conn.io, xhttp).await {
+            pool.remove(&session_id);
+            return Err(error);
+        }
+        lane.mark_connected();
         let (read, write) = tokio::io::split(conn.io);
         drop(read);
         let tunnel = Tunnel::new(
@@ -851,12 +856,23 @@ async fn handle_h2(
             Some(lane) => lane,
             None => pool.open(session_id.clone())?,
         };
-        lane.mark_connected();
+        // `mark_connected` 必须放在所有可能提前返回的步骤**之后**：
+        // TTL 回收器会跳过 `connected` 会话，若在 `take_reader` /
+        // `stream_h2_response` 失败前就标记，这两条路径会让会话槽永久泄漏
+        // （`pool.remove` 只在正常结束时执行）。
         let Some(rx) = lane.take_reader().await else {
             reject_h2(&mut respond, xhttp, StatusCode::CONFLICT).await;
             return Ok(());
         };
-        let send = stream_h2_response(&mut respond, xhttp)?;
+        let send = match stream_h2_response(&mut respond, xhttp) {
+            Ok(send) => send,
+            Err(error) => {
+                // 会话已经取走 reader，必须显式回收。
+                pool.remove(&session_id);
+                return Err(error);
+            }
+        };
+        lane.mark_connected();
         let tunnel = Tunnel::new(
             ChannelReader::new(rx),
             FinishOnDrop::new(H2Writer::new(send)),
@@ -2447,15 +2463,16 @@ async fn handle_h3(
             Some(lane) => lane,
             None => pool.open(session_id.clone())?,
         };
-        lane.mark_connected();
+        // 同 h1/h2：标记晚于所有可能提前返回的步骤，避免槽位泄漏。
         let Some(rx) = lane.take_reader().await else {
             reject_h3(&mut stream, xhttp, StatusCode::CONFLICT).await;
             return Ok(());
         };
-        stream
-            .send_response(response_head(xhttp)?)
-            .await
-            .map_err(h3_error)?;
+        if let Err(error) = stream.send_response(response_head(xhttp)?).await {
+            pool.remove(&session_id);
+            return Err(h3_error(error));
+        }
+        lane.mark_connected();
         let (send, recv) = stream.split();
         let (tx, out) = mpsc::channel::<Bytes>(8);
         // recv 只用于保持请求句柄存活到下行结束，不读取客户端请求体。
