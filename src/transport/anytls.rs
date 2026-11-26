@@ -58,6 +58,15 @@ const COMMAND_UPDATE_PADDING_SCHEME: u8 = 6;
 const COMMAND_SYNACK: u8 = 7;
 const COMMAND_HEART_REQUEST: u8 = 8;
 const COMMAND_HEART_RESPONSE: u8 = 9;
+
+/// 单个 PSH 帧的负载上限。
+///
+/// 协议长度字段是大端 `u16`，故硬上限 65535。取满这个值而不是原来的
+/// 16 KiB：relay 下行块是 64 KiB，16 KiB 会把一个块切成 4 帧，每帧多一次
+/// 7 字节头、一次 Vec 分配和一次会话 writer 排队。与 WS 那次放大同理。
+///
+/// 不能取 65536：长度字段写不下，会静默截断或溢出。
+const MAX_PSH: usize = 65_535;
 const COMMAND_SERVER_SETTINGS: u8 = 10;
 
 #[allow(clippy::too_many_arguments)]
@@ -229,7 +238,7 @@ impl AsyncWrite for PshWriter {
             ready!(self.as_mut().poll_flush(cx))?;
         }
         ready!(self.reserve(cx))?;
-        let n = bytes.len().min(16 * 1024);
+        let n = bytes.len().min(MAX_PSH);
         let id = self.id;
         self.send(control(COMMAND_PSH, id, &bytes[..n]))?;
         self.dirty = true;
@@ -873,9 +882,10 @@ mod tests {
         assert_eq!(sink.0, encode(COMMAND_PSH, 9, b"first"));
         sink.0.clear();
         go.store(false, Ordering::Relaxed);
-        let payload = vec![5; 32768];
+        // 必须超过单帧上限才会出现「部分接受」，否则整块一次就被收下。
+        let payload = vec![5; MAX_PSH + 4096];
         tx.send(control(COMMAND_SYNACK, 9, &[])).await.unwrap();
-        assert_eq!(stream.write(&payload).await.unwrap(), 16384);
+        assert_eq!(stream.write(&payload).await.unwrap(), MAX_PSH);
         assert!(futures_util::poll!(std::pin::pin!(stream.write(b"cancel"))).is_pending());
         {
             let mut writer = std::pin::pin!(write_frames(&mut sink, &mut rx));
@@ -898,7 +908,9 @@ mod tests {
             sink.0,
             [
                 encode(COMMAND_SYNACK, 9, &[]),
-                encode(COMMAND_PSH, 9, &payload[..16384]),
+                // 第一次写入被接受的字节数 = 单帧上限（见上方 assert_eq），
+                // 其余随取消一起丢弃，绝不重投。
+                encode(COMMAND_PSH, 9, &payload[..MAX_PSH]),
                 encode(COMMAND_PSH, 9, b"next"),
                 encode(COMMAND_FIN, 9, &[])
             ]
@@ -998,6 +1010,22 @@ mod tests {
         assert_eq!(&frame[1..5], &[1, 2, 3, 4]);
         assert_eq!(&frame[5..7], &[0, 3]);
         assert_eq!(&frame[7..], b"abc");
+    }
+
+    /// 下行 PSH 必须能装到协议上限 65535，且绝不超出。
+    ///
+    /// 旧实现把单帧限在 16 KiB，64 KiB 的 relay 块会被切成 4 帧。
+    #[test]
+    fn psh_payload_uses_full_protocol_limit_and_never_overflows() {
+        assert_eq!(MAX_PSH, usize::from(u16::MAX));
+        // 上限处编码正常，长度字段写得下。
+        let frame = encode(COMMAND_PSH, 1, &vec![0x5a; MAX_PSH]);
+        assert_eq!(frame.len(), FRAME_OVERHEAD + MAX_PSH);
+        let encoded_len = u16::from_be_bytes([frame[5], frame[6]]);
+        assert_eq!(usize::from(encoded_len), MAX_PSH);
+        // 取 min 后不会越界：模拟 64 KiB 的使用方切片。
+        let payload = vec![0u8; 64 * 1024];
+        assert_eq!(payload.len().min(MAX_PSH), MAX_PSH);
     }
 
     #[test]

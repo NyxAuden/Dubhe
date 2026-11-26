@@ -346,7 +346,9 @@ async fn tcp_and_uot_share_one_session_but_count_only_their_own_payload() {
             }
             2 => {
                 assert!(ack[1]);
-                assert!(!b.is_empty() && b.len() <= 16384 && b.iter().all(|&v| v == 42));
+                // 单帧上限是协议的 u16 长度字段（65535），不是旧的实现值
+                // 16384。这里断言的是「不超协议上限且内容完整」。
+                assert!(!b.is_empty() && b.len() <= 65535 && b.iter().all(|&v| v == 42));
                 n += b.len();
             }
             3 => break,
