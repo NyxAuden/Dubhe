@@ -474,6 +474,11 @@ pub struct Selected {
     pub(crate) reverse: Option<Arc<str>>,
     /// 是否由规则命中，而非回落到默认出站。
     pub(crate) matched: bool,
+    /// 为判定 IP 规则而解析出的地址集合。
+    ///
+    /// 直连拨号**必须**复用它：若再解析一次，DNS 轮询或故障切换可能返回
+    /// 不同地址，规则检查过的集合就不再等于实际连接的目标。
+    pub(crate) resolved: Option<Vec<std::net::SocketAddr>>,
 }
 
 impl Selected {
@@ -681,12 +686,14 @@ fn resolved_select(destination: &Resolved, matched: bool) -> Selected {
             proxy: proxy.clone(),
             reverse: reverse.clone(),
             matched,
+            resolved: None,
         },
         Resolved::Urltest(group) => {
             let (kind, proxy) = group.select();
             Selected {
                 kind,
                 proxy,
+                resolved: None,
                 reverse: None,
                 matched,
             }

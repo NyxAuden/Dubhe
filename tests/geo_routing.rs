@@ -782,3 +782,43 @@ async fn geoip_non_matching_relays_end_to_end() {
     assert_eq!(&echoed, b"ok");
     server.shutdown().await;
 }
+
+/// 回归：`domain_strategy` 为 `as-is`（默认）时，带 IP 条件的规则**也必须生效**。
+///
+/// 此前 `Context::selected` 只在 `ip-if-non-match` 下才解析域名。于是默认的
+/// `as-is` 配上 `{"ip_is_private": true, "outbound": "reject"}` 时，域名目标
+/// 的 IP 条件永远拿不到证据、规则永不命中，最终回落到默认出站直连——**在
+/// 拨号时才连上私网**，检查发生在错误的对象上。
+///
+/// 这里用 `dns.hosts` 把域名钉到 127.0.0.1，走真实 `ctx.connect`。
+#[tokio::test]
+async fn ip_is_private_rule_applies_to_domain_targets_without_ip_strategy() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let mut value = socks_config();
+    value["outbounds"] = json!([
+        {"type": "direct", "tag": "direct"},
+        {"type": "reject", "tag": "reject"}
+    ]);
+    // 默认 domain_strategy 即 as-is；不显式设置，正是要验证的默认行为。
+    value["route"] = json!({
+        "rules": [{"ip_is_private": true, "outbound": "reject"}],
+        "default": "direct"
+    });
+    value["dns"] = json!({"hosts": {"private.test": ["127.0.0.1"]}});
+    let config = dubhe::config::Config::from_json(&value.to_string()).unwrap();
+    let ctx = dubhe::forward::Context::new(&config).unwrap();
+
+    let target = Target {
+        host: Host::Domain("private.test".into()),
+        port: echo.address.port(),
+    };
+    let error = ctx
+        .connect("socks", &target)
+        .await
+        .expect_err("域名解析到私网时 ip_is_private 规则必须拒绝");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "{error}"
+    );
+}

@@ -331,10 +331,18 @@ impl Context {
     pub fn udp_route_target(&self, inbound: &str, target: &Target, payload: &[u8]) -> Target {
         crate::transport::sniff::udp_route_target(self, inbound, target, payload)
     }
-    /// 路由选择；`ip-if-non-match` 在没有任何规则命中时解析域名并重试。
+    /// 路由选择。
     ///
-    /// 解析失败按未命中处理并回落到默认出站，不因 DNS 故障拒绝连接；实际
-    /// 拨号仍会再次解析域名，缓存由解析器自身负责。
+    /// 只要**有规则因为缺少地址而无法判定**（`NeedIp`），就解析域名并重试，
+    /// 不管 `domain_strategy` 是 `as-is` 还是 `ip-if-non-match`。
+    ///
+    /// 此前只有在 `ip-if-non-match` 下才会解析，于是 `as-is`（默认）配上
+    /// `{"ip_is_private": true, "outbound": "reject"}` 这类规则时，域名目标
+    /// 的 IP 条件永远拿不到证据、规则永远不命中，最终回落到默认出站直连，
+    /// **在拨号时才发现是私网**——检查发生在错误的对象上。
+    ///
+    /// 解析结果随 `Selected.resolved` 传下去，直连拨号复用它，避免二次解析
+    /// 得到不同地址集合（DNS 轮询或故障切换会破坏「检查过的地址」这一前提）。
     async fn selected(
         &self,
         inbound: &str,
@@ -343,10 +351,16 @@ impl Context {
         allow_udp_proxy: bool,
     ) -> io::Result<Selected> {
         let mut selected = self.router.select_outbound(inbound, network, target);
-        if !selected.matched
-            && self.router.domain_strategy() == DomainStrategy::IpIfNonMatch
-            && matches!(target.host, Host::Domain(_))
-            && self.router.has_ip_candidates(inbound, network, target)
+        let is_domain = matches!(target.host, Host::Domain(_));
+        // 两种解析理由，任一成立就要解析：
+        // 1. **安全**：有规则因缺少地址而无法判定（`NeedIp`）。这跟
+        //    `domain_strategy` 无关——否则默认的 `as-is` 会让 IP 规则永不生效。
+        // 2. **选路**：`ip-if-non-match` 下没有任何规则命中时，按解析结果重试。
+        let needs_ip = is_domain && self.router.has_ip_candidates(inbound, network, target);
+        let retry_by_strategy = is_domain
+            && !selected.matched
+            && self.router.domain_strategy() == DomainStrategy::IpIfNonMatch;
+        if (needs_ip || retry_by_strategy)
             && let Ok(addresses) = self.dns.resolve(target).await
         {
             let ips: Vec<IpAddr> = addresses.iter().map(|address| address.ip()).collect();
@@ -354,6 +368,8 @@ impl Context {
                 selected = self
                     .router
                     .select_with(inbound, network, target, Some(&ips));
+                // 只保留与规则判断一致的地址集合，供直连拨号复用。
+                selected.resolved = Some(addresses);
             }
         }
         if selected.kind == OutboundKind::Reject {
@@ -450,8 +466,25 @@ impl Context {
         let mut upstream = match &selected.reverse {
             Some(tag) => self.reverse.open(tag, dial).await?,
             None => {
-                self.connect_selected(selected.proxy.as_deref(), dial)
-                    .await?
+                // 直连且规则已经解析过地址时，复用同一份结果：
+                // 重新解析可能拿到不同地址，规则检查就失去意义。
+                match (selected.proxy.as_deref(), &selected.resolved) {
+                    (None, Some(addresses)) => {
+                        let attempt = Duration::from_millis(self.limits.dial_attempt_timeout_ms);
+                        let stream = timeout(
+                            Duration::from_millis(self.limits.dial_timeout_ms),
+                            dial_addresses(addresses, attempt),
+                        )
+                        .await
+                        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连接目标超时"))??;
+                        let local = stream.local_addr().ok();
+                        Upstream::new(Box::new(stream), local)
+                    }
+                    _ => {
+                        self.connect_selected(selected.proxy.as_deref(), dial)
+                            .await?
+                    }
+                }
             }
         };
         upstream.track(
