@@ -501,9 +501,14 @@ impl<S: AsyncRead + Unpin> Conn<S> {
                 while !self.read_line().await?.is_empty() {}
                 return Ok(data);
             }
-            if data.len() + size > limit {
-                return Err(too_large());
-            }
+            // `size` 来自对端声明，可达 `usize::MAX`：直接相加会溢出回绕，
+            // 绕过下面的上限检查并触发巨量分配。用 checked_add 拒绝。
+            let total = data
+                .len()
+                .checked_add(size)
+                .filter(|total| *total <= limit)
+                .ok_or_else(too_large)?;
+            debug_assert!(total <= limit);
             let mut piece = vec![0u8; size];
             self.read_exact_into(&mut piece).await?;
             data.extend_from_slice(&piece);
@@ -526,8 +531,11 @@ impl<S: AsyncRead + Unpin> Conn<S> {
             if self.buffer.len() > MAX_HEAD {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk行过长"));
             }
+            // 必须**直接从底层读**。这里走到说明 buffer 里没有 `\r\n`（残留
+            // 半行）；此前的实现经一个「优先从 buffer 取」的辅助函数读到同一份
+            // 残留、再原样放回，于是无限空转——正常网络分片即可触发。
             let mut chunk = [0u8; 1024];
-            let read = self.read_some(&mut chunk).await?;
+            let read = self.io.read(&mut chunk).await?;
             if read == 0 {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunk行截断"));
             }
@@ -547,16 +555,6 @@ impl<S: AsyncRead + Unpin> Conn<S> {
             self.io.read_exact(&mut out[offset..]).await?;
         }
         Ok(())
-    }
-
-    async fn read_some(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if !self.buffer.is_empty() {
-            let take = out.len().min(self.buffer.len());
-            out[..take].copy_from_slice(&self.buffer[..take]);
-            self.buffer.drain(..take);
-            return Ok(take);
-        }
-        self.io.read(out).await
     }
 }
 

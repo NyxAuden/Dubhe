@@ -124,6 +124,47 @@ async fn post(running: &Running, target: &str, body: &[u8]) -> String {
     head
 }
 
+/// 回归：chunked 正文的**行读取必须能从 socket 取新字节**。
+///
+/// 此前 `read_line` 用 `read_some`，而后者优先从 `self.buffer` 取数据。
+/// 读到半行（没有 `\r\n`）时，它会取走同一份残留、再原样放回，形成空转：
+/// **正常网络分片就能触发**，不需要异常流量。
+///
+/// 这里逐字节发送 chunked POST，强制服务端在 chunk 行中途停下等待。
+#[tokio::test]
+async fn chunked_body_split_mid_line_still_progresses() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let running = Running::start(config("stream-up")).await;
+
+    let mut head = vless_request(echo.address);
+    head.extend_from_slice(b"split-mid-line");
+    let mut stream = connect(&running).await;
+
+    let request_head = "POST /GunService/Tun/stream HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    stream.write_all(request_head.as_bytes()).await.unwrap();
+    // 长度行与正文都逐字节发送，保证服务端读到半行。
+    let size_line = format!("{:x}\r\n", head.len());
+    for byte in size_line.as_bytes() {
+        stream.write_all(&[*byte]).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    for byte in &head {
+        stream.write_all(&[*byte]).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+    stream.flush().await.unwrap();
+
+    // 必须收到 200；挂起即说明仍会空转。
+    let (response, _) = timeout(Duration::from_secs(5), read_head(&mut stream))
+        .await
+        .expect("chunked 正文按行分片时不得空转");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    running.shutdown().await;
+}
+
 /// 回归：认证前的排队负载必须受**全入口共享字节预算**约束。
 ///
 /// 此前只有「每会话条数」上限（`sc_max_buffered_posts`），会话数上限又是

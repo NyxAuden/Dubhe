@@ -479,6 +479,12 @@ pub struct Selected {
     /// 直连拨号**必须**复用它：若再解析一次，DNS 轮询或故障切换可能返回
     /// 不同地址，规则检查过的集合就不再等于实际连接的目标。
     pub(crate) resolved: Option<Vec<std::net::SocketAddr>>,
+    /// 解析结果中**真正满足命中规则 IP 条件**的地址。
+    ///
+    /// 规则命中判定用 `any`，但拨号必须只尝试这里的地址；否则允许列表
+    /// （`ip_cidrs` + direct）会把同一域名的其他地址也放出去。
+    /// `None` 表示该规则不约束 IP，无需筛选。
+    pub(crate) permitted: Option<Vec<std::net::IpAddr>>,
 }
 
 impl Selected {
@@ -491,6 +497,26 @@ impl Selected {
     /// 规则检查过的集合就不再等于实际连接的目标。
     pub fn resolved_addresses(&self) -> Option<&[std::net::SocketAddr]> {
         self.resolved.as_deref()
+    }
+
+    /// 实际允许拨号的地址：解析结果再按命中规则的 IP 条件过滤。
+    ///
+    /// 规则命中用 `any`（任一地址满足即可），但**拨号只能尝试满足条件的
+    /// 地址**。返回 `None` 表示没有可用于直连的地址（无解析结果，或全部
+    /// 不满足条件——后者应当拒绝，不能退回「全部尝试」）。
+    pub fn dial_addresses(&self) -> Option<Vec<std::net::SocketAddr>> {
+        let resolved = self.resolved.as_deref()?;
+        match &self.permitted {
+            Some(permitted) => {
+                let allowed: Vec<_> = resolved
+                    .iter()
+                    .copied()
+                    .filter(|address| permitted.contains(&address.ip()))
+                    .collect();
+                (!allowed.is_empty()).then_some(allowed)
+            }
+            None => Some(resolved.to_vec()),
+        }
     }
 
     pub fn udp_proxied(&self) -> std::io::Result<bool> {
@@ -648,12 +674,28 @@ impl Router {
             Host::Ip(_) => None,
         };
         // 跳过 `NeedIp`：宁可继续看后面的规则，也不在缺证据时做决定。
-        match self.rules.iter().find(|rule| {
+        let matched = self.rules.iter().find(|rule| {
             rule.evaluate(inbound, network, target, domain.as_deref(), resolved) == RuleMatch::Hit
-        }) {
-            Some(rule) => resolved_select(&rule.destination, true),
-            None => resolved_select(&self.default, false),
+        });
+        let Some(rule) = matched else {
+            // 回落到默认出站：默认没有 IP 条件，不需要筛选地址。
+            return resolved_select(&self.default, false);
+        };
+        let mut selected = resolved_select(&rule.destination, true);
+        // 命中规则的 IP 条件用 `any` 判定；把实际满足它的地址筛出来，
+        // 供拨号只尝试这些地址。规则不约束 IP 时无需筛选。
+        if let Some(addresses) = resolved
+            && rule.constrains_ip()
+        {
+            selected.permitted = Some(
+                addresses
+                    .iter()
+                    .copied()
+                    .filter(|ip| rule.permits_ip(*ip))
+                    .collect(),
+            );
         }
+        selected
     }
 
     /// 参与本路由器选路的 urltest 组；未引用的组不会探测。
@@ -695,6 +737,7 @@ fn resolved_select(destination: &Resolved, matched: bool) -> Selected {
             reverse: reverse.clone(),
             matched,
             resolved: None,
+            permitted: None,
         },
         Resolved::Urltest(group) => {
             let (kind, proxy) = group.select();
@@ -702,6 +745,7 @@ fn resolved_select(destination: &Resolved, matched: bool) -> Selected {
                 kind,
                 proxy,
                 resolved: None,
+                permitted: None,
                 reverse: None,
                 matched,
             }
@@ -1267,6 +1311,29 @@ impl CompiledRule {
         }
     }
 
+    /// 单个地址是否满足本规则的 IP 条件。
+    ///
+    /// 用于把「已授权地址」从解析结果里筛出来：规则命中用的是
+    /// `any`（任一地址满足即可），但**拨号只应尝试真正满足条件的地址**，
+    /// 否则允许列表（例如 `ip_cidrs: ["geoip:cn"]` + direct）会把同一域名
+    /// 解析出的其他地址也放进去。
+    fn permits_ip(&self, ip: IpAddr) -> bool {
+        let has_group =
+            !self.ip_cidrs.is_empty() || !self.mmdb_codes.is_empty() || self.geo_ip_used;
+        (!self.ip_is_private || is_private_ip(&ip))
+            && (!has_group
+                || self.ip_cidrs.iter().any(|cidr| cidr.contains(&ip))
+                || self.mmdb_hit(ip))
+    }
+
+    /// 本规则是否对 IP 维度做了限制（否则无需筛选地址）。
+    fn constrains_ip(&self) -> bool {
+        self.ip_is_private
+            || !self.ip_cidrs.is_empty()
+            || !self.mmdb_codes.is_empty()
+            || self.geo_ip_used
+    }
+
     fn mmdb_hit(&self, ip: IpAddr) -> bool {
         let Some(geo) = self.geo.as_deref() else {
             return false;
@@ -1478,6 +1545,42 @@ mod invert_ip_tests {
                 .kind,
             OutboundKind::Direct
         );
+    }
+
+    /// 允许列表：只有**满足 CIDR 的地址**才能用于拨号。
+    ///
+    /// 规则命中用 `any`，但拨号若尝试整组，允许列表
+    /// （`ip_cidrs: ["geoip:cn"]` + direct）会把同一域名的其他地址也放出去。
+    #[test]
+    fn permitted_addresses_filter_out_unlisted_ips() {
+        let router = router(serde_json::json!([
+            {"ip_cidrs": ["192.0.2.0/24"], "outbound": "direct"}
+        ]));
+        let target = domain("mixed.test");
+        let allowed = "192.0.2.7".parse::<IpAddr>().unwrap();
+        let other = "198.51.100.9".parse::<IpAddr>().unwrap();
+        // 一个命中一个不命中：规则命中（any），但只允许拨第一个。
+        let mut selected = router.select_with("s", Network::Tcp, &target, Some(&[allowed, other]));
+        assert_eq!(selected.kind, OutboundKind::Direct);
+        assert_eq!(
+            selected.permitted.as_deref(),
+            Some(&[allowed][..]),
+            "只有满足 ip_cidrs 的地址才应被允许拨号"
+        );
+        // 手动注入解析结果，验证 dial_addresses 的过滤。
+        use std::net::SocketAddr;
+        selected.resolved = Some(vec![
+            SocketAddr::new(allowed, 443),
+            SocketAddr::new(other, 443),
+        ]);
+        let dial = selected.dial_addresses().expect("应至少有一个可拨地址");
+        assert_eq!(dial, vec![SocketAddr::new(allowed, 443)]);
+
+        // 全部不满足时规则不命中（any 为 false），回落到默认出站，
+        // `permitted` 为 None——默认出站没有 IP 条件，不筛选。
+        let only_other = router.select_with("s", Network::Tcp, &target, Some(&[other]));
+        assert!(!only_other.matched, "全部地址不满足时规则不应命中");
+        assert!(only_other.permitted.is_none());
     }
 
     /// 同一候选地址必须同时满足私网与 CIDR，不能各自由不同地址满足。

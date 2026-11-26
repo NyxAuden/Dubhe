@@ -468,12 +468,29 @@ impl Context {
             None => {
                 // 直连且规则已经解析过地址时，复用同一份结果：
                 // 重新解析可能拿到不同地址，规则检查就失去意义。
-                match (selected.proxy.as_deref(), &selected.resolved) {
+                // 只用「满足命中规则 IP 条件」的地址。
+                //
+                // 注意区分两种情况：`resolved` 为 None 表示规则阶段没解析过
+                // （交给 connect_selected 正常解析）；`resolved` 有值但
+                // `dial_addresses()` 为 None 表示**解析出的地址全都不满足
+                // 规则**——此时必须拒绝，退化成重新解析会让允许列表失效。
+                if selected.proxy.is_none()
+                    && selected.resolved.is_some()
+                    && selected.dial_addresses().is_none()
+                {
+                    self.stats.reject();
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "解析出的地址均不满足出口策略",
+                    ));
+                }
+                let dial_set = selected.dial_addresses();
+                match (selected.proxy.as_deref(), dial_set) {
                     (None, Some(addresses)) => {
                         let attempt = Duration::from_millis(self.limits.dial_attempt_timeout_ms);
                         let stream = timeout(
                             Duration::from_millis(self.limits.dial_timeout_ms),
-                            dial_addresses(addresses, attempt),
+                            dial_addresses(&addresses, attempt),
                         )
                         .await
                         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连接目标超时"))??;
