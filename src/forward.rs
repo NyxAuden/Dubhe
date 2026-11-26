@@ -1407,6 +1407,31 @@ where
 ///   命令」的传输）。
 pub(crate) const COPY_BLOCK: usize = 8 * 1024;
 
+/// 上行（client→target）中继块大小。
+///
+/// Linux ARM64 原生回环、VLESS+TLS、客户端固定 sing-box 1.11.15、交替 A/B、
+/// 各 4 轮、4 秒窗口（Gbit/s）：
+///
+/// | 上行/下行 | 下载 | 上传 | 匿名内存/连接 |
+/// |---|---:|---:|---:|
+/// | 8/8 KiB | 13.2 | 12.9 | 414 KB |
+/// | 16/32 KiB | 15.5 | 17.6 | 470 KB |
+/// | **32/64 KiB** | **18.9** | **18.2** | **517 KB** |
+/// | 48/96 KiB | 20.4 | 17.3 | — |
+/// | 64/128 KiB | 19.8 | 17.9 | — |
+///
+/// 32/64 已追平 sing-box（18.3/17.9），再放大只有下载略涨、上传下降，却要
+/// 双倍缓冲。代价是每连接 +103 KiB 匿名内存，实测是 `vec![0; n]` 的真实
+/// 触碰量，不是名义分配。
+///
+/// **此结论与更早的 macOS 数据相反**（那里 16/32 只到 28 Gbit/s 且 +33 KiB）。
+/// macOS 是 kqueue 单核回环，块大小收益被别的瓶颈吃掉；不要再拿 macOS 数字
+/// 否决这项改动。目标平台是 Linux。
+pub(crate) const RELAY_UPLINK: usize = 32 * 1024;
+
+/// 下行（target→client）中继块大小；理由见 [`RELAY_UPLINK`]。
+pub(crate) const RELAY_DOWNLINK: usize = 64 * 1024;
+
 /// 实验用块大小覆盖：`DUBHE_RELAY_UP_KIB` / `DUBHE_RELAY_DOWN_KIB`。
 ///
 /// 只为基准测试存在，**不是**配置项：生产部署不应依赖它。读完一次后缓存，
@@ -1440,7 +1465,13 @@ fn relay_block_override(side: RelaySide) -> usize {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|kib| (1..=1024).contains(kib))
-            .map_or(COPY_BLOCK, |kib| kib * 1024)
+            .map_or_else(
+                || match side {
+                    RelaySide::Uplink => RELAY_UPLINK,
+                    RelaySide::Downlink => RELAY_DOWNLINK,
+                },
+                |kib| kib * 1024,
+            )
     })
 }
 
@@ -1494,7 +1525,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    copy_with_idle_sizes(client, target, idle, COPY_BLOCK, COPY_BLOCK).await
+    let (uplink, downlink) = relay_blocks();
+    copy_with_idle_sizes(client, target, idle, uplink, downlink).await
 }
 
 /// 同 [`copy_with_idle`]，但两个方向可以各自指定块大小。

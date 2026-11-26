@@ -1556,39 +1556,95 @@ impl AsyncWrite for H2Writer {
         if this.finished {
             return Poll::Ready(Err(closed()));
         }
-        loop {
-            if this.offset == this.pending.len() {
-                if buf.is_empty() {
-                    return Poll::Ready(Ok(0));
-                }
-                this.pending.clear();
-                this.pending.extend_from_slice(buf);
-                this.offset = 0;
-            }
-            let remaining = this.pending.len() - this.offset;
+        // 上一次已接受但没写完的部分先排空，否则会与本次的新缓冲混淆。
+        while this.offset < this.pending.len() {
+            // 只有**当前额度为零**才去等额度增加。h2 的 `poll_capacity` 表示
+            // 「额度会变大」，不是「现在能写」；已有额度时调用它会一直
+            // `Pending`，即使手里还有可发空间。旧实现无条件轮询，一块写满
+            // `STREAM_CHUNK` 后剩余额度还在、却卡在等下一次通知，接收端又
+            // 必须收齐整帧才交付——块 ≥ 16 KiB 就稳定复现这个等待。
             if this.send.capacity() == 0 {
-                this.send.reserve_capacity(remaining);
-            }
-            match std::task::ready!(this.send.poll_capacity(cx)) {
-                Some(Ok(capacity)) => {
-                    let take = capacity.min(remaining).min(STREAM_CHUNK);
-                    if take == 0 {
-                        continue;
+                this.send.reserve_capacity(this.pending.len() - this.offset);
+                match this.send.poll_capacity(cx) {
+                    Poll::Ready(Some(Ok(_))) => {}
+                    Poll::Ready(Some(Err(error))) => {
+                        return Poll::Ready(Err(io::Error::other(error)));
                     }
-                    this.send
-                        .send_data(
-                            Bytes::copy_from_slice(&this.pending[this.offset..this.offset + take]),
-                            false,
-                        )
-                        .map_err(io::Error::other)?;
-                    this.offset += take;
-                    if this.offset == this.pending.len() {
-                        return Poll::Ready(Ok(buf.len()));
-                    }
+                    Poll::Ready(None) => return Poll::Ready(Err(closed())),
+                    // 上次的尾巴还没发完：本次调用不接受新缓冲，直接等唤醒。
+                    Poll::Pending => return Poll::Pending,
                 }
-                Some(Err(error)) => return Poll::Ready(Err(io::Error::other(error))),
-                None => return Poll::Ready(Err(closed())),
             }
+            let take = this
+                .send
+                .capacity()
+                .min(this.pending.len() - this.offset)
+                .min(STREAM_CHUNK);
+            if take == 0 {
+                break;
+            }
+            this.send
+                .send_data(
+                    Bytes::copy_from_slice(&this.pending[this.offset..this.offset + take]),
+                    false,
+                )
+                .map_err(io::Error::other)?;
+            this.offset += take;
+        }
+        if this.offset == this.pending.len() {
+            this.pending.clear();
+            this.offset = 0;
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        // 本次缓冲按**实际接受的字节数**返回，绝不虚报成 `buf.len()`：
+        // 剩余部分由调用方保留，下一次 `poll_write` 会重新传入。
+        let mut accepted = 0usize;
+        while accepted < buf.len() {
+            if this.send.capacity() == 0 {
+                this.send.reserve_capacity(buf.len() - accepted);
+                match this.send.poll_capacity(cx) {
+                    Poll::Ready(Some(Ok(_))) => {}
+                    Poll::Ready(Some(Err(error))) => {
+                        return if accepted > 0 {
+                            Poll::Ready(Ok(accepted))
+                        } else {
+                            Poll::Ready(Err(io::Error::other(error)))
+                        };
+                    }
+                    Poll::Ready(None) => {
+                        return if accepted > 0 {
+                            Poll::Ready(Ok(accepted))
+                        } else {
+                            Poll::Ready(Err(closed()))
+                        };
+                    }
+                    Poll::Pending => break,
+                }
+            }
+            let take = this
+                .send
+                .capacity()
+                .min(buf.len() - accepted)
+                .min(STREAM_CHUNK);
+            if take == 0 {
+                break;
+            }
+            this.send
+                .send_data(
+                    Bytes::copy_from_slice(&buf[accepted..accepted + take]),
+                    false,
+                )
+                .map_err(io::Error::other)?;
+            accepted += take;
+        }
+        if accepted > 0 {
+            Poll::Ready(Ok(accepted))
+        } else {
+            // 一个字节都没接受：等额度增加。不能返回 `Ok(0)`，那会被调用方
+            // 当作 `WriteZero` 错误。
+            Poll::Pending
         }
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {

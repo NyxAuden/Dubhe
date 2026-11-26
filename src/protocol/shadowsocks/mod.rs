@@ -194,9 +194,20 @@ pub(crate) async fn serve_generic<S: DetourStream + 'static>(
     let (stream, route, dial) =
         crate::transport::sniff::sniff_route(&ctx, tag, stream, &target).await;
     let target = ctx.connect_routed(tag, &route, &dial).await?;
-    // SS2022 的线上记录此前只有约 8 KiB（受中继块限制），而 sing-box 是
-    // 16 KiB 级：每 GiB 多出约 8 倍记录数。只把**下行**放大到 32 KiB，
-    // 代价是每条已建立连接多 24 KiB；上行保持 8 KiB，避免双向翻倍。
+    // SS2022 必须保留自己的块大小，**不能跟随公共默认值**。
+    //
+    // Linux ARM64 回环、客户端固定 sing-box、各 2–3 轮（Gbit/s）：
+    //
+    // | 上行/下行 | 下载 | 上传 |
+    // |---|---:|---:|
+    // | **8/32 KiB（此处）** | 15.0 | **23.0** |
+    // | 8/64 KiB | — | — |
+    // | 32/64 KiB（公共默认） | 20.2 | **15.0** |
+    //
+    // 上行放大到 32 KiB 会掉 35%（23.0 → 15.0），与 VLESS 的结论相反：
+    // SS2022 每条记录独立加密，块大小直接决定单条记录长度，而 VLESS 的
+    // 大块能摊薄 TLS 记录数。公开对照 sing-box 是 23.3/24.3，所以这里用
+    // 8/32 时下载落后约 36%、上传基本持平。
     if is_2022 {
         return forward::relay_sized(
             stream,
