@@ -20,7 +20,7 @@ use crate::{
 /// 在已验证的传输流上完成协议认证并转入转发。
 ///
 /// `tls_enabled` 表示外层是否已有真实 TLS（QUIC 恒为真），供 VMess 判定
-/// security=5 是否可用；`handshake` 在认证完成或失败时释放。
+/// security=5 是否可用；`handshake` 在**认证成功**时释放。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch<S>(
     mut stream: S,
@@ -29,7 +29,7 @@ pub(crate) async fn dispatch<S>(
     tls_enabled: bool,
     ctx: Arc<Context>,
     deadline: Instant,
-    handshake: Option<crate::runtime::HandshakePermits>,
+    handshake: Option<&crate::runtime::AuthSlot>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -68,7 +68,9 @@ where
                     return Err(error);
                 }
             };
-            drop(handshake);
+            if let Some(auth) = handshake {
+                auth.release();
+            }
             crate::runtime::serve_plain_vless(stream, accepted, tag, ctx, duration, *xudp).await
         }
         Inbound::VmessHttp { tag, .. } | Inbound::VmessQuic { tag, .. } => {
@@ -85,7 +87,9 @@ where
                 }
             };
             let allow_udp = prepared.allow_udp();
-            drop(handshake);
+            if let Some(auth) = handshake {
+                auth.release();
+            }
             crate::runtime::serve_vmess(stream, accepted, tag, ctx, duration, allow_udp).await
         }
         Inbound::TrojanHttp { tag, users, .. } | Inbound::TrojanQuic { tag, users, .. } => {
@@ -100,7 +104,9 @@ where
                     return Err(error);
                 }
             };
-            drop(handshake);
+            if let Some(auth) = handshake {
+                auth.release();
+            }
             match request.command {
                 Command::Connect => {
                     crate::runtime::serve_trojan_connect(stream, tag, ctx, &request).await

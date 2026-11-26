@@ -191,6 +191,85 @@ async fn vless_over_http2_tls() {
     server.shutdown().await;
 }
 
+/// 回归：V2Ray HTTP/2 的握手许可必须在**首个流认证成功**后归还。
+///
+/// 此前 H1 在认证后归还，H2 却一直持到整条连接关闭。于是一个正常的长连接
+/// 会长期占住全局/每源 IP 的握手槽：把 `max_handshakes` 设为 1 时，
+/// 第一条已认证的长连接会让后续所有连接都被拒。
+#[tokio::test]
+async fn http2_releases_handshake_permit_after_authentication() {
+    let tcp = Echo::tcp("127.0.0.1", false).await;
+    let cert = Certificate::new();
+    let mut cfg = config(json!({
+        "type":"vless-http","tag":"vless","listen":"127.0.0.1:0",
+        "users":[{"name":"test","uuid":UUID}],
+        "http":{"path":"/h2","host":["localhost"]},
+        "certificate": cert.dir.path().join("cert.pem"),
+        "private_key": cert.dir.path().join("key.pem")
+    }));
+    // 只给 1 个握手名额：许可不归还时第二条连接必然被拒。
+    cfg["limits"] = json!({"max_handshakes": 1, "per_ip_handshakes": 4});
+    let server = Running::start(cfg).await;
+
+    // 第一条：完成认证并保持打开。
+    let tls = cert.connect_alpn(server.address, &[b"h2"]).await;
+    let (mut first, connection) = h2::client::handshake(tls).await.unwrap();
+    tokio::spawn(connection);
+    let (response, mut send) = first
+        .send_request(
+            http::Request::builder()
+                .method("PUT")
+                .uri("https://localhost/h2")
+                .body(())
+                .unwrap(),
+            false,
+        )
+        .unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let mut incoming = response.into_body();
+    send.send_data(Bytes::from(vless_request(1, tcp.address)), false)
+        .unwrap();
+    let _ = incoming.data().await.unwrap().unwrap();
+    // 认证已完成；**不关闭**这条连接。
+
+    // 第二条：必须能建立。许可若未归还，这里会连不上。
+    let tls2 = timeout(
+        Duration::from_secs(3),
+        cert.connect_alpn(server.address, &[b"h2"]),
+    )
+    .await
+    .expect("首条 H2 已认证后，握手名额必须已归还");
+    let (mut second, connection2) = h2::client::handshake(tls2).await.unwrap();
+    tokio::spawn(connection2);
+    let (response2, mut send2) = second
+        .send_request(
+            http::Request::builder()
+                .method("PUT")
+                .uri("https://localhost/h2")
+                .body(())
+                .unwrap(),
+            false,
+        )
+        .unwrap();
+    let response2 = response2.await.unwrap();
+    assert_eq!(response2.status(), http::StatusCode::OK);
+    let mut incoming2 = response2.into_body();
+    send2
+        .send_data(Bytes::from(vless_request(1, tcp.address)), false)
+        .unwrap();
+    let _ = incoming2.data().await.unwrap().unwrap();
+
+    // 断言已通过；先断开再停机，否则 shutdown 会等连接排空。
+    drop((send, send2));
+    drop(incoming);
+    drop(incoming2);
+    drop(first);
+    drop(second);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), server.shutdown()).await;
+}
+
 #[tokio::test]
 async fn vmess_over_http1_plain_transport() {
     let tcp = Echo::tcp("127.0.0.1", false).await;

@@ -121,6 +121,7 @@ where
     io.flush()
         .await
         .map_err(|error| io::Error::new(error.kind(), "V2Ray HTTP 响应刷新失败"))?;
+    let auth = crate::runtime::AuthSlot::new(handshake);
     dispatch(
         PrefixReader::new(leftover, io),
         config,
@@ -128,7 +129,7 @@ where
         false,
         ctx,
         deadline,
-        Some(handshake),
+        Some(&auth),
     )
     .await
 }
@@ -168,6 +169,10 @@ where
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "V2Ray HTTP h2握手超时"))?
             .map_err(io::Error::other)?;
     let shutdown = Duration::from_millis(ctx.limits.shutdown_timeout_ms);
+    // 许可由**首个业务流认证成功**释放，不是连接结束：此前 H1 在认证后归还、
+    // H2 却一直持有到整条连接关闭，正常长连接会长期占住握手槽，把每源 IP 的
+    // 并发额度耗尽。`permit` 为 None 时（不需要限额的路径）保持原样。
+    let auth = permit.map(crate::runtime::AuthSlot::new);
     let mut streams = JoinSet::new();
     loop {
         tokio::select! {
@@ -202,13 +207,23 @@ where
                 let config = config.clone();
                 let vmess = vmess.clone();
                 let ctx = ctx.clone();
+                let auth = auth.clone();
                 let stream_deadline =
                     Instant::now() + Duration::from_millis(ctx.limits.handshake_timeout_ms);
                 // 登记到 tracker：外层 force 会直接丢掉连接 future，函数末尾的
                 // drain 执行不到，只有 tracker 能保证停机等到流任务真正 drop。
                 let tracker = ctx.children.clone();
                 streams.spawn(tracker.track_future(async move {
-                    let _ = dispatch(stream, config, vmess, true, ctx, stream_deadline, None).await;
+                    let _ = dispatch(
+                        stream,
+                        config,
+                        vmess,
+                        true,
+                        ctx,
+                        stream_deadline,
+                        auth.as_ref(),
+                    )
+                    .await;
                 }));
             }
             Some(_) = streams.join_next() => {}
@@ -219,7 +234,6 @@ where
     })
     .await;
     streams.abort_all();
-    drop(permit);
     Ok(())
 }
 
