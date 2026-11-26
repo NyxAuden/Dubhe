@@ -242,6 +242,56 @@ async fn authenticated_session_relays_a_stream() {
     assert!(synack, "服务端应在拨号成功后发送空 SYNACK");
 }
 
+/// 回归：AnyTLS 的 UoT 分支必须与 TCP 分支一样做准入并保留已认证身份。
+///
+/// 此前 UoT 分支把 `None` 传给 `udp::uot`，而 `admit_user(None)` 恒为真，
+/// 于是配额耗尽的账户仍能新建 UoT 会话，且不计入用户统计。
+#[tokio::test]
+async fn quota_exhausted_user_cannot_open_uot_stream() {
+    let cert = Certificate::new();
+    let running = Running::start(config(&cert)).await;
+    // 把该账户配额设为 1 字节并计入超额使用。
+    let counter = running.stats.user_counter("anytls", "u");
+    counter.set_quota(1);
+    counter.add(true, 1);
+    assert!(
+        !running.stats.admit_user("anytls", Some("u")),
+        "前置条件：配额应已耗尽"
+    );
+
+    let mut stream = cert.connect(running.address).await;
+    prologue(&mut stream, PASSWORD, true).await;
+
+    // 目标填 UoT magic 域名，端口任意。
+    let mut request = Vec::new();
+    const UOT_DOMAIN: &[u8] = b"sp.udp-over-tcp.arpa";
+    request.push(3); // 域名
+    request.push(UOT_DOMAIN.len() as u8);
+    request.extend_from_slice(UOT_DOMAIN);
+    request.extend_from_slice(&9000u16.to_be_bytes());
+    stream.write_all(&frame(1, 1, &[])).await.unwrap();
+    stream.write_all(&frame(2, 1, &request)).await.unwrap();
+    stream.flush().await.unwrap();
+
+    // 必须收到带 unauthorized 的 SYNACK，且不能有数据回传。
+    let mut denied = false;
+    for _ in 0..6 {
+        let Ok(Ok((command, id, body))) =
+            timeout(Duration::from_secs(2), next_frame(&mut stream)).await
+        else {
+            break;
+        };
+        if command == 7 && id == 1 && body == b"unauthorized" {
+            denied = true;
+            break;
+        }
+        if command == 2 && id == 1 && !body.is_empty() {
+            panic!("配额耗尽的账户不应收到业务数据");
+        }
+    }
+    assert!(denied, "配额耗尽的账户必须被拒绝 UoT 会话");
+}
+
 #[tokio::test]
 async fn independent_streams_are_multiplexed() {
     let first = Echo::tcp("127.0.0.1", false).await;

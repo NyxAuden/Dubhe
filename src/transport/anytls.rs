@@ -73,6 +73,8 @@ pub(crate) async fn serve(
     let mut accepted = timeout_at(deadline, acceptor.accept(stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "AnyTLS TLS握手超时"))??;
+    // 不再在认证前 `users.clone()`：`config` 已是 `Arc<Inbound>`，直接借用
+    // 用户表即可，避免每次握手按「账户数 × 2 个 String」做一次深复制。
     let (tag, users, raw_scheme) = match &*config {
         Inbound::AnyTls {
             tag,
@@ -81,7 +83,7 @@ pub(crate) async fn serve(
             ..
         } => (
             tag.clone(),
-            users.clone(),
+            users.as_slice(),
             padding_scheme.as_deref().unwrap_or(DEFAULT_PADDING_SCHEME),
         ),
         _ => return Err(io::Error::other("入口不是 AnyTLS")),
@@ -89,7 +91,7 @@ pub(crate) async fn serve(
     let password = timeout_at(deadline, read_prologue(&mut accepted))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "AnyTLS 认证超时"))??;
-    let Some(user) = authenticate(&password, &users) else {
+    let Some(user) = authenticate(&password, users) else {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "AnyTLS 认证失败",
@@ -371,8 +373,24 @@ async fn serve_stream(
             return;
         }
     };
-    // AnyTLS 没有原生 UDP 帧；协议层 UoT 目标在目标地址解析后、认证前分流。
+    // AnyTLS 没有原生 UDP 帧；协议层 UoT 目标在目标地址解析后分流。
+    //
+    // 这里**必须先做准入并保留已认证身份**。此前直接传 `None` 给 `udp::uot`，
+    // 而 `admit_user(None)` 恒为真（`telemetry.rs` 的 `let Some(user) = user
+    // else { return true }`），于是配额耗尽或已到期的账户仍能无限新建 UoT
+    // 会话，且不计入用户统计——与 TCP 分支的准入不一致。
     if let Some(version) = crate::udp::uot_version(&target) {
+        if !ctx.stats.admit_user(&tag, Some(user.as_str())) {
+            if synack {
+                let _ = frames
+                    .send(control(COMMAND_SYNACK, id, b"unauthorized"))
+                    .await;
+            }
+            if !peer_closed.is_cancelled() {
+                let _ = frames.send(control(COMMAND_FIN, id, &[])).await;
+            }
+            return;
+        }
         if synack {
             let _ = frames.send(control(COMMAND_SYNACK, id, &[])).await;
         }
@@ -380,7 +398,7 @@ async fn serve_stream(
             start_bridge(id, incoming, frames, peer_closed.clone(), &ctx.children);
         tokio::select! {
             _ = peer_closed.cancelled() => {}
-            _ = crate::udp::uot(relay, ctx, tag, version, None) => {}
+            _ = crate::udp::uot(relay, ctx, tag, version, Some(user.as_str())) => {}
         }
         bridge.finish().await;
         return;
