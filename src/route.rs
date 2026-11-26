@@ -485,6 +485,14 @@ impl Selected {
     /// UDP 快路径（dokodemo / TUIC / Hysteria2 / Snell / Shadowsocks）只实现
     /// 直连与共享代理中继。`reverse` 是独立上游，`proxy` 为空但绝不是直连；
     /// 在这些路径里必须失败关闭，不能把反向目标当成本地上游发出去。
+    /// 规则判定阶段已经解析出的地址（若有）。
+    ///
+    /// 直连路径**必须优先复用它**：重新解析可能拿到不同地址，
+    /// 规则检查过的集合就不再等于实际连接的目标。
+    pub fn resolved_addresses(&self) -> Option<&[std::net::SocketAddr]> {
+        self.resolved.as_deref()
+    }
+
     pub fn udp_proxied(&self) -> std::io::Result<bool> {
         if self.reverse.is_some() {
             return Err(std::io::Error::new(

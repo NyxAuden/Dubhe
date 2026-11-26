@@ -1074,7 +1074,12 @@ async fn forward_to(
     // 先选路。`udp_selected` 会拒绝 reject 规则、HTTP 出站与链式出站；
     // 选到代理时走共享 UDP 关联（与 SOCKS5/VLESS 等路径同一套实现），
     // 否则保持原有的直连快路径。
-    let proxied = ctx.udp_selected(tag, &packet.target).await?.udp_proxied()?;
+    let selected = ctx.udp_selected(tag, &packet.target).await?;
+    let proxied = selected.udp_proxied()?;
+    // 规则阶段解析过的地址要复用，否则重新解析可能换一个地址，
+    // 规则检查的集合就不等于实际发送的目标。
+    let rule_resolved: Option<Vec<SocketAddr>> =
+        selected.resolved_addresses().map(<[SocketAddr]>::to_vec);
     let payload_limit = ctx.limits.max_udp_payload.min(wire::MAX_UDP_PAYLOAD);
     if packet.payload.len() > payload_limit {
         return Err(invalid("Hysteria2 UDP 载荷过长"));
@@ -1195,10 +1200,11 @@ async fn forward_to(
         if mappings.len() >= ctx.limits.max_udp_targets {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "UDP 目标上限"));
         }
-        let address = ctx
-            .dns
-            .resolve(&packet.target)
-            .await?
+        let addresses = match &rule_resolved {
+            Some(addresses) => addresses.clone(),
+            None => ctx.dns.resolve(&packet.target).await?,
+        };
+        let address = addresses
             .first()
             .copied()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无可用地址"))?;

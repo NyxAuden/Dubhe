@@ -4,12 +4,7 @@ use super::{
     naive_padding::{self, PaddedStream},
     xhttp::{H3Reader, Tunnel},
 };
-use crate::{
-    config::Inbound,
-    forward::Context,
-    protocol::http as proxy_http,
-    telemetry::Gauge,
-};
+use crate::{config::Inbound, forward::Context, protocol::http as proxy_http, telemetry::Gauge};
 use bytes::Bytes;
 use http::{HeaderValue, Response, StatusCode};
 use std::{

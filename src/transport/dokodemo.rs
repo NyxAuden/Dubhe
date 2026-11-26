@@ -178,7 +178,12 @@ pub(crate) async fn serve_udp(
                 );
                 None
             }
-            Ok(false) => match ctx.dns.resolve(&target).await {
+            // 规则阶段已解析过就复用：重新解析可能拿到不同地址，
+            // 规则检查过的集合就不再等于实际发送的目标。
+            Ok(false) => match match selected.resolved_addresses() {
+                Some(addresses) => Ok(addresses.to_vec()),
+                None => ctx.dns.resolve(&target).await,
+            } {
                 Ok(addresses) => addresses.first().copied().map(Destination::Direct),
                 Err(error) => {
                     tracing::warn!(

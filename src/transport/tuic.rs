@@ -1107,16 +1107,23 @@ async fn udp_session_loop(mut receiver: mpsc::Receiver<UdpPacket>, info: Arc<Udp
                 // 先选路：`udp_selected` 会拒绝 reject 规则、HTTP 出站与链式出站，
                 // 并允许代理出站；`allowed` 只允许直连，会让 TUIC 的 UDP 在
                 // 链式部署下直接失败。
-                let proxied = match info.shared.udp_selected(&info.tag, &target).await {
-                    Ok(selected) => match selected.udp_proxied() {
-                        Ok(proxied) => proxied,
-                        Err(_) => continue,
-                    },
-                    Err(_) => {
-                        // 路由拒绝已在 Context 分类并计入 rejected，这里不重复计数。
-                        continue;
-                    }
-                };
+                let (proxied, rule_resolved) =
+                    match info.shared.udp_selected(&info.tag, &target).await {
+                        Ok(selected) => match selected.udp_proxied() {
+                            // 规则阶段解析过的地址要复用，见 hysteria2 同处注释。
+                            Ok(proxied) => (
+                                proxied,
+                                selected
+                                    .resolved_addresses()
+                                    .map(<[SocketAddr]>::to_vec),
+                            ),
+                            Err(_) => continue,
+                        },
+                        Err(_) => {
+                            // 路由拒绝已在 Context 分类并计入 rejected，这里不重复计数。
+                            continue;
+                        }
+                    };
                 // 路由变化可能改变同一目标的出站方式；旧映射不再适用。
                 if targets
                     .get(&target)
@@ -1185,7 +1192,11 @@ async fn udp_session_loop(mut receiver: mpsc::Receiver<UdpPacket>, info: Arc<Udp
                         info.shared.stats.drop_packet();
                         continue;
                     }
-                    let resolved = match info.shared.dns.resolve(&target).await {
+                    let addresses = match &rule_resolved {
+                        Some(addresses) => Ok(addresses.clone()),
+                        None => info.shared.dns.resolve(&target).await,
+                    };
+                    let resolved = match addresses {
                         Ok(addresses) => match addresses.first().copied() {
                             Some(address) => address,
                             None => {
