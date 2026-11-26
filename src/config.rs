@@ -1755,6 +1755,10 @@ fn default_per_ip_handshakes() -> usize {
     8
 }
 
+fn default_xhttp_buffer_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
@@ -1771,6 +1775,15 @@ pub struct Limits {
     pub max_grpc_streams: usize,
     pub max_grpc_streams_per_connection: usize,
     pub max_xhttp_sessions: usize,
+    /// XHTTP 各会话认证前可排队负载的**全入口共享字节预算**。
+    ///
+    /// 此前每个会话只按条数（`sc_max_buffered_posts`）限流，会话数又是
+    /// 入口级（默认 256）：最坏名义容量是
+    /// `sc_max_each_post_bytes × sc_max_buffered_posts × max_xhttp_sessions`
+    /// = 1 MB × 30 × 256 ≈ 7.15 GiB，且全部发生在认证之前。
+    /// 这个预算把总量压到固定上限，permit 跟随载荷、载荷被读走即归还。
+    #[serde(default = "default_xhttp_buffer_bytes")]
+    pub xhttp_buffer_bytes: usize,
     pub max_replay_entries: usize,
     pub max_vmess_replay_entries: usize,
     pub max_reality_replay_entries: usize,
@@ -1800,6 +1813,9 @@ impl Default for Limits {
             max_grpc_streams: 256,
             max_grpc_streams_per_connection: 16,
             max_xhttp_sessions: 256,
+            // 与 udp_queue_bytes 同量级：够若干个满 POST 排队，
+            // 又不会让未认证流量把进程内存打满。
+            xhttp_buffer_bytes: 8 * 1024 * 1024,
             max_replay_entries: 65536,
             max_vmess_replay_entries: 65536,
             max_reality_replay_entries: 65536,

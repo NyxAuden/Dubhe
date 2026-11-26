@@ -40,6 +40,10 @@ pub(crate) struct Pool {
     stats: Arc<crate::telemetry::Stats>,
     max_buffered: usize,
     ttl: Duration,
+    /// 全入口共享的排队字节预算。每段排队负载持有等量 permit，
+    /// 被下行读走即归还。此前只有「条数」上限，未认证流量可以按
+    /// 会话数 × 条数 × 单条上限累积到 GiB 级。
+    buffer_bytes: Arc<Semaphore>,
 }
 
 impl Pool {
@@ -54,6 +58,7 @@ impl Pool {
             stats,
             max_buffered: xhttp.sc_max_buffered_posts,
             ttl: Duration::from_millis(xhttp.session_ttl_ms),
+            buffer_bytes: Arc::new(Semaphore::new(limits.xhttp_buffer_bytes)),
         })
     }
 
@@ -83,6 +88,7 @@ impl Pool {
                 _slot: slot,
                 _gauge: gauge,
             }),
+            budget: self.buffer_bytes.clone(),
         });
         sessions.insert(id, lane.clone());
         drop(sessions);
@@ -139,7 +145,7 @@ struct SessionHold {
 #[derive(Default)]
 struct State {
     next_seq: u64,
-    pending: BTreeMap<u64, Vec<u8>>,
+    pending: BTreeMap<u64, QueuedChunk>,
     pending_bytes: usize,
     connected: bool,
     upload_closed: bool,
@@ -149,10 +155,12 @@ struct Session {
     id: String,
     state: Mutex<State>,
     push: tokio::sync::Mutex<()>,
-    tx: tokio::sync::Mutex<Option<mpsc::Sender<Vec<u8>>>>,
-    rx: tokio::sync::Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    tx: tokio::sync::Mutex<Option<mpsc::Sender<QueuedChunk>>>,
+    rx: tokio::sync::Mutex<Option<mpsc::Receiver<QueuedChunk>>>,
     done: AtomicBool,
     lease: Lease,
+    /// 本入口的共享排队字节预算（来自 `Pool`）。
+    budget: Arc<Semaphore>,
 }
 
 impl Session {
@@ -160,7 +168,11 @@ impl Session {
         self.lease.clone()
     }
 
-    async fn push_bytes(&self, bytes: Vec<u8>) -> io::Result<()> {
+    /// 入队一段**已经在共享字节预算内**的负载。
+    ///
+    /// permit 随数据一起转移给 reader，读到下一段时才释放。调用方负责在
+    /// 复制数据**之前**申请额度，避免先分配再拒绝。
+    async fn push_queued(&self, chunk: QueuedChunk) -> io::Result<()> {
         if self.done.load(Ordering::SeqCst) {
             return Err(closed());
         }
@@ -168,13 +180,32 @@ impl Session {
         let Some(sender) = sender.as_ref() else {
             return Err(closed());
         };
-        sender.send(bytes).await.map_err(|_| closed())
+        sender.send(chunk).await.map_err(|_| closed())
+    }
+
+    /// 申请预算后入队（先申请、再复制，避免先分配再拒绝）。
+    async fn push_with_budget(&self, bytes: Vec<u8>) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let permit = self.reserve(&bytes)?;
+        self.push_queued((bytes, permit)).await
+    }
+
+    /// 用共享预算包住一段新负载；超出即失败关闭，不把内存压力推给进程。
+    fn reserve(&self, bytes: &[u8]) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
+        let want = u32::try_from(bytes.len().max(1))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "XHTTP负载过大"))?;
+        self.budget
+            .clone()
+            .try_acquire_many_owned(want)
+            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "XHTTP排队字节超预算"))
     }
 
     /// packet-up 有序交付：允许乱序到达，缓冲有界，重复/超界失败关闭。
     async fn push_seq(&self, seq: u64, payload: Vec<u8>, max_post: usize) -> io::Result<()> {
         let _serial = self.push.lock().await;
-        let mut ready = Vec::new();
+        let mut ready: Vec<(Vec<u8>, Option<tokio::sync::OwnedSemaphorePermit>)> = Vec::new();
         {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             if seq < state.next_seq {
@@ -182,15 +213,16 @@ impl Session {
             }
             if seq == state.next_seq {
                 state.next_seq += 1;
-                ready.push(payload);
+                let permit = self.reserve(&payload)?;
+                ready.push((payload, Some(permit)));
                 loop {
                     let next_seq = state.next_seq;
-                    let Some(next) = state.pending.remove(&next_seq) else {
+                    let Some((next, permit)) = state.pending.remove(&next_seq) else {
                         break;
                     };
                     state.pending_bytes = state.pending_bytes.saturating_sub(next.len());
                     state.next_seq += 1;
-                    ready.push(next);
+                    ready.push((next, Some(permit)));
                 }
             } else {
                 if state.pending.len() >= 1024 || state.pending.contains_key(&seq) {
@@ -206,17 +238,21 @@ impl Session {
                         "XHTTP序号缓冲超限",
                     ));
                 }
+                // 乱序缓冲同样受共享字节预算约束：每会话虽有
+                // `max_post × 2` 的上限，但会话数乘起来仍会随入口放大。
+                let permit = self.reserve(&payload)?;
                 state.pending_bytes = buffered;
-                state.pending.insert(seq, payload);
+                state.pending.insert(seq, (payload, permit));
             }
         }
-        for chunk in ready {
-            self.push_bytes(chunk).await?;
+        for (payload, permit) in ready {
+            let Some(permit) = permit else { continue };
+            self.push_queued((payload, permit)).await?;
         }
         Ok(())
     }
 
-    async fn take_reader(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
+    async fn take_reader(&self) -> Option<mpsc::Receiver<QueuedChunk>> {
         self.rx.lock().await.take()
     }
 
@@ -420,7 +456,7 @@ impl<S: AsyncRead + Unpin> Conn<S> {
                     let take = remaining.min(STREAM_CHUNK);
                     let mut piece = vec![0u8; take];
                     self.read_exact_into(&mut piece).await?;
-                    session.push_bytes(piece).await?;
+                    session.push_with_budget(piece).await?;
                     remaining -= take;
                 }
             }
@@ -439,7 +475,7 @@ impl<S: AsyncRead + Unpin> Conn<S> {
                     let take = remaining.min(STREAM_CHUNK);
                     let mut piece = vec![0u8; take];
                     self.read_exact_into(&mut piece).await?;
-                    session.push_bytes(piece).await?;
+                    session.push_with_budget(piece).await?;
                     remaining -= take;
                 }
                 let mut crlf = [0u8; 2];
@@ -858,7 +894,7 @@ async fn handle_h2(
             let mut body = request.into_body();
             while let Some(chunk) = body.data().await {
                 let chunk = chunk.map_err(io::Error::other)?;
-                lane.push_bytes(chunk.to_vec()).await?;
+                lane.push_with_budget(chunk.to_vec()).await?;
                 body.flow_control()
                     .release_capacity(chunk.len())
                     .map_err(io::Error::other)?;
@@ -1333,17 +1369,27 @@ impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for Tunnel<R, W> {
     }
 }
 
+/// 排队中的一段负载，连同它占用的字节预算 permit。
+///
+/// permit 随数据一起入队；`ChannelReader` 读到下一段并替换 `current` 时，
+/// 上一段的 permit 才被 drop，预算随之归还。这样预算覆盖的是**真正还在
+/// 内存里的字节**，而不是「曾经写过多少」。
+type QueuedChunk = (Vec<u8>, tokio::sync::OwnedSemaphorePermit);
+
 struct ChannelReader {
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<QueuedChunk>,
     current: Vec<u8>,
+    /// 当前段持有的预算 permit；替换 `current` 时自动归还。
+    _current_budget: Option<tokio::sync::OwnedSemaphorePermit>,
     offset: usize,
 }
 
 impl ChannelReader {
-    fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+    fn new(rx: mpsc::Receiver<QueuedChunk>) -> Self {
         Self {
             rx,
             current: Vec::new(),
+            _current_budget: None,
             offset: 0,
         }
     }
@@ -1363,8 +1409,10 @@ impl AsyncRead for ChannelReader {
                 return Poll::Ready(Ok(()));
             }
             match std::task::ready!(self.rx.poll_recv(cx)) {
-                Some(next) => {
+                Some((next, permit)) => {
                     self.current = next;
+                    // 上一段的 permit 在这里被替换并释放。
+                    self._current_budget = Some(permit);
                     self.offset = 0;
                 }
                 None => return Poll::Ready(Ok(())),
@@ -2443,7 +2491,8 @@ async fn handle_h3(
             while let Some(mut chunk) = stream.recv_data().await.map_err(h3_error)? {
                 while chunk.has_remaining() {
                     let take = chunk.remaining().min(STREAM_CHUNK);
-                    lane.push_bytes(chunk.copy_to_bytes(take).to_vec()).await?;
+                    lane.push_with_budget(chunk.copy_to_bytes(take).to_vec())
+                        .await?;
                 }
             }
             // 持续POST的EOF只结束上行；业务下行仍由GET独立驱动。

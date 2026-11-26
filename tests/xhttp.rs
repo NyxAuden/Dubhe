@@ -124,6 +124,47 @@ async fn post(running: &Running, target: &str, body: &[u8]) -> String {
     head
 }
 
+/// 回归：认证前的排队负载必须受**全入口共享字节预算**约束。
+///
+/// 此前只有「每会话条数」上限（`sc_max_buffered_posts`），会话数上限又是
+/// 入口级的：最坏名义容量是 `单条上限 × 条数 × 会话数`，默认可达 GiB 级，
+/// 且全部发生在认证之前。这里把预算调到很小，然后推送远超预算的数据。
+///
+/// 期望：服务端拒绝，而不是无限接收后把内存吃满。
+#[tokio::test]
+async fn unauthenticated_posts_are_bounded_by_shared_byte_budget() {
+    let mut value = config("auto");
+    value["limits"] = json!({"xhttp_buffer_bytes": 4096});
+    let running = Running::start(value).await;
+
+    // 单条就超过预算。允许两种 fail-closed 结果：
+    // 返回非 200，或直接断开（服务端不做无界接收）。
+    let oversized = vec![0x41u8; 16 * 1024];
+    let mut stream = connect(&running).await;
+    let head = format!(
+        "POST /GunService/Tun/sess-big/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+        oversized.len()
+    );
+    let _ = stream.write_all(head.as_bytes()).await;
+    let _ = stream.write_all(&oversized).await;
+    let mut buffer = [0u8; 64];
+    let verdict = timeout(Duration::from_secs(3), stream.read(&mut buffer)).await;
+    match verdict {
+        // 断开（读到 EOF 或错误）：可接受。
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        // 有响应时必须不是 200。
+        Ok(Ok(read)) => {
+            let text = String::from_utf8_lossy(&buffer[..read]).to_string();
+            assert!(
+                !text.starts_with("HTTP/1.1 200"),
+                "超过共享字节预算的未认证 POST 不得被接受，实际返回 {text}"
+            );
+        }
+        Err(_) => panic!("超过共享字节预算的未认证 POST 既未被拒也未断开（挂起）"),
+    }
+    running.shutdown().await;
+}
+
 #[tokio::test]
 async fn packet_up_posts_feed_a_get_downlink() {
     let echo = Echo::tcp("127.0.0.1", false).await;

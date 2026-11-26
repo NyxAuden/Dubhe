@@ -2305,6 +2305,10 @@ impl Limits {
             (1..=max_permits).contains(&self.max_xhttp_sessions),
             "limits.max_xhttp_sessions 超出允许的非零资源范围"
         );
+        ensure!(
+            (1..=max_permits).contains(&self.xhttp_buffer_bytes),
+            "limits.xhttp_buffer_bytes 超出允许的非零资源范围"
+        );
         for (field, value) in [
             ("handshake_timeout_ms", self.handshake_timeout_ms),
             ("dial_timeout_ms", self.dial_timeout_ms),

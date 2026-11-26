@@ -164,6 +164,7 @@ fn valid_dual_inbounds_defaults_and_serialization() {
         "udp_queue_packets": 64,
         "max_udp_payload": 65507,
         "max_xhttp_sessions": 256,
+        "xhttp_buffer_bytes": 8388608,
         "per_ip_handshakes": 8,
         "handshake_timeout_ms": 10000,
         "dial_timeout_ms": 10000,
