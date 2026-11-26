@@ -41,21 +41,15 @@ pub(crate) async fn serve(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Naive TLS握手超时"))??;
     let alpn = accepted.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
-    let (tag, users, h1_padding) = match &*config {
-        Inbound::Naive {
-            tag,
-            users,
-            h1_padding,
-            ..
-        } => (tag.clone(), users.clone(), *h1_padding),
-        _ => return Err(io::Error::other("入口不是 Naive")),
+    let Inbound::Naive { h1_padding, .. } = &*config else {
+        return Err(io::Error::other("入口不是 Naive"));
     };
+    let h1_padding = *h1_padding;
     match alpn.as_deref() {
         Some(b"h2") => {
             serve_h2(
                 accepted,
-                &tag,
-                &users,
+                config,
                 &ctx,
                 deadline,
                 handshake,
@@ -66,6 +60,11 @@ pub(crate) async fn serve(
             .await
         }
         Some(b"http/1.1") | None => {
+            // H1 每承载一条连接只跑一次 relay，不需要共享快照。
+            let (tag, users) = match &*config {
+                Inbound::Naive { tag, users, .. } => (tag.clone(), users.clone()),
+                _ => return Err(io::Error::other("入口不是 Naive")),
+            };
             if h1_padding {
                 return h1::serve(accepted, &tag, &users, ctx, deadline, handshake).await;
             }
@@ -82,8 +81,7 @@ pub(crate) async fn serve(
 #[allow(clippy::too_many_arguments)]
 async fn serve_h2<S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(
     io: S,
-    tag: &str,
-    users: &[crate::config::User],
+    config: Arc<Inbound>,
     ctx: &Arc<Context>,
     deadline: Instant,
     handshake: crate::runtime::HandshakePermits,
@@ -137,13 +135,16 @@ async fn serve_h2<S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
                 let Ok(global_slot) = global_streams.clone().try_acquire_owned() else {
                     ctx.stats.reject(); respond.send_reset(h2::Reason::REFUSED_STREAM); continue;
                 };
-                let (tag, users, ctx) = (tag.to_owned(), users.to_vec(), ctx.clone());
+                // 每流只共享 Arc 快照：此前这里 `users.to_vec()` 深复制全部
+                // 账户（每个 User 两个 String），成本按「账户数 × 并发流数」
+                // 增长，且在认证前就复制。
+                let (config, ctx) = (config.clone(), ctx.clone());
                 let children = ctx.children.clone();
                 let auth = auth_tx.clone();
                 streams.spawn(children.track_future(async move {
                     let _slot = slot;
                     let _global = global_slot;
-                    handle_stream(request, respond, &tag, &users, &ctx, &auth).await
+                    handle_stream(request, respond, &config, &ctx, &auth).await
                 }));
             }
             result = streams.join_next(), if !streams.is_empty() => {
@@ -165,11 +166,15 @@ async fn serve_h2<S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>
 async fn handle_stream(
     request: ::http::Request<h2::RecvStream>,
     mut respond: SendResponse<Bytes>,
-    tag: &str,
-    users: &[crate::config::User],
+    config: &Inbound,
     ctx: &Arc<Context>,
     auth: &tokio::sync::watch::Sender<bool>,
 ) -> io::Result<()> {
+    let Inbound::Naive { tag, users, .. } = config else {
+        return Err(io::Error::other("入口不是 Naive"));
+    };
+    let tag = tag.as_str();
+    let users = users.as_slice();
     if request.method() != ::http::Method::CONNECT {
         reject(&mut respond, StatusCode::METHOD_NOT_ALLOWED)?;
         return Ok(());
@@ -265,6 +270,9 @@ async fn handle_stream(
     } else {
         // 按账户归因业务字节（此前 Naive H2 连用户名都没传下来）。
         let tunnel = ctx.stats.count_user(tag, user.as_deref(), tunnel);
+        // 曾按「多路复用短流应使用小块」在这里改成 8/8，但实测 8/32/64 KiB
+        // 三档在 16/32 并发隧道下的每流匿名内存差全在噪声内（109–124 KB），
+        // 没有可测收益，已回退。这里的每流成本不是 relay 缓冲决定的。
         crate::forward::relay(tunnel, upstream.expect("非UoT已建目标"), ctx.stats.clone()).await
     }
 }
