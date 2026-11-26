@@ -70,6 +70,39 @@ pub(crate) struct HandshakePermits {
     _per_ip: Option<PerIpGuard>,
 }
 
+/// 可在深层异步函数里释放的握手许可。
+///
+/// gRPC / XHTTP 的认证发生在 `dispatch` 内部（协议握手成功后才知道用户是谁），
+/// 而许可需要在**认证成功的那一刻**归还。用一个可共享的槽把它传下去：
+/// 只有真正认证成功的路径调用 [`AuthSlot::release`]，其余路径在连接结束时
+/// 由 `Drop` 释放。
+#[derive(Clone)]
+pub(crate) struct AuthSlot(Arc<std::sync::Mutex<Option<HandshakePermits>>>);
+
+impl AuthSlot {
+    pub(crate) fn new(permits: HandshakePermits) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(permits))))
+    }
+
+    /// 认证成功后归还握手名额；重复调用无副作用。
+    pub(crate) fn release(&self) {
+        let taken = self
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        drop(taken);
+    }
+
+    /// 仍在等待首次认证。
+    pub(crate) fn pending(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+    }
+}
+
 impl HandshakePermits {
     pub(crate) fn new(
         global: tokio::sync::OwnedSemaphorePermit,

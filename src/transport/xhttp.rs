@@ -301,10 +301,13 @@ pub(crate) async fn serve(
                 crate::tls::AcceptedInbound::Fallback => return Ok(()),
                 crate::tls::AcceptedInbound::Stream { io, alpn } => (io, alpn),
             };
-            drop(handshake);
+            let auth = crate::runtime::AuthSlot::new(handshake);
             match alpn.as_deref() {
                 Some(b"h2") => {
-                    serve_h2(stream, config, vmess, ctx, pool, absolute, stop, force).await
+                    serve_h2(
+                        stream, config, vmess, ctx, pool, absolute, stop, force, auth,
+                    )
+                    .await
                 }
                 Some(b"http/1.1") | None => {
                     serve_h1(
@@ -319,6 +322,7 @@ pub(crate) async fn serve(
                         absolute,
                         stop,
                         force,
+                        auth,
                     )
                     .await
                 }
@@ -347,9 +351,12 @@ pub(crate) async fn serve(
                     break;
                 }
             }
-            drop(handshake);
+            let auth = crate::runtime::AuthSlot::new(handshake);
             if read == H2_PREFACE.len() && peek == H2_PREFACE {
-                serve_h2(stream, config, vmess, ctx, pool, absolute, stop, force).await
+                serve_h2(
+                    stream, config, vmess, ctx, pool, absolute, stop, force, auth,
+                )
+                .await
             } else {
                 serve_h1(
                     Conn {
@@ -363,6 +370,7 @@ pub(crate) async fn serve(
                     absolute,
                     stop,
                     force,
+                    auth,
                 )
                 .await
             }
@@ -568,6 +576,7 @@ async fn serve_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     absolute: Instant,
     stop: CancellationToken,
     force: CancellationToken,
+    auth: crate::runtime::AuthSlot,
 ) -> io::Result<()> {
     let head_limit = xhttp_config(&config)?.server_max_header_bytes();
     loop {
@@ -585,7 +594,7 @@ async fn serve_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             .get(http::header::CONNECTION)
             .and_then(|v| v.to_str().ok())
             .is_none_or(|v| !v.eq_ignore_ascii_case("close"));
-        match handle_h1(conn, head, &config, &vmess, &ctx, &pool, absolute).await {
+        match handle_h1(conn, head, &config, &vmess, &ctx, &pool, absolute, &auth).await {
             Ok(Some(next)) if keep => conn = next,
             Ok(_) => return Ok(()),
             Err(error) => return Err(error),
@@ -602,6 +611,7 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     ctx: &Arc<Context>,
     pool: &Arc<Pool>,
     absolute: Instant,
+    auth: &crate::runtime::AuthSlot,
 ) -> io::Result<Option<Conn<S>>> {
     let xhttp = xhttp_config(config)?;
     let (path, query) = split_target(&head.target);
@@ -655,7 +665,16 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             ChannelReader::new(rx),
             FinishOnDrop::new(ChunkedWriter::new(write)),
         );
-        let result = dispatch(tunnel, config, vmess, ctx, absolute, Some(lane.lease())).await;
+        let result = dispatch(
+            tunnel,
+            config,
+            vmess,
+            ctx,
+            absolute,
+            Some(lane.lease()),
+            Some(auth),
+        )
+        .await;
         pool.remove(&session_id);
         result?;
         return Ok(None);
@@ -683,7 +702,16 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             _ => BodyReader::Raw(PrefixReader::new(conn.buffer, read)),
         };
         let tunnel = Tunnel::new(input, FinishOnDrop::new(ChunkedWriter::new(write)));
-        let result = dispatch(tunnel, config, vmess, ctx, absolute, Some(lane.lease())).await;
+        let result = dispatch(
+            tunnel,
+            config,
+            vmess,
+            ctx,
+            absolute,
+            Some(lane.lease()),
+            Some(auth),
+        )
+        .await;
         pool.remove(&session_id);
         result?;
         return Ok(None);
@@ -757,6 +785,7 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     absolute: Instant,
     stop: CancellationToken,
     force: CancellationToken,
+    auth: crate::runtime::AuthSlot,
 ) -> io::Result<()> {
     let head_limit = xhttp_config(&config)?.server_max_header_bytes() as u32;
     // H2 握手本身也受 `absolute` 约束：此前只有 TLS 握手受期限保护，
@@ -798,9 +827,10 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 let vmess = vmess.clone();
                 let ctx = ctx.clone();
                 let pool = pool.clone();
+                let auth = auth.clone();
                 let tracker = ctx.children.clone();
                 streams.spawn(tracker.track_future(async move {
-                    if let Err(error) = handle_h2(request, respond, &config, &vmess, &ctx, &pool, absolute).await {
+                    if let Err(error) = handle_h2(request, respond, &config, &vmess, &ctx, &pool, absolute, &auth).await {
                         metrics_reject(&ctx);
                         let _ = error;
                     }
@@ -827,6 +857,7 @@ async fn handle_h2(
     ctx: &Arc<Context>,
     pool: &Arc<Pool>,
     absolute: Instant,
+    auth: &crate::runtime::AuthSlot,
 ) -> io::Result<()> {
     let xhttp = xhttp_config(config)?;
     let path = request.uri().path().to_owned();
@@ -875,7 +906,16 @@ async fn handle_h2(
             ChannelReader::new(rx),
             FinishOnDrop::new(H2Writer::new(send)),
         );
-        let result = dispatch(tunnel, config, vmess, ctx, absolute, Some(lane.lease())).await;
+        let result = dispatch(
+            tunnel,
+            config,
+            vmess,
+            ctx,
+            absolute,
+            Some(lane.lease()),
+            Some(auth),
+        )
+        .await;
         pool.remove(&session_id);
         result
     } else if *request.method() == Method::POST {
@@ -885,7 +925,7 @@ async fn handle_h2(
                 H2Reader::new(request.into_body()),
                 FinishOnDrop::new(H2Writer::new(send)),
             );
-            return dispatch(tunnel, config, vmess, ctx, absolute, None).await;
+            return dispatch(tunnel, config, vmess, ctx, absolute, None, Some(auth)).await;
         }
         let Some(session_id) = session else {
             reject_h2(&mut respond, xhttp, StatusCode::BAD_REQUEST).await;
@@ -1023,6 +1063,7 @@ pub(crate) async fn dispatch<S>(
     ctx: &Arc<Context>,
     deadline: Instant,
     lease: Option<Lease>,
+    auth: Option<&crate::runtime::AuthSlot>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1048,6 +1089,9 @@ where
             let accepted = timeout_at(deadline, vless::read_plain_request(&mut app, users, *xudp))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP/VLESS认证超时"))??;
+            if let Some(auth) = auth {
+                auth.release();
+            }
             crate::runtime::serve_plain_vless_scoped(
                 app,
                 accepted,
@@ -1064,6 +1108,9 @@ where
             let request = timeout_at(deadline, trojan::read_request(&mut app, users))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP/Trojan认证超时"))??;
+            if let Some(auth) = auth {
+                auth.release();
+            }
             match request.command {
                 Command::Connect => {
                     crate::runtime::serve_trojan_connect(app, tag, ctx.clone(), &request).await
@@ -1092,6 +1139,9 @@ where
             let accepted = timeout_at(deadline, prepared.handshake(&mut app, true))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP/VMess认证超时"))??;
+            if let Some(auth) = auth {
+                auth.release();
+            }
             let allow_udp = prepared.allow_udp();
             crate::runtime::serve_vmess_scoped(
                 app,
@@ -2324,8 +2374,11 @@ pub(crate) async fn serve_quic(
                     let wait = Duration::from_millis(ctx.limits.handshake_timeout_ms);
                     let accepted = timeout(wait, async move { incoming.await }).await;
                     let Ok(Ok(connection)) = accepted else { return };
-                    drop(handshake);
-                    let _ = serve_h3_connection(connection, config, vmess, ctx, pool, stop, force).await;
+                    // 许可由认证成功释放，不是 QUIC 握手完成。
+                    let auth = crate::runtime::AuthSlot::new(
+                        crate::runtime::HandshakePermits::new(handshake, None),
+                    );
+                    let _ = serve_h3_connection(connection, config, vmess, ctx, pool, stop, force, auth).await;
                 }));
             }
             Some(_) = tasks.join_next() => {}
@@ -2367,6 +2420,7 @@ fn quic_server_config(tls: Arc<rustls::ServerConfig>) -> io::Result<quinn::Serve
 }
 
 /// 单个 QUIC 连接内的 HTTP/3 请求循环。
+#[allow(clippy::too_many_arguments)]
 async fn serve_h3_connection(
     connection: quinn::Connection,
     config: Arc<Inbound>,
@@ -2375,6 +2429,7 @@ async fn serve_h3_connection(
     pool: Arc<Pool>,
     stop: CancellationToken,
     force: CancellationToken,
+    auth: crate::runtime::AuthSlot,
 ) -> io::Result<()> {
     let mut connection = h3::server::Connection::<h3_quinn::Connection, Bytes>::new(
         h3_quinn::Connection::new(connection),
@@ -2396,10 +2451,11 @@ async fn serve_h3_connection(
                 let vmess = vmess.clone();
                 let ctx = ctx.clone();
                 let pool = pool.clone();
+                let auth = auth.clone();
                 let tracker = ctx.children.clone();
                 streams.spawn(tracker.track_future(async move {
                     if let Err(error) =
-                        handle_h3(request, stream, &config, &vmess, &ctx, &pool, deadline).await
+                        handle_h3(request, stream, &config, &vmess, &ctx, &pool, deadline, &auth).await
                     {
                         metrics_reject(&ctx);
                         let _ = error;
@@ -2434,6 +2490,7 @@ async fn handle_h3(
     ctx: &Arc<Context>,
     pool: &Arc<Pool>,
     absolute: Instant,
+    auth: &crate::runtime::AuthSlot,
 ) -> io::Result<()> {
     let xhttp = xhttp_config(config)?;
     let path = request.uri().path().to_owned();
@@ -2479,7 +2536,16 @@ async fn handle_h3(
             pump_h3(send, out).await;
         });
         let tunnel = Tunnel::new(ChannelReader::new(rx), FinishOnDrop::new(H3Sender::new(tx)));
-        let result = dispatch(tunnel, config, vmess, ctx, absolute, Some(lane.lease())).await;
+        let result = dispatch(
+            tunnel,
+            config,
+            vmess,
+            ctx,
+            absolute,
+            Some(lane.lease()),
+            Some(auth),
+        )
+        .await;
         pool.remove(&session_id);
         result
     } else if *request.method() == Method::POST {
@@ -2492,7 +2558,7 @@ async fn handle_h3(
             let (tx, out) = mpsc::channel::<Bytes>(8);
             tokio::spawn(pump_h3(send, out));
             let tunnel = Tunnel::new(H3Reader::new(recv), FinishOnDrop::new(H3Sender::new(tx)));
-            return dispatch(tunnel, config, vmess, ctx, absolute, None).await;
+            return dispatch(tunnel, config, vmess, ctx, absolute, None, Some(auth)).await;
         }
         let Some(session_id) = session else {
             reject_h3(&mut stream, xhttp, StatusCode::BAD_REQUEST).await;

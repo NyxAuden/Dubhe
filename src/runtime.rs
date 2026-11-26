@@ -57,10 +57,10 @@ fn relay_credential(bytes: usize) -> String {
 /// 否则 `route.rules[].inbounds: ["nw3-in"]` 匹配不到经 relay 的流量。
 pub(crate) const NW3_RELAY_PREFIX: &str = "__nw3_relay:";
 
+pub(crate) use accept::{ACCEPT_BACKOFF, recoverable_accept_error};
 /// 握手期的两个名额（全局并发 + 单 IP 在途）。协议实现只需按原样持有并在
 /// 握手完成时 `drop`，两者的释放时机因此自动对齐。
-pub(crate) use accept::HandshakePermits;
-pub(crate) use accept::{ACCEPT_BACKOFF, recoverable_accept_error};
+pub(crate) use accept::{AuthSlot, HandshakePermits};
 mod listener;
 mod reload;
 mod serve;

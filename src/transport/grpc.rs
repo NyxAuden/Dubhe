@@ -618,7 +618,9 @@ pub(crate) async fn serve(
         | Inbound::TrojanGrpc { grpc, .. } => grpc.clone(),
         _ => return Err(io::Error::other("入口不是gRPC")),
     };
-    let mut handshake = Some(handshake);
+    // 许可由**认证成功**释放，不是「收到 RPC」：把可共享的槽传进
+    // `accept_rpc` → `dispatch`，由各协议握手成功处调用 `release()`。
+    let auth = crate::runtime::AuthSlot::new(handshake);
     // 物理准备完成前pipeline的合法RPC先有界持有，不进入协议业务。
     let mut pending: Vec<(Request<RecvStream>, SendResponse<prost::bytes::Bytes>)> = Vec::new();
 
@@ -648,11 +650,11 @@ pub(crate) async fn serve(
     // 并发握手限额（许可已归还，计数器归零）。改为：许可保留到第一个被接受
     // 的 RPC，并由下面的 `authenticate_by` 给它一个绝对期限。
     for (request, respond) in pending.drain(..) {
-        handshake.take();
         let rpc_deadline = rpc_deadline(&respond, &heads, duration);
         accept_rpc(
             request,
             respond,
+            &auth,
             rpc_deadline,
             &inbound,
             &grpc,
@@ -681,7 +683,7 @@ pub(crate) async fn serve(
             biased;
             _ = force.cancelled() => break,
             // 仍在等首个 RPC（许可未归还）时到点失败关闭。
-            _ = tokio::time::sleep_until(authenticate_by), if handshake.is_some() => {
+            _ = tokio::time::sleep_until(authenticate_by), if auth.pending() => {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "gRPC 首个 RPC 认证超时",
@@ -716,12 +718,11 @@ pub(crate) async fn serve(
                             rpcs.spawn(reject(respond, StatusCode::SERVICE_UNAVAILABLE));
                             continue;
                         }
-                        // 第一个被接受的 RPC：此后按已认证连接处理，归还许可。
-                        handshake.take();
                         let rpc_deadline = rpc_deadline(&respond, &heads, duration);
                         accept_rpc(
                             request,
                             respond,
+                            &auth,
                             rpc_deadline,
                             &inbound,
                             &grpc,
@@ -849,6 +850,7 @@ impl RpcScope {
 fn accept_rpc(
     request: Request<RecvStream>,
     respond: SendResponse<prost::bytes::Bytes>,
+    auth: &crate::runtime::AuthSlot,
     deadline: Instant,
     inbound: &Inbound,
     grpc: &crate::config::Grpc,
@@ -887,6 +889,7 @@ fn accept_rpc(
     let vmess = vmess.clone();
     let ctx = ctx.clone();
     let tracker = ctx.children.clone();
+    let auth = auth.clone();
     rpcs.spawn(tracker.track_future(async move {
         run_rpc(
             request.into_body(),
@@ -897,6 +900,7 @@ fn accept_rpc(
             vmess,
             ctx,
             scope,
+            auth,
         )
         .await;
     }));
@@ -1010,6 +1014,7 @@ async fn run_rpc(
     vmess: Option<Arc<vmess::Prepared>>,
     ctx: Arc<Context>,
     mut scope: RpcScope,
+    auth: crate::runtime::AuthSlot,
 ) {
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -1032,7 +1037,7 @@ async fn run_rpc(
         let _lease = out_lease;
         let _ = pump_out(bridge_read, send, multi).await;
     });
-    let result = dispatch(app, &inbound, vmess, ctx.clone(), deadline, lease).await;
+    let result = dispatch(app, &inbound, vmess, ctx.clone(), deadline, lease, &auth).await;
     if let Err(error) = &result {
         // 认证失败必须计入 rejected：此前只 abort_and_join 就返回，导致
         // gRPC 入口的 UUID/密码猜测在 dubhe_rejected_total 上完全不可见
@@ -1057,6 +1062,7 @@ async fn dispatch<S>(
     ctx: Arc<Context>,
     deadline: Instant,
     lease: Lease,
+    auth: &crate::runtime::AuthSlot,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1079,6 +1085,8 @@ where
             let accepted = timeout_at(deadline, vless::read_plain_request(&mut app, users, *xudp))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "gRPC/VLESS认证超时"))??;
+            // 认证成功：此刻才归还握手名额。
+            auth.release();
             crate::runtime::serve_plain_vless_scoped(
                 app,
                 accepted,
@@ -1094,6 +1102,7 @@ where
             let request = timeout_at(deadline, trojan::read_request(&mut app, users))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "gRPC/Trojan认证超时"))??;
+            auth.release();
             match request.command {
                 Command::Connect => {
                     crate::runtime::serve_trojan_connect(app, tag, ctx, &request).await
@@ -1119,6 +1128,7 @@ where
             let accepted = timeout_at(deadline, prepared.handshake(&mut app, true))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "gRPC/VMess认证超时"))??;
+            auth.release();
             let allow_udp = prepared.allow_udp();
             crate::runtime::serve_vmess_scoped(
                 app,

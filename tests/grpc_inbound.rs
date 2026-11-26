@@ -1012,6 +1012,39 @@ async fn h2_handshake_without_any_rpc_is_closed_at_deadline() {
     server.shutdown().await;
 }
 
+/// 回归：**发出 RPC 但未完成认证**的连接，许可不得归还。
+///
+/// 上一版在「收到 RPC」时就 `handshake.take()`，于是攻击者只要发一个空帧
+/// （或半截头部）就能释放许可并让连接无限挂着——每源 IP 的并发握手限额
+/// 因此失效。现在许可由**认证成功**释放：这条连接应在期限内被关闭。
+#[tokio::test]
+async fn rpc_without_authentication_keeps_permit_and_is_closed_at_deadline() {
+    let mut value = config(None, None);
+    value["limits"]["handshake_timeout_ms"] = json!(300);
+    let server = Running::start(value).await;
+
+    let io = timeout(WAIT, TcpStream::connect(server.address))
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut send_request, connection) = h2::client::handshake(io).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let (response, mut stream) = send_request
+        .send_request(request("/GunService/Tun"), false)
+        .unwrap();
+    // 只发一个不构成有效认证的短帧，然后保持连接不关。
+    let _ = stream.send_data(
+        prost::bytes::Bytes::from_static(&[0, 0, 0, 0, 2, 0xff]),
+        false,
+    );
+    drop(response);
+
+    // 服务端应在期限内关闭；driver 以错误或结束收场。
+    let closed = timeout(Duration::from_secs(3), driver).await;
+    assert!(closed.is_ok(), "未完成认证的 RPC 不应让连接无限存活");
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn truncated_authentication_message_never_dials() {
     let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

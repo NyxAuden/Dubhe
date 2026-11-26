@@ -56,7 +56,8 @@ pub(crate) async fn serve(
                     ));
                 }
             }
-            drop(handshake);
+            // 许可由认证成功释放，不是升级完成。
+            let auth = crate::runtime::AuthSlot::new(handshake);
             let (app, early) = timeout_at(deadline, accept(accepted, &expected))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTPUpgrade升级超时"))??;
@@ -67,11 +68,12 @@ pub(crate) async fn serve(
                 &ctx,
                 deadline,
                 None,
+                Some(&auth),
             )
             .await
         }
         None => {
-            drop(handshake);
+            let auth = crate::runtime::AuthSlot::new(handshake);
             let (app, early) = timeout_at(deadline, accept(stream, &expected))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTPUpgrade升级超时"))??;
@@ -82,6 +84,7 @@ pub(crate) async fn serve(
                 &ctx,
                 deadline,
                 None,
+                Some(&auth),
             )
             .await
         }
