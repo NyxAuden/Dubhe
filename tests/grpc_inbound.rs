@@ -984,11 +984,40 @@ async fn silent_client_is_closed_at_handshake_deadline() {
     server.shutdown().await;
 }
 
-/// 回归：完成 H2 握手但**从不发任何 RPC** 的连接，必须在期限内失败关闭。
-///
-/// 此前服务端在 SETTINGS ACK 后立刻归还握手许可，之后的主循环没有首 RPC
-/// 期限。于是一条不认证的连接可以无限期占住全局连接槽，并绕过每源 IP 的
-/// 并发握手限额（许可已归还）。
+#[tokio::test]
+async fn authenticated_rpc_survives_first_authentication_deadline() {
+    let mut value = with_inbound(grpc_inbound("trojan-grpc", None));
+    value["limits"]["handshake_timeout_ms"] = json!(500);
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = Running::start(value).await;
+    let (mut send, mut body, driver) = plain_client(server.address, "/GunService/Tun").await;
+    timeout(WAIT, async {
+        send.send_data(
+            frame(&trojan_hello(
+                "test-secret-password",
+                target.local_addr().unwrap(),
+                b"hello",
+            )),
+            false,
+        )
+        .unwrap();
+        let (mut peer, _) = target.accept().await.unwrap();
+        let mut request = [0; 5];
+        peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"hello");
+
+        // 首次认证不产生下行数据，连接循环可以一直等到定时器到期。
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        peer.write_all(b"after").await.unwrap();
+        assert_eq!(body.next().await.unwrap(), b"after");
+    })
+    .await
+    .expect("已认证的 RPC 必须在首次认证期限之后继续转发");
+    driver.abort();
+    server.shutdown().await;
+}
+
+/// 完成 H2 握手但一直未认证的连接必须按期关闭。
 #[tokio::test]
 async fn h2_handshake_without_any_rpc_is_closed_at_deadline() {
     let mut value = config(None, None);

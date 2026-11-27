@@ -647,8 +647,7 @@ pub(crate) async fn serve(
     }
     // 此处**不再**提前归还握手许可。此前在 SETTINGS ACK 后就 `drop`，于是
     // 一条不发任何 RPC 的连接可以无限期占住全局连接槽，并绕过每源 IP 的
-    // 并发握手限额（许可已归还，计数器归零）。改为：许可保留到第一个被接受
-    // 的 RPC，并由下面的 `authenticate_by` 给它一个绝对期限。
+    // 并发握手限额（许可已归还，计数器归零）。许可保留到首个 RPC 的内层认证成功。
     for (request, respond) in pending.drain(..) {
         let rpc_deadline = rpc_deadline(&respond, &heads, duration);
         accept_rpc(
@@ -682,12 +681,14 @@ pub(crate) async fn serve(
         tokio::select! {
             biased;
             _ = force.cancelled() => break,
-            // 仍在等首个 RPC（许可未归还）时到点失败关闭。
             _ = tokio::time::sleep_until(authenticate_by), if auth.pending() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "gRPC 首个 RPC 认证超时",
-                ));
+                // RPC 子任务可能在本轮 select 等待期间完成认证。
+                if auth.pending() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "gRPC 首个 RPC 认证超时",
+                    ));
+                }
             }
             _ = timer => break,
             result = structure => {
