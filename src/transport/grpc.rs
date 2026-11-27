@@ -1026,17 +1026,31 @@ async fn run_rpc(
         return;
     };
     let (app, bridge) = tokio::io::duplex(BRIDGE_BYTES);
-    let (bridge_read, bridge_write) = tokio::io::split(bridge);
+    let (bridge_read, mut bridge_write) = tokio::io::split(bridge);
     let lease = scope.lease();
+    // 上行 pump 的失败必须让对端看到明确的错误状态，而不是成功的
+    // `grpc-status: 0`。用一个共享槽把错误交给下行 pump：它负责在
+    // trailers 里反映结果。
+    let upstream_failure: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
     let in_lease = lease.clone();
+    let failure_slot = upstream_failure.clone();
     scope.spawn(async move {
         let _lease = in_lease;
-        let _ = pump_in(body, bridge_write, multi).await;
+        // `tokio::io::split` 的写半边 drop 不会立刻把 EOF 送到 `app`：
+        // 读半边仍被下行 pump 持有。必须显式 shutdown，否则一次非法上行
+        // 会让 RPC 一直挂到握手指令期限。
+        if let Err(error) = pump_in(body, &mut bridge_write, multi).await {
+            let code = grpc_status_for(&error);
+            *failure_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
+            // `pump_in` 只在正常结尾 shutdown；失败时补一次，确保 `app`
+            // 立刻读到 EOF 而不是等到握手指令期限。
+            let _ = bridge_write.shutdown().await;
+        }
     });
     let out_lease = lease.clone();
     scope.spawn(async move {
         let _lease = out_lease;
-        let _ = pump_out(bridge_read, send, multi).await;
+        let _ = pump_out(bridge_read, send, multi, upstream_failure).await;
     });
     let result = dispatch(app, &inbound, vmess, ctx.clone(), deadline, lease, &auth).await;
     if let Err(error) = &result {
@@ -1148,7 +1162,7 @@ where
 
 async fn pump_in(
     mut body: RecvStream,
-    mut out: tokio::io::WriteHalf<DuplexStream>,
+    out: &mut tokio::io::WriteHalf<DuplexStream>,
     multi: bool,
 ) -> io::Result<()> {
     let mut wire = Vec::new();
@@ -1254,10 +1268,17 @@ async fn pump_out(
     mut input: tokio::io::ReadHalf<DuplexStream>,
     mut send: SendStream<prost::bytes::Bytes>,
     multi: bool,
+    upstream_failure: Arc<Mutex<Option<&'static str>>>,
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; WRITE_CHUNK];
     loop {
-        let read = input.read(&mut buffer).await?;
+        let read = match input.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(error) => {
+                send_failure_trailers(&mut send, grpc_status_for(&error));
+                return Err(error);
+            }
+        };
         if read == 0 {
             break;
         }
@@ -1276,11 +1297,43 @@ async fn pump_out(
         frame.push(0);
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(&payload);
-        send_message(&mut send, prost::bytes::Bytes::from(frame)).await?;
+        if let Err(error) = send_message(&mut send, prost::bytes::Bytes::from(frame)).await {
+            send_failure_trailers(&mut send, grpc_status_for(&error));
+            return Err(error);
+        }
     }
+    // 上行 pump 已失败时不能报成功：客户端只看 trailers 里的状态。
+    let status = *upstream_failure
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let mut trailers = HeaderMap::new();
-    trailers.insert("grpc-status", HeaderValue::from_static("0"));
+    trailers.insert(
+        "grpc-status",
+        HeaderValue::from_static(status.unwrap_or("0")),
+    );
     send.send_trailers(trailers).map_err(io::Error::other)
+}
+
+/// 尽力把失败状态发给对端；发送本身失败时只能放弃。
+fn send_failure_trailers(send: &mut SendStream<prost::bytes::Bytes>, status: &'static str) {
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from_static(status));
+    let _ = send.send_trailers(trailers);
+}
+
+/// 把内部错误映射到 gRPC 状态码。
+///
+/// 只区分「协议/帧非法」与「内部错误」两类：前者是客户端问题（INTERNAL
+/// 之外还应能定位），后者用 INTERNAL。非零状态即可让客户端停止把连接
+/// 当作正常结束。
+fn grpc_status_for(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::InvalidData => "13",     // INTERNAL
+        io::ErrorKind::BrokenPipe => "14",      // UNAVAILABLE
+        io::ErrorKind::TimedOut => "4",         // DEADLINE_EXCEEDED
+        io::ErrorKind::PermissionDenied => "7", // PERMISSION_DENIED
+        _ => "2",                               // UNKNOWN
+    }
 }
 
 async fn send_message(

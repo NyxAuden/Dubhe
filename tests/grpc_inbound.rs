@@ -168,6 +168,29 @@ impl FrameReader {
             }
         }
     }
+
+    /// 读到流结束并返回 `grpc-status`（若对端发送了 trailers）。
+    ///
+    /// 客户端只看状态判断结果：服务端在内部失败时若仍报成功，
+    /// 调用方会把截断当成正常 EOF。返回 `Err` 表示流异常终止——
+    /// 那同样不是成功，但要用与「成功状态 0」不同的方式表达。
+    async fn final_status(&mut self) -> Result<Option<String>, ()> {
+        while let Some(chunk) = self.body.data().await {
+            match chunk {
+                Ok(chunk) => {
+                    let _ = self.body.flow_control().release_capacity(chunk.len());
+                }
+                Err(_) => return Err(()),
+            }
+        }
+        let trailers = self.body.trailers().await.map_err(|_| ())?;
+        Ok(trailers.and_then(|trailers| {
+            trailers
+                .get("grpc-status")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        }))
+    }
 }
 
 async fn plain_client(
@@ -1758,4 +1781,42 @@ async fn trojan_grpc_rejected_counts_protocol_authentication_failure() {
         counted.unwrap_or(false),
         "gRPC 协议层认证失败没有计入 stats.rejected（修复前为 0）"
     );
+}
+
+/// 认证成功后出现非法上行帧时，必须以非零 grpc-status 结束。
+///
+/// 场景比「一上来就非法」更接近真实：`dispatch` 已经成功，控制流会走到
+/// `scope.finish()`，由下行 pump 发送 trailers。此前它的状态被硬编码为
+/// `grpc-status: 0`，客户端会把协议错误当成正常 EOF。
+#[tokio::test]
+async fn invalid_uplink_frame_after_auth_reports_non_zero_status() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let server = Running::start(config(None, None)).await;
+    let (mut stream, mut body, driver) = plain_client(server.address, "/GunService/Tun").await;
+
+    // 完成认证：先发 VLESS 请求头并读到首响应。
+    stream.send_data(frame(&vless_request(echo.address)), false).unwrap();
+    assert_eq!(body.next().await.expect("VLESS应答"), vec![0, 0]);
+
+    // 随后发送一个长度前缀超限的非法帧，上行 pump 会以 InvalidData 结束。
+    let mut bad = vec![0u8];
+    bad.extend_from_slice(&((1u32 << 20) + 1).to_be_bytes());
+    stream
+        .send_data(prost::bytes::Bytes::from(bad), false)
+        .unwrap();
+
+    let status = timeout(Duration::from_secs(15), body.final_status())
+        .await
+        .expect("服务端应结束该 RPC");
+    // `Ok(None)` 与 `Err` 都表示对端直接断开，同样不是成功结束。
+    if let Ok(Some(status)) = status {
+        assert_ne!(
+            status, "0",
+            "非法上行帧不得以成功状态结束，否则客户端会把协议错误当成正常 EOF"
+        );
+    }
+
+    drop(stream);
+    driver.abort();
+    server.shutdown().await;
 }

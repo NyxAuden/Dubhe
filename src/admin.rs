@@ -305,22 +305,29 @@ fn query_of(path: &str) -> Option<&str> {
 }
 
 /// 查询参数可选；出现但不是合法 `u64` 时返回字段级错误，由调用方回 400。
+///
+/// 与 [`query_filters`] 保持同一套规则：重复键与空值都视为非法，避免
+/// `?limit=1&limit=2` 这类请求静默取到其中任意一个。
 fn parse_optional(path: &str, name: &str) -> Result<Option<u64>, String> {
-    match query_value(path, name) {
-        None => Ok(None),
-        Some(value) => value
-            .parse()
-            .map(Some)
-            .map_err(|_| format!(r#"{{"error":"invalid {name}"}}"#)),
+    let mut found: Option<String> = None;
+    for pair in query_of(path).unwrap_or_default().split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if percent_decode(key) != name {
+            continue;
+        }
+        let value = percent_decode(value);
+        if found.is_some() || value.trim().is_empty() {
+            return Err(format!(r#"{{"error":"invalid {name}"}}"#));
+        }
+        found = Some(value);
     }
-}
-
-fn query_value(path: &str, key: &str) -> Option<String> {
-    query_of(path)?
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(name, _)| *name == key)
-        .map(|(_, value)| percent_decode(value))
+    found
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| format!(r#"{{"error":"invalid {name}"}}"#))
+        })
+        .transpose()
 }
 
 /// 只有真正省略才允许扩大范围。
@@ -480,4 +487,60 @@ async fn respond_with(
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "管理 API 响应超时"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 省略参数是合法的，用来表示「不为该字段设置值」。
+    #[test]
+    fn optional_numeric_parameter_may_be_absent() {
+        assert_eq!(parse_optional("/q", "quota_bytes").unwrap(), None);
+    }
+
+    /// 出现且合法时按值返回。
+    #[test]
+    fn optional_numeric_parameter_parses_value() {
+        assert_eq!(
+            parse_optional("/q?quota_bytes=1024", "quota_bytes").unwrap(),
+            Some(1024)
+        );
+    }
+
+    /// 重复键必须拒绝，不能静默取其中一个。
+    ///
+    /// 与 `query_filters` 保持同一套规则；此前这里会取第一个值，
+    /// `?quota_bytes=1&quota_bytes=999999` 因此能绕过调用方的预期。
+    #[test]
+    fn duplicate_numeric_parameter_is_rejected() {
+        let error = parse_optional("/q?quota_bytes=1&quota_bytes=999999", "quota_bytes")
+            .expect_err("重复键应被拒绝");
+        assert!(error.contains("invalid quota_bytes"), "{error}");
+    }
+
+    /// 空值视同非法，而不是当成 0 或「未提供」。
+    #[test]
+    fn empty_numeric_parameter_is_rejected() {
+        let error =
+            parse_optional("/q?quota_bytes=", "quota_bytes").expect_err("空值应被拒绝");
+        assert!(error.contains("invalid quota_bytes"), "{error}");
+    }
+
+    /// 非数字仍然按字段级错误返回，由调用方回 400。
+    #[test]
+    fn non_numeric_parameter_is_rejected() {
+        let error =
+            parse_optional("/q?quota_bytes=abc", "quota_bytes").expect_err("非数字应被拒绝");
+        assert!(error.contains("invalid quota_bytes"), "{error}");
+    }
+
+    /// 其它参数不影响目标字段。
+    #[test]
+    fn unrelated_parameters_are_ignored() {
+        assert_eq!(
+            parse_optional("/q?other=x&quota_bytes=7", "quota_bytes").unwrap(),
+            Some(7)
+        );
+    }
 }
