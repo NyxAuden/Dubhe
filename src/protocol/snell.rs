@@ -745,6 +745,7 @@ struct UdpReply {
 /// `RoutedUdp`，回程通过 `UdpReply` 汇入同一条记录流。
 enum Mapping {
     Direct {
+        peer: SocketAddr,
         socket: Arc<UdpSocket>,
         task: AbortHandle,
         last_used: Arc<Mutex<Instant>>,
@@ -817,7 +818,8 @@ impl UdpAssociation {
     ) -> io::Result<()> {
         // 先选路：`udp_selected` 允许代理出站，`allowed` 只允许直连。
         // reject 规则、HTTP 出站与链式出站都会在这里被拒绝。
-        let proxied = ctx.udp_selected(inbound, &target).await?.udp_proxied()?;
+        let selected = ctx.udp_selected(inbound, &target).await?;
+        let proxied = selected.udp_proxied()?;
         if payload.len() > ctx.limits.max_udp_payload {
             return Err(invalid("Snell UDP 载荷超过上限"));
         }
@@ -827,9 +829,13 @@ impl UdpAssociation {
         if self
             .mappings
             .get(&target)
-            .is_some_and(|mapping| mapping.is_proxied() != proxied)
+            .is_some_and(|mapping| {
+                mapping.is_proxied() != proxied
+                    || matches!(mapping, Mapping::Direct { peer, .. } if !selected.allows_cached_peer(*peer))
+            })
+            && let Some(mapping) = self.mappings.remove(&target)
         {
-            self.mappings.remove(&target);
+            mapping.task().abort();
         }
 
         if proxied {
@@ -928,10 +934,7 @@ impl UdpAssociation {
                     "Snell UDP 目标数量超过上限",
                 ));
             }
-            let addresses = ctx.dns.resolve(&target).await?;
-            let address = *addresses
-                .first()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Snell UDP 无可用地址"))?;
+            let address = ctx.direct_udp_address(&selected, &target).await?;
             let bind = if address.is_ipv4() {
                 SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
             } else {
@@ -989,6 +992,7 @@ impl UdpAssociation {
             self.mappings.insert(
                 target.clone(),
                 Mapping::Direct {
+                    peer: address,
                     socket,
                     task,
                     last_used,

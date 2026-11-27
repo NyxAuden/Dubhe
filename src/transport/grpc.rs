@@ -649,7 +649,7 @@ pub(crate) async fn serve(
     // 一条不发任何 RPC 的连接可以无限期占住全局连接槽，并绕过每源 IP 的
     // 并发握手限额（许可已归还，计数器归零）。许可保留到首个 RPC 的内层认证成功。
     for (request, respond) in pending.drain(..) {
-        let rpc_deadline = rpc_deadline(&respond, &heads, duration);
+        let rpc_deadline = rpc_deadline(&respond, &heads, duration).min(deadline);
         accept_rpc(
             request,
             respond,
@@ -667,9 +667,6 @@ pub(crate) async fn serve(
 
     let mut stopping = false;
     let mut drain_deadline: Option<Instant> = None;
-    // 首次 RPC 前的绝对期限：与 `runtime/serve.rs` 的 H2 入口同一语义。
-    // 没有它，SETTINGS ACK 之后客户端可以永不发 RPC，长期占住连接槽。
-    let authenticate_by = Instant::now() + duration;
     loop {
         let timer = async {
             match drain_deadline {
@@ -681,7 +678,7 @@ pub(crate) async fn serve(
         tokio::select! {
             biased;
             _ = force.cancelled() => break,
-            _ = tokio::time::sleep_until(authenticate_by), if auth.pending() => {
+            _ = tokio::time::sleep_until(deadline), if auth.pending() => {
                 // RPC 子任务可能在本轮 select 等待期间完成认证。
                 if auth.pending() {
                     return Err(io::Error::new(
@@ -719,7 +716,10 @@ pub(crate) async fn serve(
                             rpcs.spawn(reject(respond, StatusCode::SERVICE_UNAVAILABLE));
                             continue;
                         }
-                        let rpc_deadline = rpc_deadline(&respond, &heads, duration);
+                        let mut rpc_deadline = rpc_deadline(&respond, &heads, duration);
+                        if auth.pending() {
+                            rpc_deadline = rpc_deadline.min(deadline);
+                        }
                         accept_rpc(
                             request,
                             respond,

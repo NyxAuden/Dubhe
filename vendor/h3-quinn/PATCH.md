@@ -13,6 +13,8 @@
   会 panic。
 - 改为仅在 `self.stream` 存在时发送 STOP_SENDING；读取 future 持有流时跳过。
   发送侧 `RESET_STREAM`/连接关闭仍按原路径终止请求。
+- XHTTP 通过 `SendStream::stopped` / `BidiStream::stopped` 观察 Quinn 的
+  `STOP_SENDING`，即使没有业务写入也能回收请求；正常 FIN 确认不取消上行。
 
 ## 原因
 

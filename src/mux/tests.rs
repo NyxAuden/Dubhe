@@ -16,18 +16,12 @@ use tokio::{
     time::timeout,
 };
 
-// `src/mux.rs` 使用 `crate::forward/...`；测试 crate 根部的同名重导出让它
-// 能以 `#[path]` 方式直接编译，而无需把模块注册进 lib.rs。
-pub use dubhe::{config, forward, outbound, route, session, telemetry};
-
-// 测试 crate 只覆盖 mux 的部分入口，未覆盖的生产函数在此按需放行。
-#[allow(dead_code)]
-#[path = "../src/mux.rs"]
-mod mux;
-
-use config::Config;
-use forward::Context;
-use session::Target;
+use crate::{
+    config::Config,
+    forward::Context,
+    mux,
+    session::{self, Target},
+};
 
 const STATUS_NEW: u8 = 0x01;
 const STATUS_KEEP: u8 = 0x02;

@@ -11,13 +11,13 @@ use super::*;
 /// 计数表用 `Arc<Mutex<..>>` 共享：guard 会随连接任务活到结束，归还时必须
 /// 能触达同一张表。锁只在 admit/释放时短暂持有，不在 I/O 期间持有。
 #[derive(Clone)]
-struct PerIpHandshakes {
+pub(crate) struct PerIpHandshakes {
     limit: usize,
     active: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
 }
 
 impl PerIpHandshakes {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             limit,
             active: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -25,15 +25,17 @@ impl PerIpHandshakes {
     }
 
     /// 允许则返回随连接生命周期释放的 guard；超限返回 `None`。
-    fn admit(&self, stream: &tokio::net::TcpStream) -> Option<PerIpGuard> {
+    pub(crate) fn admit(&self, ip: std::net::IpAddr) -> Option<PerIpGuard> {
         if self.limit == 0 {
             return Some(PerIpGuard {
                 shared: None,
                 ip: None,
             });
         }
-        // 拿不到对端地址时不因计数问题拒绝连接。
-        let ip = stream.peer_addr().ok()?.ip();
+        let ip = match ip {
+            std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(ip.into(), Into::into),
+            ip => ip,
+        };
         let mut active = crate::sync::locked(&self.active);
         let count = active.entry(ip).or_insert(0);
         if *count >= self.limit {
@@ -79,6 +81,8 @@ pub(crate) struct HandshakePermits {
 #[derive(Clone)]
 pub(crate) struct AuthSlot(Arc<std::sync::Mutex<Option<HandshakePermits>>>);
 
+pub(crate) type WeakAuthSlot = std::sync::Weak<std::sync::Mutex<Option<HandshakePermits>>>;
+
 impl AuthSlot {
     pub(crate) fn new(permits: HandshakePermits) -> Self {
         Self(Arc::new(std::sync::Mutex::new(Some(permits))))
@@ -100,6 +104,14 @@ impl AuthSlot {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .is_some()
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakAuthSlot {
+        Arc::downgrade(&self.0)
+    }
+
+    pub(crate) fn upgrade(weak: &WeakAuthSlot) -> Option<Self> {
+        weak.upgrade().map(Self)
     }
 }
 
@@ -234,7 +246,7 @@ pub(super) async fn accept_loop(
                     .unwrap_or_else(|_| "-".to_owned());
                 let Ok(connection_permit) = slots.clone().try_acquire_owned() else { ctx.stats.reject(); continue; };
                 // 单 IP 超限时直接拒绝，不占用全局握手槽。
-                let ip_guard = match per_ip.admit(&stream) {
+                let ip_guard = match stream.peer_addr().ok().and_then(|peer| per_ip.admit(peer.ip())) {
                     Some(guard) => guard,
                     None => { ctx.stats.reject(); continue; }
                 };

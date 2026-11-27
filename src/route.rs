@@ -66,6 +66,17 @@ fn ipnet_of(cidr: crate::geo::Cidr) -> Result<IpNet> {
         .with_context(|| format!("地理数据里的 CIDR 无效: {}/{}", cidr.addr, cidr.prefix))
 }
 
+fn canonical_cidr(net: IpNet) -> IpNet {
+    // 只有完全落在 ::ffff:0:0/96 内的前缀才表示 IPv4 规则。
+    if let IpNet::V6(v6) = net
+        && let Some(prefix) = v6.prefix_len().checked_sub(96)
+        && let Some(ip) = v6.network().to_ipv4_mapped()
+    {
+        return IpNet::V4(ipnet::Ipv4Net::new_assert(ip, prefix));
+    }
+    net
+}
+
 /// 地理展开项的运行期形态：正则在此预编译。
 ///
 /// 真实 geosite.dat 含正则条目；每次选路重新 `Regex::new` 会在热路径上
@@ -479,44 +490,46 @@ pub struct Selected {
     /// 直连拨号**必须**复用它：若再解析一次，DNS 轮询或故障切换可能返回
     /// 不同地址，规则检查过的集合就不再等于实际连接的目标。
     pub(crate) resolved: Option<Vec<std::net::SocketAddr>>,
-    /// 解析结果中**真正满足命中规则 IP 条件**的地址。
-    ///
-    /// 规则命中判定用 `any`，但拨号必须只尝试这里的地址；否则允许列表
-    /// （`ip_cidrs` + direct）会把同一域名的其他地址也放出去。
-    /// `None` 表示该规则不约束 IP，无需筛选。
+    /// 按整组地址选路后、逐地址复核所得的允许集。
+    /// `None` 表示无需筛选，空集表示没有地址通过复核。
     pub(crate) permitted: Option<Vec<std::net::IpAddr>>,
 }
 
 impl Selected {
-    /// UDP 快路径（dokodemo / TUIC / Hysteria2 / Snell / Shadowsocks）只实现
-    /// 直连与共享代理中继。`reverse` 是独立上游，`proxy` 为空但绝不是直连；
-    /// 在这些路径里必须失败关闭，不能把反向目标当成本地上游发出去。
     /// 规则判定阶段已经解析出的地址（若有）。
     ///
-    /// 直连路径**必须优先复用它**：重新解析可能拿到不同地址，
-    /// 规则检查过的集合就不再等于实际连接的目标。
+    /// 这不是允许集合，不能直接供拨号使用。
     pub fn resolved_addresses(&self) -> Option<&[std::net::SocketAddr]> {
         self.resolved.as_deref()
     }
 
-    /// 实际允许拨号的地址：解析结果再按命中规则的 IP 条件过滤。
+    pub(crate) fn allows_cached_peer(&self, peer: std::net::SocketAddr) -> bool {
+        self.allows_direct_ip(peer.ip())
+            && self
+                .resolved
+                .as_ref()
+                .is_none_or(|addresses| addresses.contains(&peer))
+    }
+
+    pub(crate) fn allows_direct_ip(&self, ip: IpAddr) -> bool {
+        !ip.to_canonical().is_unspecified()
+            && self.permitted.as_ref().is_none_or(|ips| ips.contains(&ip))
+    }
+
+    /// 实际允许拨号的地址：解析结果再按逐地址复核结果过滤。
     ///
     /// 规则命中用 `any`（任一地址满足即可），但**拨号只能尝试满足条件的
     /// 地址**。返回 `None` 表示没有可用于直连的地址（无解析结果，或全部
     /// 不满足条件——后者应当拒绝，不能退回「全部尝试」）。
     pub fn dial_addresses(&self) -> Option<Vec<std::net::SocketAddr>> {
-        let resolved = self.resolved.as_deref()?;
-        match &self.permitted {
-            Some(permitted) => {
-                let allowed: Vec<_> = resolved
-                    .iter()
-                    .copied()
-                    .filter(|address| permitted.contains(&address.ip()))
-                    .collect();
-                (!allowed.is_empty()).then_some(allowed)
-            }
-            None => Some(resolved.to_vec()),
-        }
+        let allowed: Vec<_> = self
+            .resolved
+            .as_ref()?
+            .iter()
+            .copied()
+            .filter(|address| self.allows_direct_ip(address.ip()))
+            .collect();
+        (!allowed.is_empty()).then_some(allowed)
     }
 
     pub fn udp_proxied(&self) -> std::io::Result<bool> {
@@ -595,12 +608,12 @@ impl Router {
                     .ip_cidrs
                     .iter()
                     .filter_map(|entry| match entry {
-                        crate::config::IpEntry::Cidr(net) => Some(*net),
+                        crate::config::IpEntry::Cidr(net) => Some(canonical_cidr(*net)),
                         crate::config::IpEntry::Geo(_) => None,
                     })
                     .collect();
                 for cidr in expanded.ips {
-                    ip_cidrs.push(ipnet_of(cidr)?);
+                    ip_cidrs.push(canonical_cidr(ipnet_of(cidr)?));
                 }
                 Ok(CompiledRule {
                     inbounds: rule.inbounds.clone(),
@@ -669,29 +682,50 @@ impl Router {
         target: &Target,
         resolved: Option<&[IpAddr]>,
     ) -> Selected {
-        let domain = match &target.host {
+        let literal = match target.host {
+            Host::Ip(ip) => Some([ip]),
+            Host::Domain(_) => None,
+        };
+        self.select_for_target(
+            inbound,
+            network,
+            target,
+            target.port,
+            literal.as_ref().map(|ips| ips.as_slice()).or(resolved),
+        )
+    }
+
+    pub(crate) fn select_for_target(
+        &self,
+        inbound: &str,
+        network: Network,
+        route: &Target,
+        port: u16,
+        ips: Option<&[IpAddr]>,
+    ) -> Selected {
+        let domain = match &route.host {
             Host::Domain(domain) => Some(normalize_domain(domain)),
             Host::Ip(_) => None,
         };
-        // 跳过 `NeedIp`：宁可继续看后面的规则，也不在缺证据时做决定。
-        let matched = self.rules.iter().find(|rule| {
-            rule.evaluate(inbound, network, target, domain.as_deref(), resolved) == RuleMatch::Hit
-        });
-        let Some(rule) = matched else {
-            // 回落到默认出站：默认没有 IP 条件，不需要筛选地址。
-            return resolved_select(&self.default, false);
+        let first_match = |ips: Option<&[IpAddr]>| {
+            self.rules.iter().position(|rule| {
+                rule.evaluate(inbound, network, port, domain.as_deref(), ips) == RuleMatch::Hit
+            })
         };
-        let mut selected = resolved_select(&rule.destination, true);
-        // 命中规则的 IP 条件用 `any` 判定；把实际满足它的地址筛出来，
-        // 供拨号只尝试这些地址。规则不约束 IP 时无需筛选。
-        if let Some(addresses) = resolved
-            && rule.constrains_ip()
+        let matched = first_match(ips);
+        let destination = matched.map_or(&self.default, |index| &self.rules[index].destination);
+        let mut selected = resolved_select(destination, matched.is_some());
+        // 保留整组地址的选路结果；每个直连地址还必须独立命中同一规则（或同一默认）。
+        if let Some(addresses) = ips.filter(|ips| ips.len() > 1)
+            && self.rules.iter().any(|rule| {
+                rule.evaluate(inbound, network, port, domain.as_deref(), None) == RuleMatch::NeedIp
+            })
         {
             selected.permitted = Some(
                 addresses
                     .iter()
                     .copied()
-                    .filter(|ip| rule.permits_ip(*ip))
+                    .filter(|ip| first_match(Some(std::slice::from_ref(ip))) == matched)
                     .collect(),
             );
         }
@@ -712,6 +746,7 @@ impl Router {
         inbound: &str,
         network: Network,
         target: &Target,
+        port: u16,
     ) -> bool {
         let domain = match &target.host {
             Host::Domain(domain) => Some(normalize_domain(domain)),
@@ -719,7 +754,7 @@ impl Router {
         };
         // 复用同一求值函数：只有真的因为缺地址而无法判定的规则才值得解析。
         self.rules.iter().any(|rule| {
-            rule.evaluate(inbound, network, target, domain.as_deref(), None) == RuleMatch::NeedIp
+            rule.evaluate(inbound, network, port, domain.as_deref(), None) == RuleMatch::NeedIp
         })
     }
 
@@ -1250,14 +1285,14 @@ impl CompiledRule {
         &self,
         inbound: &str,
         network: Network,
-        target: &Target,
+        port: u16,
         domain: Option<&str>,
         resolved: Option<&[IpAddr]>,
     ) -> RuleMatch {
         // 基础条件不成立时，**取反仍然要生效**：端口不符已经足以确定
         // 「这条规则不匹配」，取反后就应当是命中，且不需要地址证据。
-        let result = if self.matches_base(inbound, network, target, domain) {
-            match self.ip_outcome(target, resolved) {
+        let result = if self.matches_base(inbound, network, port, domain) {
+            match self.ip_outcome(resolved) {
                 IpOutcome::Always => RuleMatch::Hit,
                 IpOutcome::Never => RuleMatch::Miss,
                 IpOutcome::NeedIp => RuleMatch::NeedIp,
@@ -1278,7 +1313,7 @@ impl CompiledRule {
     ///   不能两个条件各自由不同地址满足（否则「命中」没有可指认的依据）。
     /// - 域名未解析时返回 `NeedIp`，交由调用方决定是否解析；
     ///   它不会在 `invert` 下变成命中。
-    fn ip_outcome(&self, target: &Target, resolved: Option<&[IpAddr]>) -> IpOutcome {
+    fn ip_outcome(&self, resolved: Option<&[IpAddr]>) -> IpOutcome {
         let has_group = !self.ip_cidrs.is_empty() || !self.mmdb_codes.is_empty();
         if !self.ip_is_private && !has_group {
             // 完全没有 IP 条件；但如果引用过地理集合且展开为空，
@@ -1292,46 +1327,23 @@ impl CompiledRule {
         if self.geo_ip_used && !has_group {
             return IpOutcome::Never;
         }
-        let hit = |ip: IpAddr| {
-            (!self.ip_is_private || is_private_ip(&ip))
-                && (!has_group
-                    || self.ip_cidrs.iter().any(|cidr| cidr.contains(&ip))
-                    || self.mmdb_hit(ip))
-        };
-        match &target.host {
-            Host::Ip(ip) => IpOutcome::Value(hit(*ip)),
-            Host::Domain(_) => match resolved {
-                // 空解析结果视为「仍未知」：DNS 没给出地址不等于
-                // 「已证明不属于该集合」，不能被 invert 翻成命中。
-                Some(addresses) if !addresses.is_empty() => {
-                    IpOutcome::Value(addresses.iter().any(|ip| hit(*ip)))
-                }
-                _ => IpOutcome::NeedIp,
-            },
+        match resolved {
+            Some(addresses) if !addresses.is_empty() => {
+                IpOutcome::Value(addresses.iter().any(|ip| self.permits_ip(*ip)))
+            }
+            _ => IpOutcome::NeedIp,
         }
     }
 
-    /// 单个地址是否满足本规则的 IP 条件。
-    ///
-    /// 用于把「已授权地址」从解析结果里筛出来：规则命中用的是
-    /// `any`（任一地址满足即可），但**拨号只应尝试真正满足条件的地址**，
-    /// 否则允许列表（例如 `ip_cidrs: ["geoip:cn"]` + direct）会把同一域名
-    /// 解析出的其他地址也放进去。
+    /// 单个地址是否满足本规则的 IP 条件；`invert` 在整条规则上处理。
     fn permits_ip(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
         let has_group =
             !self.ip_cidrs.is_empty() || !self.mmdb_codes.is_empty() || self.geo_ip_used;
         (!self.ip_is_private || is_private_ip(&ip))
             && (!has_group
                 || self.ip_cidrs.iter().any(|cidr| cidr.contains(&ip))
                 || self.mmdb_hit(ip))
-    }
-
-    /// 本规则是否对 IP 维度做了限制（否则无需筛选地址）。
-    fn constrains_ip(&self) -> bool {
-        self.ip_is_private
-            || !self.ip_cidrs.is_empty()
-            || !self.mmdb_codes.is_empty()
-            || self.geo_ip_used
     }
 
     fn mmdb_hit(&self, ip: IpAddr) -> bool {
@@ -1348,7 +1360,7 @@ impl CompiledRule {
         &self,
         inbound: &str,
         network: Network,
-        target: &Target,
+        port: u16,
         domain: Option<&str>,
     ) -> bool {
         // 空字段不限制；不同字段取交集，同字段的多个值取并集。
@@ -1389,7 +1401,7 @@ impl CompiledRule {
                 || self
                     .ports
                     .iter()
-                    .any(|range| (range.start..=range.end).contains(&target.port)))
+                    .any(|range| (range.start..=range.end).contains(&port)))
     }
 }
 
@@ -1523,7 +1535,7 @@ mod invert_ip_tests {
             router.select_outbound("s", Network::Tcp, &target).kind,
             OutboundKind::Reject
         );
-        assert!(!router.has_ip_candidates("s", Network::Tcp, &target));
+        assert!(!router.has_ip_candidates("s", Network::Tcp, &target, target.port));
     }
 
     /// 「尚不知道」不能当成「不属于集合」。
@@ -1581,6 +1593,54 @@ mod invert_ip_tests {
         let only_other = router.select_with("s", Network::Tcp, &target, Some(&[other]));
         assert!(!only_other.matched, "全部地址不满足时规则不应命中");
         assert!(only_other.permitted.is_none());
+    }
+
+    #[test]
+    fn inverted_rule_keeps_whole_answer_selection_and_checks_each_peer() {
+        let router = router(serde_json::json!([
+            {"ip_cidrs": ["192.0.2.0/24"], "invert": true, "outbound": "reject"}
+        ]));
+        let target = domain("mixed.test");
+        let listed = "192.0.2.7".parse::<IpAddr>().unwrap();
+        let unlisted = "198.51.100.9".parse::<IpAddr>().unwrap();
+        let selected = router.select_with("s", Network::Tcp, &target, Some(&[listed, unlisted]));
+        assert!(!selected.matched, "整组包含匹配项，取反规则不能命中");
+        assert_eq!(selected.kind, OutboundKind::Direct);
+        assert_eq!(selected.permitted.as_deref(), Some(&[listed][..]));
+    }
+
+    #[test]
+    fn mapped_addresses_honor_ipv4_and_explicit_mapped_prefixes() {
+        for (condition, expected) in [
+            (
+                serde_json::json!({"ip_is_private": true}),
+                OutboundKind::Reject,
+            ),
+            (
+                serde_json::json!({"ip_cidrs": ["127.0.0.0/8"]}),
+                OutboundKind::Reject,
+            ),
+            (
+                serde_json::json!({"ip_cidrs": ["::ffff:127.0.0.0/104"]}),
+                OutboundKind::Reject,
+            ),
+            (
+                serde_json::json!({"ip_cidrs": ["::/0"]}),
+                OutboundKind::Direct,
+            ),
+        ] {
+            let mut rule = condition;
+            rule["outbound"] = serde_json::json!("reject");
+            let router = router(serde_json::json!([rule]));
+            for addr in ["127.0.0.1:80", "[::ffff:127.0.0.1]:80"] {
+                let target = Target::from(addr.parse::<std::net::SocketAddr>().unwrap());
+                assert_eq!(
+                    router.select("s", Network::Tcp, &target),
+                    expected,
+                    "{addr}"
+                );
+            }
+        }
     }
 
     /// 同一候选地址必须同时满足私网与 CIDR，不能各自由不同地址满足。
@@ -2545,8 +2605,8 @@ mod tests {
         let first = router.select_outbound("socks", Network::Tcp, &target);
         assert!(!first.matched);
         assert_eq!(first.kind, OutboundKind::Direct);
-        assert!(router.has_ip_candidates("socks", Network::Tcp, &target));
-        assert!(!router.has_ip_candidates("other", Network::Tcp, &target));
+        assert!(router.has_ip_candidates("socks", Network::Tcp, &target, target.port));
+        assert!(!router.has_ip_candidates("other", Network::Tcp, &target, target.port));
         // 第二轮使用解析结果；没有解析结果时仍不命中。
         let resolved: Vec<IpAddr> = vec!["192.0.2.7".parse().unwrap()];
         let second = router.select_with("socks", Network::Tcp, &target, Some(&resolved));

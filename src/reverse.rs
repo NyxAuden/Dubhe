@@ -291,7 +291,13 @@ impl Registry {
                 .clients
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            clients.retain(|client| client.strong_count() > 0);
+            // 只按 strong_count 清理会漏掉已关闭的载体：`close()` 之后仍有
+            // 本地会话持有 Arc，载体因此在 MAX_CARRIERS 名额里继续占位。
+            clients.retain(|client| {
+                client
+                    .upgrade()
+                    .is_some_and(|client| !client.is_closed())
+            });
             if clients.len() >= MAX_CARRIERS {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -376,7 +382,13 @@ impl Registry {
                 .clients
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            clients.retain(|client| client.strong_count() > 0);
+            // 只按 strong_count 清理会漏掉已关闭的载体：`close()` 之后仍有
+            // 本地会话持有 Arc，载体因此在 MAX_CARRIERS 名额里继续占位。
+            clients.retain(|client| {
+                client
+                    .upgrade()
+                    .is_some_and(|client| !client.is_closed())
+            });
             if clients.len() >= MAX_CARRIERS {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -406,7 +418,7 @@ impl Registry {
                 .iter()
                 .rev()
                 .filter_map(Weak::upgrade)
-                .find(|client| client.session_count() < MAX_SESSIONS)
+                .find(|client| !client.is_closed() && client.session_count() < MAX_SESSIONS)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "没有可用的反向隧道"))?
         };
         let (id, incoming, failed) = client.allocate(target)?;
@@ -453,7 +465,7 @@ impl Registry {
                 .iter()
                 .rev()
                 .filter_map(Weak::upgrade)
-                .find(|client| client.session_count() < MAX_SESSIONS)
+                .find(|client| !client.is_closed() && client.session_count() < MAX_SESSIONS)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "没有可用的反向隧道"))?
         };
         let (id, incoming) = client.allocate_udp(target)?;
@@ -1001,6 +1013,72 @@ mod tests {
         };
         let error = registry.open("portal", &target).await.expect_err("应失败");
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+    /// 已关闭的载体不能继续占用 `MAX_CARRIERS` 名额。
+    ///
+    /// 此前只清理 `strong_count == 0` 的端口项。载体 `close()` 之后仍被本地
+    /// 会话持有 `Arc`，`strong_count` 依然大于 0，于是在上限里持续占位，
+    /// 新载体被错误拒绝。
+    #[tokio::test]
+    async fn closed_carrier_releases_its_placement() {
+        let ctx = portal_context();
+        let (carrier, _peer) = tokio::io::duplex(64);
+        ctx.reverse.attach("portal", carrier, &ctx).unwrap();
+
+        let registry = ctx
+            .reverse
+            .portals
+            .get("portal")
+            .unwrap()
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .next()
+            .expect("载体应已注册");
+        // 关闭载体，但保留一个 Arc：模拟本地会话仍未释放。
+        registry.close();
+        assert!(registry.is_closed());
+        assert!(
+            Arc::strong_count(&registry) > 0,
+            "本测试要求载体在关闭后仍被引用"
+        );
+
+        let before = ctx
+            .reverse
+            .portals
+            .get("portal")
+            .unwrap()
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        let (second, _peer2) = tokio::io::duplex(64);
+        ctx.reverse.attach("portal", second, &ctx).unwrap();
+        let after = ctx
+            .reverse
+            .portals
+            .get("portal")
+            .unwrap()
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        assert!(
+            after <= before,
+            "关闭的载体应被清理，而不是与新载体一起计数"
+        );
+
+        // 已关闭的载体也不能被 `open` 选中。
+        let target = Target {
+            host: Host::Domain("example.com".to_owned()),
+            port: 443,
+        };
+        assert!(
+            ctx.reverse.open("portal", &target).await.is_ok(),
+            "新载体应可被选作转发出口"
+        );
     }
 }
 

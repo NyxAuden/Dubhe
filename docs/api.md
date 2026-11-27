@@ -157,6 +157,8 @@ Unix 有 SIGHUP 重载协调器；非 Unix 没有重载路径，但启动状态�
 
 ## 5. 其他端点的副作用
 
+两个用户写端点都只把真正省略的 `inbound` / `user` 视为通配。显式空值、纯空白或重复过滤器返回 `400`，不修改状态。
+
 ### `POST /stats/users/limits`
 
 `?quota_bytes=` / `?expires_at_ms=`（unix 毫秒）。

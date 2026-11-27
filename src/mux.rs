@@ -548,7 +548,6 @@ enum Session {
         generation: u64,
         association: UdpAssociation,
         initial: Target,
-        _slot: OwnedSemaphorePermit,
         _gauge: Guard,
     },
 }
@@ -863,6 +862,9 @@ impl Mux {
             _ => UdpAssociation::new(self.ctx.clone(), self.inbound.clone(), next_token()),
         };
         association.set_sink(self.events.clone(), generation, self.inbound_budget.clone());
+        // 槽交给关联持有：GlobalID 关联进入宽限期后仍握有 socket，
+        // 必须继续计入活动上限，否则宽限期等于一次免费的配额逃逸。
+        association.hold_slot(slot);
         let gauge = self.ctx.stats.enter(Gauge::Udp);
         self.sessions.insert(
             id,
@@ -870,7 +872,6 @@ impl Mux {
                 generation,
                 association: association.clone(),
                 initial: target.clone(),
-                _slot: slot,
                 _gauge: gauge,
             },
         );
@@ -1183,6 +1184,11 @@ impl UdpAssociation {
         self.inner.set_sink(sender, owner, budget);
     }
 
+    /// 让关联本身持有活动槽，直到它被真正回收（含 GlobalID 宽限期）。
+    fn hold_slot(&self, slot: OwnedSemaphorePermit) {
+        self.inner.hold_slot(slot);
+    }
+
     async fn detach(&self, owner: u64) {
         self.inner.detach(owner).await;
     }
@@ -1203,6 +1209,13 @@ struct UdpInner {
     relay: tokio::sync::Mutex<Option<MuxRelay>>,
     tasks: StdMutex<JoinSet<()>>,
     sink: StdMutex<Option<Sink>>,
+    /// 活动槽由关联本身持有，而不是由 Mux 会话持有。
+    ///
+    /// GlobalID 关联结束后仍会在登记表里保留 60 秒，这段时间它的映射与
+    /// 上游中继仍握着 socket。若活动槽随会话释放，宽限期内的关联就不再
+    /// 计入 `max_udp_associations`，等于绕过该上限。因此槽随 `UdpInner`
+    /// 存活，直到关联真正被回收。
+    slot: StdMutex<Option<OwnedSemaphorePermit>>,
 }
 
 struct MuxRelay {
@@ -1221,6 +1234,7 @@ struct Sink {
 }
 
 struct UdpMapping {
+    peer: SocketAddr,
     socket: Arc<UdpSocket>,
     task: AbortHandle,
     last_used: Arc<StdMutex<Instant>>,
@@ -1237,7 +1251,13 @@ impl UdpInner {
             relay: tokio::sync::Mutex::new(None),
             tasks: StdMutex::new(JoinSet::new()),
             sink: StdMutex::new(None),
+            slot: StdMutex::new(None),
         }
+    }
+
+    /// 把活动槽转交给关联本身，使宽限期内仍占用配额。
+    fn hold_slot(&self, slot: OwnedSemaphorePermit) {
+        *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(slot);
     }
 
     fn set_sink(&self, sender: mpsc::Sender<Event>, owner: u64, budget: Arc<Semaphore>) {
@@ -1293,7 +1313,10 @@ impl UdpInner {
     async fn send(self: &Arc<Self>, target: Target, payload: &[u8]) -> io::Result<()> {
         // QUIC Initial SNI 只参与出站选择，实际发送目标保持不变。
         let route = self.ctx.udp_route_target(&self.inbound, &target, payload);
-        let selected = self.ctx.udp_selected(&self.inbound, &route).await?;
+        let selected = self
+            .ctx
+            .udp_selected_routed(&self.inbound, &route, &target)
+            .await?;
         // `reverse` 出站的 proxy 为空，但它是独立上游；只判断 `.proxy`
         // 会把它当直连，把反向目标当普通目标发出去。
         selected.udp_proxied()?;
@@ -1308,6 +1331,13 @@ impl UdpInner {
         }
         let mut mappings = self.mappings.lock().await;
         self.expire(&mut mappings);
+        if mappings
+            .get(&target)
+            .is_some_and(|mapping| !selected.allows_cached_peer(mapping.peer))
+            && let Some(mapping) = mappings.remove(&target)
+        {
+            mapping.task.abort();
+        }
 
         if !mappings.contains_key(&target) {
             if mappings.len() >= self.ctx.limits.max_udp_targets {
@@ -1316,10 +1346,7 @@ impl UdpInner {
                     "Mux UDP 目标上限",
                 ));
             }
-            let addresses = self.ctx.dns.resolve(&target).await?;
-            let address = *addresses
-                .first()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Mux UDP 无可用地址"))?;
+            let address = self.ctx.direct_udp_address(&selected, &target).await?;
             let socket = Arc::new(UdpSocket::bind(wildcard(address.ip())).await?);
             socket.connect(address).await?;
 
@@ -1380,6 +1407,7 @@ impl UdpInner {
             mappings.insert(
                 target.clone(),
                 UdpMapping {
+                    peer: address,
                     socket,
                     task,
                     last_used,
@@ -1760,6 +1788,9 @@ fn release_global(global_key: GlobalKey, owner: u64) {
 }
 
 #[cfg(test)]
+mod tests;
+
+#[cfg(test)]
 mod global_id_isolation_tests {
     use super::*;
     use crate::config::Config;
@@ -1800,6 +1831,49 @@ mod global_id_isolation_tests {
             !Arc::ptr_eq(&alice.inner, &other_inbound.inner),
             "不同入口不能共用同一个 GlobalID 关联"
         );
+
+        release_instance(&ctx);
+    }
+
+    /// GlobalID 关联进入宽限期后仍握着 socket，必须继续占用活动槽。
+    ///
+    /// 此前槽由 Mux 会话持有：会话结束时 `OwnedSemaphorePermit` 随 `Session`
+    /// 释放，而登记表还保留关联 60 秒。宽限期内的关联因此不计数，
+    /// `max_udp_associations` 被绕过。修复后槽随 `UdpInner` 存活。
+    #[tokio::test]
+    async fn expiring_global_keeps_its_association_slot() {
+        let config = Config::from_json(
+            r#"{
+                "version": 1,
+                "inbounds": [{"type": "socks5", "tag": "in", "listen": "127.0.0.1:0"}],
+                "outbounds": [{"type": "direct", "tag": "direct"}],
+                "route": {"default": "direct"}
+            }"#,
+        )
+        .unwrap();
+        let ctx = Arc::new(Context::new(&config).unwrap());
+        let id = [0x7e; 8];
+        let before = ctx.udp_slots.available_permits();
+
+        let association = acquire_global(id, ctx.clone(), "in", "alice", 1, 1).unwrap();
+        let slot = ctx.udp_slots.clone().try_acquire_owned().unwrap();
+        association.hold_slot(slot);
+        assert_eq!(ctx.udp_slots.available_permits(), before - 1);
+
+        // 会话结束：关联转入宽限期，登记表继续持有它。
+        association.inner.detach(1).await;
+        assert!(
+            ctx.udp_slots.available_permits() == before - 1,
+            "宽限期内的关联仍在占用 socket，必须继续计数活动槽"
+        );
+
+        // 关联真正释放后槽才归还。
+        drop(association);
+        purge_globals(
+            &mut global_ids().lock().unwrap_or_else(|e| e.into_inner()),
+            Instant::now(),
+        );
+        assert_eq!(ctx.udp_slots.available_permits(), before);
 
         release_instance(&ctx);
     }

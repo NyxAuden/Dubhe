@@ -4,13 +4,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::task::{Context as TaskContext, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll, Wake, Waker};
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures_util::task::AtomicWaker;
 use h2::server::SendResponse;
 use h3::server::RequestStream;
 use h3_quinn::{BidiStream, RecvStream as H3RecvStream, SendStream as H3SendStream};
@@ -26,6 +26,7 @@ use tokio_util::sync::{CancellationToken, PollSender};
 use crate::config::{Inbound, Limits, Xhttp};
 use crate::forward::{Context, Lease};
 use crate::protocol::{trojan, vless, vmess};
+use crate::runtime::{AuthSlot, WeakAuthSlot};
 use crate::session::Command;
 use crate::telemetry::{Gauge, Guard as GaugeGuard};
 
@@ -83,11 +84,11 @@ impl Pool {
             id: id.clone(),
             state: Mutex::new(State::default()),
             push: tokio::sync::Mutex::new(()),
-            tx: tokio::sync::Mutex::new(Some(tx)),
-            rx: tokio::sync::Mutex::new(Some(rx)),
-            done: AtomicBool::new(false),
+            tx: Mutex::new(Some(tx)),
+            rx: Mutex::new(Some(rx)),
             authenticated: CancellationToken::new(),
             reader_closed: CancellationToken::new(),
+            failed: CancellationToken::new(),
             lease: Lease::new(SessionHold {
                 _slot: slot,
                 _gauge: gauge,
@@ -96,7 +97,7 @@ impl Pool {
         });
         sessions.insert(id, lane.clone());
         drop(sessions);
-        Self::spawn_reaper(Arc::downgrade(self), Arc::downgrade(&lane));
+        self.spawn_reaper(&lane);
         Ok(lane)
     }
 
@@ -108,36 +109,54 @@ impl Pool {
             .cloned()
     }
 
-    fn remove(&self, id: &str) -> Option<Arc<Session>> {
-        self.sessions
+    fn remove(&self, lane: &Session) {
+        let mut sessions = self
+            .sessions
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(id)
+            .unwrap_or_else(|error| error.into_inner());
+        if sessions
+            .get(&lane.id)
+            .is_some_and(|current| std::ptr::eq(current.as_ref(), lane))
+        {
+            sessions.remove(&lane.id);
+        }
     }
 
-    fn spawn_reaper(pool: Weak<Self>, session: Weak<Session>) {
+    fn spawn_reaper(self: &Arc<Self>, session: &Arc<Session>) {
+        let pool = Arc::downgrade(self);
+        let ttl = self.ttl;
+        let closed = session.reader_closed.clone();
+        let session = Arc::downgrade(session);
         tokio::spawn(async move {
-            let ttl = match pool.upgrade() {
-                Some(pool) => pool.ttl,
-                None => return,
-            };
-            tokio::time::sleep(ttl).await;
+            tokio::select! {
+                _ = closed.cancelled() => {},
+                _ = tokio::time::sleep(ttl) => {}
+            }
             let Some(session) = session.upgrade() else {
                 return;
             };
-            if session
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .connected
-            {
+            let mut state = crate::sync::locked(&session.state);
+            if state.connected {
                 return;
             }
-            session.done.store(true, Ordering::SeqCst);
+            session.close(&mut state);
+            drop(state);
             if let Some(pool) = pool.upgrade() {
-                pool.remove(&session.id);
+                pool.remove(&session);
             }
         });
+    }
+}
+
+struct SessionGuard<'a> {
+    pool: &'a Pool,
+    lane: &'a Session,
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        self.lane.close(&mut crate::sync::locked(&self.lane.state));
+        self.pool.remove(self.lane);
     }
 }
 
@@ -153,17 +172,18 @@ struct State {
     pending_bytes: usize,
     connected: bool,
     upload_attached: bool,
+    upload_auth: Vec<WeakAuthSlot>,
 }
 
 pub(super) struct Session {
     id: String,
     state: Mutex<State>,
     push: tokio::sync::Mutex<()>,
-    tx: tokio::sync::Mutex<Option<mpsc::Sender<QueuedChunk>>>,
-    rx: tokio::sync::Mutex<Option<mpsc::Receiver<QueuedChunk>>>,
-    done: AtomicBool,
+    tx: Mutex<Option<mpsc::Sender<QueuedChunk>>>,
+    rx: Mutex<Option<mpsc::Receiver<QueuedChunk>>>,
     authenticated: CancellationToken,
     reader_closed: CancellationToken,
+    failed: CancellationToken,
     lease: Lease,
     /// 本入口的共享排队字节预算（来自 `Pool`）。
     budget: Arc<Semaphore>,
@@ -176,118 +196,197 @@ impl Session {
 
     /// 入队一段**已经在共享字节预算内**的负载。
     ///
-    /// permit 随数据一起转移给 reader，读到下一段时才释放。调用方负责在
+    /// permit 随数据一起转移给 reader，读完即释放。调用方负责在
     /// 复制数据**之前**申请额度，避免先分配再拒绝。
     async fn push_queued(&self, chunk: QueuedChunk) -> io::Result<()> {
-        if self.done.load(Ordering::SeqCst) {
-            return Err(closed());
-        }
-        let sender = self.tx.lock().await;
-        let Some(sender) = sender.as_ref() else {
+        let Some(sender) = crate::sync::locked(&self.tx).clone() else {
             return Err(closed());
         };
-        sender.send(chunk).await.map_err(|_| closed())
+        tokio::select! {
+            biased;
+            _ = self.reader_closed.cancelled() => Err(closed()),
+            result = sender.send(chunk) => result.map_err(|_| closed()),
+        }
     }
 
     /// 申请预算后入队（先申请、再复制，避免先分配再拒绝）。
-    async fn push_with_budget(&self, bytes: Vec<u8>) -> io::Result<()> {
+    async fn push_with_budget(&self, bytes: &[u8]) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
-        let permit = self.reserve(&bytes)?;
-        self.push_queued((bytes, permit)).await
-    }
-
-    /// 用共享预算包住一段新负载；超出即失败关闭，不把内存压力推给进程。
-    fn reserve(&self, bytes: &[u8]) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
-        let want = u32::try_from(bytes.len().max(1))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "XHTTP负载过大"))?;
-        self.budget
-            .clone()
-            .try_acquire_many_owned(want)
-            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "XHTTP排队字节超预算"))
+        let permit = reserve(&self.budget, bytes.len())?;
+        self.push_queued((bytes.to_vec(), permit)).await
     }
 
     /// packet-up 有序交付：允许乱序到达，缓冲有界，重复/超界失败关闭。
-    async fn push_seq(&self, seq: u64, payload: Vec<u8>, max_post: usize) -> io::Result<()> {
+    async fn push_seq(
+        &self,
+        seq: u64,
+        chunk: QueuedChunk,
+        max_post: usize,
+        auth: Option<&AuthSlot>,
+    ) -> io::Result<()> {
         let _serial = self.push.lock().await;
-        let mut ready: Vec<(Vec<u8>, Option<tokio::sync::OwnedSemaphorePermit>)> = Vec::new();
         {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = crate::sync::locked(&self.state);
+            if self.reader_closed.is_cancelled() {
+                return Err(closed());
+            }
             if state.upload_attached {
                 return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
+                    io::ErrorKind::AlreadyExists,
                     "XHTTP上行模式冲突",
                 ));
             }
-            if seq < state.next_seq {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "重复XHTTP序号"));
+            if seq < state.next_seq || seq == u64::MAX {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "无效XHTTP序号",
+                ));
             }
-            if seq == state.next_seq {
-                state.next_seq += 1;
-                let permit = self.reserve(&payload)?;
-                ready.push((payload, Some(permit)));
-                loop {
-                    let next_seq = state.next_seq;
-                    let Some((next, permit)) = state.pending.remove(&next_seq) else {
-                        break;
-                    };
-                    state.pending_bytes = state.pending_bytes.saturating_sub(next.len());
-                    state.next_seq += 1;
-                    ready.push((next, Some(permit)));
-                }
-            } else {
+            if seq != state.next_seq {
                 if state.pending.len() >= 1024 || state.pending.contains_key(&seq) {
                     return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                        io::ErrorKind::AlreadyExists,
                         "XHTTP序号缓冲超限",
                     ));
                 }
-                let buffered = state.pending_bytes + payload.len();
+                let buffered = state.pending_bytes + chunk.0.len();
                 if buffered > max_post.saturating_mul(2).max(CHUNK_LIMIT) {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
                         "XHTTP序号缓冲超限",
                     ));
                 }
-                // 乱序缓冲同样受共享字节预算约束：每会话虽有
-                // `max_post × 2` 的上限，但会话数乘起来仍会随入口放大。
-                let permit = self.reserve(&payload)?;
                 state.pending_bytes = buffered;
-                state.pending.insert(seq, (payload, permit));
+                state.pending.insert(seq, chunk);
+                if let Some(auth) = auth {
+                    self.bind_upload_auth(&mut state, auth);
+                }
+                return Ok(());
             }
         }
-        for (payload, permit) in ready {
-            let Some(permit) = permit else { continue };
-            self.push_queued((payload, permit)).await?;
+        let Some(sender) = crate::sync::locked(&self.tx).clone() else {
+            return Err(closed());
+        };
+        // 取消发生在已入队一部分之后时，不能留下无人推进的连续包。
+        struct PartialPush<'a>(&'a Session, bool);
+        impl Drop for PartialPush<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.fail();
+                }
+            }
         }
-        Ok(())
+        let mut partial = PartialPush(self, false);
+        let mut first = Some(chunk);
+        loop {
+            if first.is_none() {
+                let state = crate::sync::locked(&self.state);
+                if !state.pending.contains_key(&state.next_seq) {
+                    partial.1 = false;
+                    return Ok(());
+                }
+            }
+            let permit = tokio::select! {
+                biased;
+                _ = self.reader_closed.cancelled() => return Err(closed()),
+                permit = sender.reserve() => permit.map_err(|_| closed())?,
+            };
+            let mut state = crate::sync::locked(&self.state);
+            if self.reader_closed.is_cancelled() || state.upload_attached {
+                return Err(closed());
+            }
+            let chunk = if let Some(chunk) = first.take() {
+                if let Some(auth) = auth {
+                    self.bind_upload_auth(&mut state, auth);
+                }
+                chunk
+            } else {
+                let next = state.next_seq;
+                let chunk = state.pending.remove(&next).expect("序号由 push 锁串行化");
+                state.pending_bytes -= chunk.0.len();
+                chunk
+            };
+            state.next_seq += 1;
+            permit.send(chunk);
+            partial.1 = true;
+        }
     }
 
-    async fn take_reader(&self) -> Option<mpsc::Receiver<QueuedChunk>> {
-        self.rx.lock().await.take()
+    fn take_reader(&self) -> Option<mpsc::Receiver<QueuedChunk>> {
+        crate::sync::locked(&self.rx).take()
     }
 
-    fn mark_connected(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .connected = true;
+    fn claim<'a>(&'a self, pool: &'a Pool) -> io::Result<SessionGuard<'a>> {
+        let mut state = crate::sync::locked(&self.state);
+        if self.reader_closed.is_cancelled() {
+            return Err(closed());
+        }
+        state.connected = true;
+        Ok(SessionGuard { pool, lane: self })
     }
 
-    fn attach_upload(&self) -> bool {
+    fn close(&self, state: &mut State) {
+        self.end_upload();
+        self.reader_closed.cancel();
+        crate::sync::locked(&self.rx).take();
+        state.pending.clear();
+        state.pending_bytes = 0;
+        state.upload_auth.clear();
+    }
+
+    fn fail(&self) {
+        let mut state = crate::sync::locked(&self.state);
+        // 不把不完整的上行当作可以继续下行的正常 EOF。
+        self.failed.cancel();
+        self.close(&mut state);
+    }
+
+    fn bind_upload_auth(&self, state: &mut State, auth: &AuthSlot) {
+        if !auth.pending() {
+            return;
+        }
+        if self.authenticated.is_cancelled() {
+            auth.release();
+        } else if !self.reader_closed.is_cancelled() {
+            let weak = auth.downgrade();
+            state
+                .upload_auth
+                .retain(|slot| AuthSlot::upgrade(slot).is_some_and(|slot| slot.pending()));
+            if !state.upload_auth.iter().any(|slot| slot.ptr_eq(&weak)) {
+                state.upload_auth.push(weak);
+            }
+        }
+    }
+
+    fn finish_auth(&self) {
+        let mut state = crate::sync::locked(&self.state);
+        for weak in state.upload_auth.drain(..) {
+            if let Some(auth) = AuthSlot::upgrade(&weak) {
+                auth.release();
+            }
+        }
+        self.authenticated.cancel();
+    }
+
+    fn attach_upload(&self, auth: &AuthSlot) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.upload_attached || state.next_seq != 0 || !state.pending.is_empty() {
+        if self.reader_closed.is_cancelled()
+            || state.upload_attached
+            || state.next_seq != 0
+            || !state.pending.is_empty()
+        {
             return false;
         }
         state.upload_attached = true;
+        self.bind_upload_auth(&mut state, auth);
         true
     }
 
-    async fn end_upload(&self) {
-        self.done.store(true, Ordering::SeqCst);
+    fn end_upload(&self) {
         // 丢弃最后一个sender使下行reader在排空后读到EOF。
-        self.tx.lock().await.take();
+        crate::sync::locked(&self.tx).take();
     }
 }
 
@@ -297,10 +396,136 @@ fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "XHTTP会话已关闭")
 }
 
+fn auth_timeout() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "XHTTP 认证超时")
+}
+
+fn reserve(budget: &Arc<Semaphore>, size: usize) -> io::Result<OwnedSemaphorePermit> {
+    let size = u32::try_from(size).map_err(|_| too_large())?;
+    budget
+        .clone()
+        .try_acquire_many_owned(size)
+        .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "XHTTP排队字节超预算"))
+}
+
+struct PacketBody<'a> {
+    budget: &'a Arc<Semaphore>,
+    chunk: QueuedChunk,
+    limit: usize,
+    keep_body: bool,
+    body_len: usize,
+}
+
+impl<'a> PacketBody<'a> {
+    fn new(budget: &'a Arc<Semaphore>, xhttp: &Xhttp, headers: &HeaderMap) -> io::Result<Self> {
+        let placement = xhttp.uplink_data_placement.as_str();
+        let mut body = Self {
+            budget,
+            chunk: (Vec::new(), reserve(budget, 1)?),
+            limit: xhttp.sc_max_each_post_bytes as usize,
+            keep_body: !matches!(placement, "header" | "cookie"),
+            body_len: 0,
+        };
+        if matches!(placement, "auto" | "header") {
+            body.decode(&encoded_headers(xhttp, headers)?)?;
+        }
+        if matches!(placement, "auto" | "cookie") {
+            body.decode(&encoded_cookies(xhttp, headers)?)?;
+        }
+        Ok(body)
+    }
+
+    fn grow(&mut self, size: usize) -> io::Result<()> {
+        let total = self
+            .chunk
+            .0
+            .len()
+            .checked_add(size)
+            .filter(|n| *n <= self.limit)
+            .ok_or_else(too_large)?;
+        if total > self.chunk.0.capacity() {
+            let held = self.chunk.1.num_permits();
+            let target = total.max(self.chunk.0.capacity().saturating_mul(2).min(self.limit));
+            let permit = reserve(self.budget, target.saturating_sub(held))
+                .or_else(|_| reserve(self.budget, total.saturating_sub(held)))?;
+            self.chunk
+                .0
+                .reserve_exact((held + permit.num_permits()).max(total) - self.chunk.0.len());
+            self.chunk.1.merge(permit);
+        }
+        Ok(())
+    }
+
+    fn decode(&mut self, encoded: &str) -> io::Result<()> {
+        let size = encoded.len() / 4 * 3 + (encoded.len() % 4) * 3 / 4;
+        self.grow(size)?;
+        let start = self.chunk.0.len();
+        self.chunk.0.resize(start + size, 0);
+        let written = URL_SAFE_NO_PAD
+            .decode_slice(encoded, &mut self.chunk.0[start..])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "XHTTP上行数据base64非法"))?;
+        self.chunk.0.truncate(start + written);
+        Ok(())
+    }
+
+    fn prepare(&mut self, size: usize) -> io::Result<()> {
+        self.body_len = self
+            .body_len
+            .checked_add(size)
+            .filter(|n| *n <= self.limit)
+            .ok_or_else(too_large)?;
+        if self.keep_body {
+            self.grow(size)?;
+        }
+        Ok(())
+    }
+
+    fn append(&mut self, mut bytes: impl Buf) -> io::Result<()> {
+        self.prepare(bytes.remaining())?;
+        if self.keep_body {
+            while bytes.has_remaining() {
+                let chunk = bytes.chunk();
+                self.chunk.0.extend_from_slice(chunk);
+                let len = chunk.len();
+                bytes.advance(len);
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn drive_upload(
+    lane: &Session,
+    deadline: Instant,
+    upload: impl Future<Output = io::Result<()>>,
+) -> io::Result<()> {
+    struct EndUpload<'a>(&'a Session);
+    impl Drop for EndUpload<'_> {
+        fn drop(&mut self) {
+            self.0.end_upload();
+        }
+    }
+    let _end = EndUpload(lane);
+    tokio::pin!(upload);
+    tokio::select! {
+        biased;
+        _ = lane.reader_closed.cancelled() => Ok(()),
+        _ = lane.authenticated.cancelled() => {
+            tokio::select! {
+                biased;
+                _ = lane.reader_closed.cancelled() => Ok(()),
+                result = &mut upload => result,
+            }
+        }
+        _ = tokio::time::sleep_until(deadline) => Err(auth_timeout()),
+        result = &mut upload => result,
+    }
+}
+
 /// 下发入口：TLS 只接受 h2/http1.1；明文接受 h2c prior-knowledge 或 h1。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
-    stream: TcpStream,
+    mut stream: TcpStream,
     config: Arc<Inbound>,
     security: Option<crate::tls::InboundSecurity>,
     vmess: Option<Arc<vmess::Prepared>>,
@@ -351,10 +576,10 @@ pub(crate) async fn serve(
         }
         None => {
             // 明文承载先判前24字节；分片到达时继续等到能区分h2c与h1。
-            let mut peek = [0u8; 24];
+            let mut prefix = [0u8; H2_PREFACE.len()];
             let mut read = 0;
             loop {
-                let available = timeout_at(absolute, stream.peek(&mut peek[read..]))
+                let available = timeout_at(absolute, stream.read(&mut prefix[read..]))
                     .await
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP首字节超时"))??;
                 if available == 0 {
@@ -364,21 +589,29 @@ pub(crate) async fn serve(
                     ));
                 }
                 read += available;
-                if !H2_PREFACE.starts_with(&peek[..read]) || read == H2_PREFACE.len() {
+                if !H2_PREFACE.starts_with(&prefix[..read]) || read == H2_PREFACE.len() {
                     break;
                 }
             }
             let auth = crate::runtime::AuthSlot::new(handshake);
-            if read == H2_PREFACE.len() && peek == H2_PREFACE {
+            if read == H2_PREFACE.len() && prefix == H2_PREFACE {
                 serve_h2(
-                    stream, config, vmess, ctx, pool, absolute, stop, force, auth,
+                    PrefixReader::new(prefix.to_vec(), stream),
+                    config,
+                    vmess,
+                    ctx,
+                    pool,
+                    absolute,
+                    stop,
+                    force,
+                    auth,
                 )
                 .await
             } else {
                 serve_h1(
                     Conn {
                         io: stream,
-                        buffer: Vec::new(),
+                        buffer: prefix[..read].to_vec(),
                     },
                     config,
                     vmess,
@@ -450,26 +683,33 @@ impl<S: AsyncRead + Unpin> Conn<S> {
         }
     }
 
-    async fn read_body(&mut self, body: &BodyKind, limit: usize) -> io::Result<Vec<u8>> {
+    async fn read_body(&mut self, body: &BodyKind, packet: &mut PacketBody<'_>) -> io::Result<()> {
         match body {
-            BodyKind::None => Ok(Vec::new()),
-            BodyKind::Length(length) => {
-                if *length > limit {
-                    return Err(too_large());
-                }
-                let mut data = Vec::with_capacity(*length);
-                let mut remaining = *length;
-                while remaining > 0 {
-                    let take = remaining.min(STREAM_CHUNK);
-                    let mut piece = vec![0u8; take];
-                    self.read_exact_into(&mut piece).await?;
-                    data.extend_from_slice(&piece);
-                    remaining -= take;
-                }
-                Ok(data)
-            }
-            BodyKind::Chunked => self.read_chunked(limit).await,
+            BodyKind::None => Ok(()),
+            BodyKind::Length(length) => self.read_packet_bytes(packet, *length).await,
+            BodyKind::Chunked => self.read_chunked(packet).await,
         }
+    }
+
+    async fn read_packet_bytes(
+        &mut self,
+        packet: &mut PacketBody<'_>,
+        size: usize,
+    ) -> io::Result<()> {
+        packet.prepare(size)?;
+        if packet.keep_body {
+            let start = packet.chunk.0.len();
+            packet.chunk.0.resize(start + size, 0);
+            return self.read_exact_into(&mut packet.chunk.0[start..]).await;
+        }
+        let mut discard = [0; 1024];
+        let mut left = size;
+        while left != 0 {
+            let n = left.min(discard.len());
+            self.read_exact_into(&mut discard[..n]).await?;
+            left -= n;
+        }
+        Ok(())
     }
 
     async fn stream_body(&mut self, body: &BodyKind, session: &Session) -> io::Result<()> {
@@ -479,9 +719,10 @@ impl<S: AsyncRead + Unpin> Conn<S> {
                 let mut remaining = *length;
                 while remaining > 0 {
                     let take = remaining.min(STREAM_CHUNK);
+                    let permit = reserve(&session.budget, take)?;
                     let mut piece = vec![0u8; take];
                     self.read_exact_into(&mut piece).await?;
-                    session.push_with_budget(piece).await?;
+                    session.push_queued((piece, permit)).await?;
                     remaining -= take;
                 }
             }
@@ -498,9 +739,10 @@ impl<S: AsyncRead + Unpin> Conn<S> {
                 let mut remaining = size;
                 while remaining > 0 {
                     let take = remaining.min(STREAM_CHUNK);
+                    let permit = reserve(&session.budget, take)?;
                     let mut piece = vec![0u8; take];
                     self.read_exact_into(&mut piece).await?;
-                    session.push_with_budget(piece).await?;
+                    session.push_queued((piece, permit)).await?;
                     remaining -= take;
                 }
                 let mut crlf = [0u8; 2];
@@ -510,13 +752,10 @@ impl<S: AsyncRead + Unpin> Conn<S> {
                 }
             },
         }
-        // stream-up只有一条持续POST；其EOF只结束上传，GET仍可读取下行。
-        session.end_upload().await;
         Ok(())
     }
 
-    async fn read_chunked(&mut self, limit: usize) -> io::Result<Vec<u8>> {
-        let mut data = Vec::new();
+    async fn read_chunked(&mut self, packet: &mut PacketBody<'_>) -> io::Result<()> {
         loop {
             let line = self.read_line().await?;
             let size_text = line.split(';').next().unwrap_or("").trim();
@@ -524,19 +763,9 @@ impl<S: AsyncRead + Unpin> Conn<S> {
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "非法chunk长度"))?;
             if size == 0 {
                 while !self.read_line().await?.is_empty() {}
-                return Ok(data);
+                return Ok(());
             }
-            // `size` 来自对端声明，可达 `usize::MAX`：直接相加会溢出回绕，
-            // 绕过下面的上限检查并触发巨量分配。用 checked_add 拒绝。
-            let total = data
-                .len()
-                .checked_add(size)
-                .filter(|total| *total <= limit)
-                .ok_or_else(too_large)?;
-            debug_assert!(total <= limit);
-            let mut piece = vec![0u8; size];
-            self.read_exact_into(&mut piece).await?;
-            data.extend_from_slice(&piece);
+            self.read_packet_bytes(packet, size).await?;
             let mut crlf = [0u8; 2];
             self.read_exact_into(&mut crlf).await?;
             if crlf != *b"\r\n" {
@@ -665,17 +894,14 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             Some(lane) => lane,
             None => pool.open(session_id.clone())?,
         };
-        // 同 `handle_h2`：标记必须晚于所有可能提前返回的步骤，
-        // 否则 TTL 回收器会跳过这个会话，槽位永久泄漏。
-        let Some(rx) = lane.take_reader().await else {
+        let Some(rx) = lane.take_reader() else {
             write_status(&mut conn.io, xhttp, "409 Conflict").await?;
             return Ok(None);
         };
-        if let Err(error) = write_stream_headers(&mut conn.io, xhttp).await {
-            pool.remove(&session_id);
-            return Err(error);
-        }
-        lane.mark_connected();
+        let _session = lane.claim(pool)?;
+        timeout_at(absolute, write_stream_headers(&mut conn.io, xhttp))
+            .await
+            .map_err(|_| auth_timeout())??;
         let (read, write) = tokio::io::split(conn.io);
         drop(read);
         let tunnel = Tunnel::new(
@@ -692,7 +918,6 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             Some(auth),
         )
         .await;
-        pool.remove(&session_id);
         result?;
         return Ok(None);
     }
@@ -709,10 +934,12 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             write_status(&mut conn.io, xhttp, "400 Bad Request").await?;
             return Ok(None);
         }
-        write_stream_headers(&mut conn.io, xhttp).await?;
+        timeout_at(absolute, write_stream_headers(&mut conn.io, xhttp))
+            .await
+            .map_err(|_| auth_timeout())??;
         let session_id = unique_session_id();
         let lane = pool.open(session_id.clone())?;
-        lane.mark_connected();
+        let _session = lane.claim(pool)?;
         let (read, write) = tokio::io::split(conn.io);
         let input = match head.body {
             BodyKind::Chunked => BodyReader::Chunked(ChunkedReader::new(conn.buffer, read)),
@@ -729,7 +956,6 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             Some(auth),
         )
         .await;
-        pool.remove(&session_id);
         result?;
         return Ok(None);
     }
@@ -747,35 +973,24 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             return Ok(None);
         }
         let lane = pool.open(session_id.clone())?;
-        if !lane.attach_upload() {
+        if !lane.attach_upload(auth) {
             write_status(&mut conn.io, xhttp, "409 Conflict").await?;
             return Ok(None);
         }
-        let upload = async {
+        drive_upload(&lane, absolute, async {
             write_stream_headers(&mut conn.io, xhttp).await?;
-            tokio::select! {
-                result = conn.stream_body(&head.body, &lane) => result?,
-                _ = lane.reader_closed.cancelled() => {},
-            }
-            conn.io.write_all(b"0\r\n\r\n").await?;
-            conn.io.flush().await
-        };
-        tokio::pin!(upload);
-        // GET 完成内层认证前，分离的 POST 也必须受本连接的握手期限约束。
-        tokio::select! {
-            biased;
-            _ = lane.authenticated.cancelled() => {
-                auth.release();
-                upload.await?;
-            }
-            _ = tokio::time::sleep_until(absolute) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "XHTTP 上行正文超时",
-                ));
-            }
-            result = &mut upload => result?,
-        }
+            conn.stream_body(&head.body, &lane).await
+        })
+        .await?;
+        timeout_at(
+            Instant::now() + Duration::from_millis(ctx.limits.handshake_timeout_ms),
+            async {
+                conn.io.write_all(b"0\r\n\r\n").await?;
+                conn.io.flush().await
+            },
+        )
+        .await
+        .map_err(|_| auth_timeout())??;
         return Ok(None);
     }
     // packet-up：有界读取后按 seq 入队。
@@ -787,45 +1002,27 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         return Ok(None);
     }
     // packet-up 的正文读取也在认证之前，必须有同一绝对期限。
-    let body = match tokio::time::timeout_at(
-        absolute,
-        conn.read_body(&head.body, xhttp.sc_max_each_post_bytes as usize),
-    )
-    .await
-    {
-        Err(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "XHTTP 上行正文超时",
-            ));
-        }
-        Ok(result) => match result {
-            Ok(body) => body,
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                write_status(&mut conn.io, xhttp, "413 Payload Too Large").await?;
-                return Ok(Some(conn));
-            }
-            Err(error) => return Err(error),
-        },
-    };
-    let payload = match uplink_payload(xhttp, &head.headers, body) {
-        Ok(payload) => payload,
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-            write_status(&mut conn.io, xhttp, "413 Payload Too Large").await?;
-            return Ok(Some(conn));
-        }
-        Err(_) => {
-            write_status(&mut conn.io, xhttp, "400 Bad Request").await?;
-            return Ok(Some(conn));
-        }
-    };
     let Some(seq) = seq else {
         write_status(&mut conn.io, xhttp, "400 Bad Request").await?;
         return Ok(None);
     };
-    let lane = pool.open(session_id.clone())?;
-    lane.push_seq(seq, payload, xhttp.sc_max_each_post_bytes as usize)
-        .await?;
+    let result = timeout_at(absolute, async {
+        let mut packet = PacketBody::new(&pool.buffer_bytes, xhttp, &head.headers)?;
+        conn.read_body(&head.body, &mut packet).await?;
+        let lane = pool.open(session_id)?;
+        lane.push_seq(seq, packet.chunk, packet.limit, None).await
+    })
+    .await
+    .map_err(|_| auth_timeout())?;
+    if let Err(error) = result {
+        let status = match error.kind() {
+            io::ErrorKind::InvalidData => "413 Payload Too Large",
+            io::ErrorKind::InvalidInput => "400 Bad Request",
+            _ => return Err(error),
+        };
+        write_status(&mut conn.io, xhttp, status).await?;
+        return Ok(None);
+    }
     write_status(&mut conn.io, xhttp, "200 OK").await?;
     Ok(Some(conn))
 }
@@ -859,25 +1056,25 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP h2握手超时"))?
     .map_err(io::Error::other)?;
     let mut streams = JoinSet::new();
-    // 首个请求前的绝对期限。XHTTP 在外层 TLS 完成后就归还了握手许可
-    // （见上面 `drop(handshake)`），若这里不给期限，一条不认证的连接会
-    // 长期占住共享连接槽。
-    let mut first_request = true;
+    let duration = Duration::from_millis(ctx.limits.handshake_timeout_ms);
     loop {
         tokio::select! {
             biased;
             _ = force.cancelled() => break,
             _ = stop.cancelled() => break,
-            _ = tokio::time::sleep_until(absolute), if first_request => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "XHTTP 首个请求超时",
-                ));
+            _ = tokio::time::sleep_until(absolute), if auth.pending() => {
+                if auth.pending() { return Err(auth_timeout()); }
             }
+            Some(_) = streams.join_next() => {}
             accepted = connection.accept() => {
                 let Some(accepted) = accepted else { break };
-                let (request, respond) = accepted.map_err(io::Error::other)?;
-                first_request = false;
+                let (request, mut respond) = accepted.map_err(io::Error::other)?;
+                if streams.len() >= 64 {
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    metrics_reject(&ctx);
+                    continue;
+                }
+                let deadline = if auth.pending() { absolute } else { Instant::now() + duration };
                 let config = config.clone();
                 let vmess = vmess.clone();
                 let ctx = ctx.clone();
@@ -885,13 +1082,12 @@ async fn serve_h2<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 let auth = auth.clone();
                 let tracker = ctx.children.clone();
                 streams.spawn(tracker.track_future(async move {
-                    if let Err(error) = handle_h2(request, respond, &config, &vmess, &ctx, &pool, absolute, &auth).await {
+                    if let Err(error) = handle_h2(request, respond, &config, &vmess, &ctx, &pool, deadline, &auth).await {
                         metrics_reject(&ctx);
                         let _ = error;
                     }
                 }));
             }
-            Some(_) = streams.join_next() => {}
         }
     }
     let _ = timeout(
@@ -940,29 +1136,15 @@ async fn handle_h2(
             Some(lane) => lane,
             None => pool.open(session_id.clone())?,
         };
-        // `mark_connected` 必须放在所有可能提前返回的步骤**之后**：
-        // TTL 回收器会跳过 `connected` 会话，若在 `take_reader` /
-        // `stream_h2_response` 失败前就标记，这两条路径会让会话槽永久泄漏
-        // （`pool.remove` 只在正常结束时执行）。
-        let Some(rx) = lane.take_reader().await else {
+        let Some(rx) = lane.take_reader() else {
             reject_h2(&mut respond, xhttp, StatusCode::CONFLICT).await;
             return Ok(());
         };
-        let send = match stream_h2_response(&mut respond, xhttp) {
-            Ok(send) => send,
-            Err(error) => {
-                // 会话已经取走 reader，必须显式回收。
-                pool.remove(&session_id);
-                return Err(error);
-            }
-        };
-        lane.mark_connected();
-        let tunnel = Tunnel::new(
+        let _session = lane.claim(pool)?;
+        let send = stream_h2_response(&mut respond, xhttp)?;
+        dispatch_h2(
             ChannelReader::new(rx, &lane),
-            FinishOnDrop::new(H2Writer::new(send)),
-        );
-        let result = dispatch(
-            tunnel,
+            send,
             config,
             vmess,
             ctx,
@@ -970,17 +1152,21 @@ async fn handle_h2(
             Some(&lane),
             Some(auth),
         )
-        .await;
-        pool.remove(&session_id);
-        result
+        .await
     } else if *request.method() == Method::POST {
         if session.is_none() {
             let send = stream_h2_response(&mut respond, xhttp)?;
-            let tunnel = Tunnel::new(
+            return dispatch_h2(
                 H2Reader::new(request.into_body()),
-                FinishOnDrop::new(H2Writer::new(send)),
-            );
-            return dispatch(tunnel, config, vmess, ctx, absolute, None, Some(auth)).await;
+                send,
+                config,
+                vmess,
+                ctx,
+                absolute,
+                None,
+                Some(auth),
+            )
+            .await;
         }
         let Some(session_id) = session else {
             reject_h2(&mut respond, xhttp, StatusCode::BAD_REQUEST).await;
@@ -991,68 +1177,74 @@ async fn handle_h2(
                 Some(lane) => lane,
                 None => pool.open(session_id.clone())?,
             };
-            if !lane.attach_upload() {
+            if !lane.attach_upload(auth) {
                 reject_h2(&mut respond, xhttp, StatusCode::CONFLICT).await;
                 return Ok(());
             }
-            let mut send = respond
-                .send_response(
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .body(())
-                        .expect("响应头合法"),
-                    false,
-                )
-                .map_err(io::Error::other)?;
+            let mut send = match respond.send_response(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(())
+                    .expect("响应头合法"),
+                false,
+            ) {
+                Ok(send) => send,
+                Err(error) => {
+                    lane.end_upload();
+                    return Err(io::Error::other(error));
+                }
+            };
             let mut body = request.into_body();
-            while let Some(chunk) = body.data().await {
-                let chunk = chunk.map_err(io::Error::other)?;
-                lane.push_with_budget(chunk.to_vec()).await?;
-                body.flow_control()
-                    .release_capacity(chunk.len())
-                    .map_err(io::Error::other)?;
-            }
-            // 持续POST不受packet-up单块预算限制；EOF仅半关闭上行，GET继续。
-            lane.end_upload().await;
+            drive_upload(&lane, absolute, async {
+                let upload = async {
+                    while let Some(chunk) = body.data().await {
+                        let chunk = chunk.map_err(io::Error::other)?;
+                        lane.push_with_budget(&chunk).await?;
+                        body.flow_control()
+                            .release_capacity(chunk.len())
+                            .map_err(io::Error::other)?;
+                    }
+                    Ok(())
+                };
+                tokio::select! {
+                    biased;
+                    _ = std::future::poll_fn(|cx| send.poll_reset(cx)) => Err(closed()),
+                    result = upload => result,
+                }
+            })
+            .await?;
             send.send_data(Bytes::new(), true)
                 .map_err(io::Error::other)?;
             return Ok(());
         }
-        let request_headers = request.headers().clone();
-        let mut body = request.into_body();
-        let mut payload = Vec::new();
-        while let Some(chunk) = body.data().await {
-            let chunk = chunk.map_err(io::Error::other)?;
-            if payload.len() + chunk.len() > xhttp.sc_max_each_post_bytes as usize {
-                reject_h2(&mut respond, xhttp, StatusCode::PAYLOAD_TOO_LARGE).await;
-                return Ok(());
-            }
-            payload.extend_from_slice(&chunk);
-            body.flow_control()
-                .release_capacity(chunk.len())
-                .map_err(io::Error::other)?;
-        }
-        let payload = match uplink_payload(xhttp, &request_headers, payload) {
-            Ok(payload) => payload,
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                reject_h2(&mut respond, xhttp, StatusCode::PAYLOAD_TOO_LARGE).await;
-                return Ok(());
-            }
-            Err(_) => {
-                reject_h2(&mut respond, xhttp, StatusCode::BAD_REQUEST).await;
-                return Ok(());
-            }
-        };
-        let lane = match pool.get(&session_id) {
-            Some(lane) => lane,
-            None => pool.open(session_id.clone())?,
-        };
         let Some(seq) = seq else {
             reject_h2(&mut respond, xhttp, StatusCode::BAD_REQUEST).await;
             return Ok(());
         };
-        lane.push_seq(seq, payload, xhttp.sc_max_each_post_bytes as usize)
-            .await?;
+        let upload = async {
+            let mut packet = PacketBody::new(&pool.buffer_bytes, xhttp, request.headers())?;
+            let mut body = request.into_body();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.map_err(io::Error::other)?;
+                let len = chunk.len();
+                packet.append(chunk)?;
+                body.flow_control()
+                    .release_capacity(len)
+                    .map_err(io::Error::other)?;
+            }
+            let lane = pool.open(session_id)?;
+            lane.push_seq(seq, packet.chunk, packet.limit, Some(auth))
+                .await
+        };
+        let result = tokio::select! {
+            biased;
+            _ = std::future::poll_fn(|cx| respond.poll_reset(cx)) => return Err(closed()),
+            result = timeout_at(absolute, upload) => result.map_err(|_| auth_timeout())?,
+        };
+        if let Err(error) = result {
+            reject_h2(&mut respond, xhttp, packet_error_status(&error)?).await;
+            return Ok(());
+        }
         let _ = respond.send_response(
             Response::builder()
                 .status(StatusCode::OK)
@@ -1115,6 +1307,29 @@ fn metrics_reject(ctx: &Arc<Context>) {
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn dispatch_h2<R: AsyncRead + Unpin + Send + 'static>(
+    read: R,
+    send: h2::SendStream<Bytes>,
+    config: &Inbound,
+    vmess: &Option<Arc<vmess::Prepared>>,
+    ctx: &Arc<Context>,
+    deadline: Instant,
+    lane: Option<&Session>,
+    auth: Option<&AuthSlot>,
+) -> io::Result<()> {
+    let write = CancellableH2Writer {
+        inner: Arc::new(Mutex::new(H2Writer::new(send))),
+        wake: Arc::default(),
+    };
+    let tunnel = Tunnel::new(read, FinishOnDrop::new(write.clone()));
+    tokio::select! {
+        biased;
+        _ = write.cancelled() => Err(closed()),
+        result = dispatch(tunnel, config, vmess, ctx, deadline, lane, auth) => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn dispatch<S>(
     app: S,
     config: &Inbound,
@@ -1134,89 +1349,111 @@ where
             auth.release();
         }
         if let Some(lane) = lane {
-            lane.authenticated.cancel();
+            lane.finish_auth();
         }
     };
-    match config {
-        Inbound::VlessXhttp {
-            tag, users, xudp, ..
-        }
-        | Inbound::VlessHttpUpgrade {
-            tag, users, xudp, ..
-        } => {
-            let mut app: Box<dyn crate::tls::Io> = match ctx.vless_encryption(tag) {
-                Some(prepared) => Box::new(
-                    timeout_at(deadline, prepared.accept(app))
+    let relay = async {
+        match config {
+            Inbound::VlessXhttp {
+                tag, users, xudp, ..
+            }
+            | Inbound::VlessHttpUpgrade {
+                tag, users, xudp, ..
+            } => {
+                let mut app: Box<dyn crate::tls::Io> = match ctx.vless_encryption(tag) {
+                    Some(prepared) => {
+                        Box::new(timeout_at(deadline, prepared.accept(app)).await.map_err(
+                            |_| {
+                                io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "XHTTP/VLESS Encryption 超时",
+                                )
+                            },
+                        )??)
+                    }
+                    None => Box::new(app),
+                };
+                let accepted =
+                    timeout_at(deadline, vless::read_plain_request(&mut app, users, *xudp))
                         .await
                         .map_err(|_| {
-                            io::Error::new(io::ErrorKind::TimedOut, "XHTTP/VLESS Encryption 超时")
-                        })??,
-                ),
-                None => Box::new(app),
-            };
-            let accepted = timeout_at(deadline, vless::read_plain_request(&mut app, users, *xudp))
+                            io::Error::new(io::ErrorKind::TimedOut, "XHTTP/VLESS认证超时")
+                        })??;
+                finish_auth();
+                crate::runtime::serve_plain_vless_scoped(
+                    app,
+                    accepted,
+                    tag,
+                    ctx.clone(),
+                    duration,
+                    *xudp,
+                    lease,
+                )
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP/VLESS认证超时"))??;
-            finish_auth();
-            crate::runtime::serve_plain_vless_scoped(
-                app,
-                accepted,
-                tag,
-                ctx.clone(),
-                duration,
-                *xudp,
-                lease,
-            )
-            .await
-        }
-        Inbound::TrojanXhttp { tag, users, .. } | Inbound::TrojanHttpUpgrade { tag, users, .. } => {
-            let mut app = app;
-            let request = timeout_at(deadline, trojan::read_request(&mut app, users))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP/Trojan认证超时"))??;
-            finish_auth();
-            match request.command {
-                Command::Connect => {
-                    crate::runtime::serve_trojan_connect(app, tag, ctx.clone(), &request).await
-                }
-                Command::UdpAssociate => {
-                    crate::udp::trojan_scoped(
-                        app,
-                        ctx.clone(),
-                        tag.clone(),
-                        lease,
-                        request.user.as_deref(),
-                    )
-                    .await
-                }
-                Command::Bind => Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "该协议不支持 BIND",
-                )),
             }
-        }
-        Inbound::VmessXhttp { tag, .. } | Inbound::VmessHttpUpgrade { tag, .. } => {
-            let mut app = app;
-            let prepared = vmess
-                .as_ref()
-                .ok_or_else(|| io::Error::other("VMess未准备"))?;
-            let accepted = timeout_at(deadline, prepared.handshake(&mut app, true))
+            Inbound::TrojanXhttp { tag, users, .. }
+            | Inbound::TrojanHttpUpgrade { tag, users, .. } => {
+                let mut app = app;
+                let request = timeout_at(deadline, trojan::read_request(&mut app, users))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "XHTTP/Trojan认证超时")
+                    })??;
+                finish_auth();
+                match request.command {
+                    Command::Connect => {
+                        crate::runtime::serve_trojan_connect(app, tag, ctx.clone(), &request).await
+                    }
+                    Command::UdpAssociate => {
+                        crate::udp::trojan_scoped(
+                            app,
+                            ctx.clone(),
+                            tag.clone(),
+                            lease,
+                            request.user.as_deref(),
+                        )
+                        .await
+                    }
+                    Command::Bind => Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "该协议不支持 BIND",
+                    )),
+                }
+            }
+            Inbound::VmessXhttp { tag, .. } | Inbound::VmessHttpUpgrade { tag, .. } => {
+                let mut app = app;
+                let prepared = vmess
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("VMess未准备"))?;
+                let accepted = timeout_at(deadline, prepared.handshake(&mut app, true))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "XHTTP/VMess认证超时")
+                    })??;
+                finish_auth();
+                let allow_udp = prepared.allow_udp();
+                crate::runtime::serve_vmess_scoped(
+                    app,
+                    accepted,
+                    tag,
+                    ctx.clone(),
+                    duration,
+                    allow_udp,
+                    lease,
+                )
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP/VMess认证超时"))??;
-            finish_auth();
-            let allow_udp = prepared.allow_udp();
-            crate::runtime::serve_vmess_scoped(
-                app,
-                accepted,
-                tag,
-                ctx.clone(),
-                duration,
-                allow_udp,
-                lease,
-            )
-            .await
+            }
+            _ => Err(io::Error::other("入口不是XHTTP/HTTPUpgrade")),
         }
-        _ => Err(io::Error::other("入口不是XHTTP/HTTPUpgrade")),
+    };
+    if let Some(lane) = lane {
+        tokio::select! {
+            biased;
+            _ = lane.failed.cancelled() => Err(closed()),
+            result = relay => result,
+        }
+    } else {
+        relay.await
     }
 }
 
@@ -1497,17 +1734,14 @@ impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for Tunnel<R, W> {
 
 /// 排队中的一段负载，连同它占用的字节预算 permit。
 ///
-/// permit 随数据一起入队；`ChannelReader` 读到下一段并替换 `current` 时，
-/// 上一段的 permit 才被 drop，预算随之归还。这样预算覆盖的是**真正还在
-/// 内存里的字节**，而不是「曾经写过多少」。
-type QueuedChunk = (Vec<u8>, tokio::sync::OwnedSemaphorePermit);
+/// permit 随数据一起入队，整段读完后与缓冲一起释放。
+type QueuedChunk = (Vec<u8>, OwnedSemaphorePermit);
 
 struct ChannelReader {
     rx: mpsc::Receiver<QueuedChunk>,
     _on_drop: tokio_util::sync::DropGuard,
     current: Vec<u8>,
-    /// 当前段持有的预算 permit；替换 `current` 时自动归还。
-    _current_budget: Option<tokio::sync::OwnedSemaphorePermit>,
+    current_budget: Option<OwnedSemaphorePermit>,
     offset: usize,
 }
 
@@ -1517,7 +1751,7 @@ impl ChannelReader {
             rx,
             _on_drop: lane.reader_closed.clone().drop_guard(),
             current: Vec::new(),
-            _current_budget: None,
+            current_budget: None,
             offset: 0,
         }
     }
@@ -1529,18 +1763,26 @@ impl AsyncRead for ChannelReader {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         loop {
             if self.offset < self.current.len() {
                 let take = buf.remaining().min(self.current.len() - self.offset);
                 buf.put_slice(&self.current[self.offset..self.offset + take]);
                 self.offset += take;
+                if self.offset == self.current.len() {
+                    self.current = Vec::new();
+                    self.current_budget = None;
+                    self.offset = 0;
+                }
                 return Poll::Ready(Ok(()));
             }
             match std::task::ready!(self.rx.poll_recv(cx)) {
+                Some((next, _)) if next.is_empty() => continue,
                 Some((next, permit)) => {
                     self.current = next;
-                    // 上一段的 permit 在这里被替换并释放。
-                    self._current_budget = Some(permit);
+                    self.current_budget = Some(permit);
                     self.offset = 0;
                 }
                 None => return Poll::Ready(Ok(())),
@@ -1853,6 +2095,64 @@ impl AsyncWrite for H2Writer {
     }
 }
 
+#[derive(Default)]
+struct H2SendWake {
+    write: AtomicWaker,
+    reset: AtomicWaker,
+}
+
+impl Wake for H2SendWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.reset.wake();
+        self.write.wake();
+    }
+}
+
+#[derive(Clone)]
+struct CancellableH2Writer {
+    inner: Arc<Mutex<H2Writer>>,
+    wake: Arc<H2SendWake>,
+}
+
+impl CancellableH2Writer {
+    async fn cancelled(&self) {
+        let waker = Waker::from(self.wake.clone());
+        let _ = std::future::poll_fn(|cx| {
+            self.wake.reset.register(cx.waker());
+            crate::sync::locked(&self.inner)
+                .send
+                .poll_reset(&mut TaskContext::from_waker(&waker))
+        })
+        .await;
+    }
+}
+
+impl AsyncWrite for CancellableH2Writer {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        // h2 的 reset 和写额度共用一个唤醒槽；Mux 可能从另一个任务写入。
+        self.wake.write.register(cx.waker());
+        let waker = Waker::from(self.wake.clone());
+        Pin::new(&mut *crate::sync::locked(&self.inner))
+            .poll_write(&mut TaskContext::from_waker(&waker), buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *crate::sync::locked(&self.inner)).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *crate::sync::locked(&self.inner)).poll_shutdown(cx)
+    }
+}
+
 fn find_head_end(buffer: &[u8]) -> Option<usize> {
     buffer
         .windows(4)
@@ -2075,7 +2375,7 @@ fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 /// Xray 把 packet-up 数据按 `key-N` 头块 / `key_N` Cookie 块承载，
 /// 每块是 URL-safe base64 无填充片段，拼接后整体解码。
-fn header_payload(xhttp: &Xhttp, headers: &HeaderMap) -> io::Result<Vec<u8>> {
+fn encoded_headers(xhttp: &Xhttp, headers: &HeaderMap) -> io::Result<String> {
     let key = xhttp.uplink_data_key().unwrap_or("X-Data");
     let max = xhttp.sc_max_each_post_bytes as usize;
     let mut encoded = String::new();
@@ -2095,30 +2395,30 @@ fn header_payload(xhttp: &Xhttp, headers: &HeaderMap) -> io::Result<Vec<u8>> {
         }
         encoded.push_str(value);
     }
-    decode_uplink_payload(&encoded, max)
+    Ok(encoded)
 }
 
-fn cookie_payload(xhttp: &Xhttp, headers: &HeaderMap) -> io::Result<Vec<u8>> {
+fn encoded_cookies(xhttp: &Xhttp, headers: &HeaderMap) -> io::Result<String> {
     let key = xhttp.uplink_data_key().unwrap_or("x_data");
     let max = xhttp.sc_max_each_post_bytes as usize;
     let Some(cookie) = header_value(headers, "cookie") else {
-        return Ok(Vec::new());
+        return Ok(String::new());
     };
     let mut encoded = String::new();
     for index in 0..=4_096 {
         let name = format!("{key}_{index}");
         let Some(value) = cookie.split(';').find_map(|pair| {
             let (cookie_name, value) = pair.trim().split_once('=')?;
-            (cookie_name == name && !value.is_empty()).then(|| value.to_owned())
+            (cookie_name == name && !value.is_empty()).then_some(value)
         }) else {
             break;
         };
         if encoded.len() + value.len() > max.saturating_mul(2) {
             return Err(too_large());
         }
-        encoded.push_str(&value);
+        encoded.push_str(value);
     }
-    decode_uplink_payload(&encoded, max)
+    Ok(encoded)
 }
 
 #[cfg(feature = "fuzzing")]
@@ -2126,6 +2426,7 @@ pub(crate) fn fuzz_decode_uplink(encoded: &str) {
     let _ = decode_uplink_payload(encoded, 64 * 1024);
 }
 
+#[cfg(feature = "fuzzing")]
 fn decode_uplink_payload(encoded: &str, max: usize) -> io::Result<Vec<u8>> {
     if encoded.is_empty() {
         return Ok(Vec::new());
@@ -2139,23 +2440,14 @@ fn decode_uplink_payload(encoded: &str, max: usize) -> io::Result<Vec<u8>> {
     Ok(decoded)
 }
 
-fn uplink_payload(xhttp: &Xhttp, headers: &HeaderMap, body: Vec<u8>) -> io::Result<Vec<u8>> {
-    let max = xhttp.sc_max_each_post_bytes as usize;
-    let payload = match xhttp.uplink_data_placement.as_str() {
-        "header" => header_payload(xhttp, headers)?,
-        "cookie" => cookie_payload(xhttp, headers)?,
-        "auto" => {
-            let mut payload = header_payload(xhttp, headers)?;
-            payload.extend_from_slice(&cookie_payload(xhttp, headers)?);
-            payload.extend_from_slice(&body);
-            payload
-        }
-        _ => body,
-    };
-    if payload.len() > max {
-        return Err(too_large());
-    }
-    Ok(payload)
+fn packet_error_status(error: &io::Error) -> io::Result<StatusCode> {
+    Ok(match error.kind() {
+        io::ErrorKind::InvalidData => StatusCode::PAYLOAD_TOO_LARGE,
+        io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+        io::ErrorKind::AlreadyExists => StatusCode::CONFLICT,
+        io::ErrorKind::WouldBlock => StatusCode::SERVICE_UNAVAILABLE,
+        _ => return Err(io::Error::new(error.kind(), error.to_string())),
+    })
 }
 
 fn percent_decode(value: &str) -> String {
@@ -2416,6 +2708,7 @@ pub(crate) async fn serve_quic(
     .map_err(|_| io::Error::other("XHTTP/3 QUIC 端点创建失败"))?;
     let connections = Arc::new(Semaphore::new(ctx.limits.max_connections.max(1)));
     let handshakes = Arc::new(Semaphore::new(ctx.limits.max_handshakes.max(1)));
+    let per_ip = crate::runtime::PerIpHandshakes::new(ctx.limits.per_ip_handshakes);
     let mut tasks = JoinSet::new();
     loop {
         tokio::select! {
@@ -2424,8 +2717,10 @@ pub(crate) async fn serve_quic(
             _ = stop.cancelled() => break,
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
-                let Ok(permit) = connections.clone().try_acquire_owned() else { continue };
-                let Ok(handshake) = handshakes.clone().try_acquire_owned() else { continue };
+                let Ok(permit) = connections.clone().try_acquire_owned() else { metrics_reject(&ctx); continue };
+                let Some(ip_guard) = per_ip.admit(incoming.remote_address().ip()) else { metrics_reject(&ctx); continue };
+                let Ok(handshake) = handshakes.clone().try_acquire_owned() else { metrics_reject(&ctx); continue };
+                let deadline = Instant::now() + Duration::from_millis(ctx.limits.handshake_timeout_ms);
                 let config = config.clone();
                 let vmess = vmess.clone();
                 let ctx = ctx.clone();
@@ -2435,14 +2730,13 @@ pub(crate) async fn serve_quic(
                 let tracker = ctx.children.clone();
                 tasks.spawn(tracker.track_future(async move {
                     let _permit = permit;
-                    let wait = Duration::from_millis(ctx.limits.handshake_timeout_ms);
-                    let accepted = timeout(wait, async move { incoming.await }).await;
+                    let accepted = timeout_at(deadline, async move { incoming.await }).await;
                     let Ok(Ok(connection)) = accepted else { return };
                     // 许可由认证成功释放，不是 QUIC 握手完成。
                     let auth = crate::runtime::AuthSlot::new(
-                        crate::runtime::HandshakePermits::new(handshake, None),
+                        crate::runtime::HandshakePermits::new(handshake, Some(ip_guard)),
                     );
-                    let _ = serve_h3_connection(connection, config, vmess, ctx, pool, stop, force, auth).await;
+                    let _ = serve_h3_connection(connection, config, vmess, ctx, pool, stop, force, auth, deadline).await;
                 }));
             }
             Some(_) = tasks.join_next() => {}
@@ -2494,23 +2788,42 @@ async fn serve_h3_connection(
     stop: CancellationToken,
     force: CancellationToken,
     auth: crate::runtime::AuthSlot,
+    absolute: Instant,
 ) -> io::Result<()> {
-    let mut connection = h3::server::Connection::<h3_quinn::Connection, Bytes>::new(
-        h3_quinn::Connection::new(connection),
+    struct CloseQuic(quinn::Connection);
+    impl Drop for CloseQuic {
+        fn drop(&mut self) {
+            self.0.close(0u32.into(), b"");
+        }
+    }
+    let _close = CloseQuic(connection.clone());
+    let mut connection = timeout_at(
+        absolute,
+        h3::server::Connection::<h3_quinn::Connection, Bytes>::new(h3_quinn::Connection::new(
+            connection,
+        )),
     )
     .await
+    .map_err(|_| auth_timeout())?
     .map_err(h3_error)?;
-    let deadline = Instant::now() + Duration::from_millis(ctx.limits.handshake_timeout_ms);
+    let duration = Duration::from_millis(ctx.limits.handshake_timeout_ms);
     let mut streams = JoinSet::new();
     loop {
         tokio::select! {
             biased;
             _ = force.cancelled() => break,
             _ = stop.cancelled() => break,
+            _ = tokio::time::sleep_until(absolute), if auth.pending() => {
+                if auth.pending() { return Err(auth_timeout()); }
+            }
+            Some(_) = streams.join_next() => {}
             accepted = connection.accept() => {
                 let Some(resolver) = accepted.map_err(h3_error)? else { break };
-                let (request, stream) =
-                    resolver.resolve_request().await.map_err(h3_error)?;
+                if streams.len() >= H3_MAX_BIDI_STREAMS as usize {
+                    metrics_reject(&ctx);
+                    continue;
+                }
+                let deadline = if auth.pending() { absolute } else { Instant::now() + duration };
                 let config = config.clone();
                 let vmess = vmess.clone();
                 let ctx = ctx.clone();
@@ -2518,15 +2831,17 @@ async fn serve_h3_connection(
                 let auth = auth.clone();
                 let tracker = ctx.children.clone();
                 streams.spawn(tracker.track_future(async move {
-                    if let Err(error) =
+                    let result = async {
+                        let (request, stream) = timeout_at(deadline, resolver.resolve_request())
+                            .await.map_err(|_| auth_timeout())?.map_err(h3_error)?;
                         handle_h3(request, stream, &config, &vmess, &ctx, &pool, deadline, &auth).await
-                    {
+                    }.await;
+                    if let Err(error) = result {
                         metrics_reject(&ctx);
                         let _ = error;
                     }
                 }));
             }
-            Some(_) = streams.join_next() => {}
         }
     }
     let shutdown = Duration::from_millis(ctx.limits.shutdown_timeout_ms);
@@ -2570,40 +2885,37 @@ async fn handle_h3(
     )?;
     padding(xhttp, &query, request.headers())?;
     if !mode_allows(xhttp, request.method(), session.is_some(), seq.is_some()) {
-        reject_h3(&mut stream, xhttp, StatusCode::BAD_REQUEST).await;
+        reject_h3(&mut stream, xhttp, StatusCode::BAD_REQUEST, absolute).await;
         return Ok(());
     }
     if *request.method() == Method::GET {
         let (Some(session_id), None) = (session, seq) else {
-            reject_h3(&mut stream, xhttp, StatusCode::BAD_REQUEST).await;
+            reject_h3(&mut stream, xhttp, StatusCode::BAD_REQUEST, absolute).await;
             return Ok(());
         };
         let lane = match pool.get(&session_id) {
             Some(lane) => lane,
             None => pool.open(session_id.clone())?,
         };
-        // 同 h1/h2：标记晚于所有可能提前返回的步骤，避免槽位泄漏。
-        let Some(rx) = lane.take_reader().await else {
-            reject_h3(&mut stream, xhttp, StatusCode::CONFLICT).await;
+        let Some(rx) = lane.take_reader() else {
+            reject_h3(&mut stream, xhttp, StatusCode::CONFLICT, absolute).await;
             return Ok(());
         };
-        if let Err(error) = stream.send_response(response_head(xhttp)?).await {
-            pool.remove(&session_id);
-            return Err(h3_error(error));
-        }
-        lane.mark_connected();
+        let _session = lane.claim(pool)?;
+        timeout_at(absolute, stream.send_response(response_head(xhttp)?))
+            .await
+            .map_err(|_| auth_timeout())?
+            .map_err(h3_error)?;
         let (send, recv) = stream.split();
         let (tx, out) = mpsc::channel::<Bytes>(8);
+        let cancelled = h3_cancelled(send.quic_stream().stopped());
         // recv 只用于保持请求句柄存活到下行结束，不读取客户端请求体。
-        tokio::spawn(async move {
+        let writer = tokio_util::task::AbortOnDropHandle::new(ctx.children.spawn(async move {
             let _recv = recv;
-            pump_h3(send, out).await;
-        });
-        let tunnel = Tunnel::new(
-            ChannelReader::new(rx, &lane),
-            FinishOnDrop::new(H3Sender::new(tx)),
-        );
-        let result = dispatch(
+            pump_h3(send, out).await
+        }));
+        let tunnel = Tunnel::new(ChannelReader::new(rx, &lane), H3Sender::new(tx));
+        let relay = dispatch(
             tunnel,
             config,
             vmess,
@@ -2611,24 +2923,46 @@ async fn handle_h3(
             absolute,
             Some(&lane),
             Some(auth),
+        );
+        tokio::select! {
+            biased;
+            _ = cancelled => return Err(closed()),
+            result = relay => result?,
+        }
+        timeout(
+            Duration::from_millis(ctx.limits.handshake_timeout_ms),
+            writer,
         )
-        .await;
-        pool.remove(&session_id);
-        result
+        .await
+        .map_err(|_| auth_timeout())?
+        .map_err(io::Error::other)?
     } else if *request.method() == Method::POST {
         if session.is_none() {
-            stream
-                .send_response(response_head(xhttp)?)
+            timeout_at(absolute, stream.send_response(response_head(xhttp)?))
                 .await
+                .map_err(|_| auth_timeout())?
                 .map_err(h3_error)?;
             let (send, recv) = stream.split();
             let (tx, out) = mpsc::channel::<Bytes>(8);
-            tokio::spawn(pump_h3(send, out));
-            let tunnel = Tunnel::new(H3Reader::new(recv), FinishOnDrop::new(H3Sender::new(tx)));
-            return dispatch(tunnel, config, vmess, ctx, absolute, None, Some(auth)).await;
+            let cancelled = h3_cancelled(send.quic_stream().stopped());
+            let writer =
+                tokio_util::task::AbortOnDropHandle::new(ctx.children.spawn(pump_h3(send, out)));
+            let tunnel = Tunnel::new(H3Reader::new(recv), H3Sender::new(tx));
+            tokio::select! {
+                biased;
+                _ = cancelled => return Err(closed()),
+                result = dispatch(tunnel, config, vmess, ctx, absolute, None, Some(auth)) => result?,
+            }
+            return timeout(
+                Duration::from_millis(ctx.limits.handshake_timeout_ms),
+                writer,
+            )
+            .await
+            .map_err(|_| auth_timeout())?
+            .map_err(io::Error::other)?;
         }
         let Some(session_id) = session else {
-            reject_h3(&mut stream, xhttp, StatusCode::BAD_REQUEST).await;
+            reject_h3(&mut stream, xhttp, StatusCode::BAD_REQUEST, absolute).await;
             return Ok(());
         };
         if seq.is_none() {
@@ -2636,56 +2970,68 @@ async fn handle_h3(
                 Some(lane) => lane,
                 None => pool.open(session_id.clone())?,
             };
-            if !lane.attach_upload() {
-                reject_h3(&mut stream, xhttp, StatusCode::CONFLICT).await;
+            if !lane.attach_upload(auth) {
+                reject_h3(&mut stream, xhttp, StatusCode::CONFLICT, absolute).await;
                 return Ok(());
             }
-            while let Some(mut chunk) = stream.recv_data().await.map_err(h3_error)? {
-                while chunk.has_remaining() {
-                    let take = chunk.remaining().min(STREAM_CHUNK);
-                    lane.push_with_budget(chunk.copy_to_bytes(take).to_vec())
-                        .await?;
+            let cancelled = h3_cancelled(stream.quic_stream().stopped());
+            drive_upload(&lane, absolute, async {
+                let upload = async {
+                    while let Some(mut chunk) = stream.recv_data().await.map_err(h3_error)? {
+                        while chunk.has_remaining() {
+                            let bytes = chunk.chunk();
+                            let take = bytes.len().min(STREAM_CHUNK);
+                            lane.push_with_budget(&bytes[..take]).await?;
+                            chunk.advance(take);
+                        }
+                    }
+                    Ok(())
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancelled => Err(closed()),
+                    result = upload => result,
+                }
+            })
+            .await?;
+            let deadline = Instant::now() + Duration::from_millis(ctx.limits.handshake_timeout_ms);
+            timeout_at(deadline, finish_h3(&mut stream, xhttp))
+                .await
+                .map_err(|_| auth_timeout())?;
+            return Ok(());
+        }
+        let Some(seq) = seq else {
+            reject_h3(&mut stream, xhttp, StatusCode::BAD_REQUEST, absolute).await;
+            return Ok(());
+        };
+        let cancelled = h3_cancelled(stream.quic_stream().stopped());
+        let upload = async {
+            let result = async {
+                let mut packet = PacketBody::new(&pool.buffer_bytes, xhttp, request.headers())?;
+                while let Some(chunk) = stream.recv_data().await.map_err(h3_error)? {
+                    packet.append(chunk)?;
+                }
+                let lane = pool.open(session_id)?;
+                lane.push_seq(seq, packet.chunk, packet.limit, Some(auth))
+                    .await
+            }
+            .await;
+            match result {
+                Ok(()) => finish_h3(&mut stream, xhttp).await,
+                Err(error) => {
+                    reject_h3(&mut stream, xhttp, packet_error_status(&error)?, absolute).await
                 }
             }
-            // 持续POST的EOF只结束上行；业务下行仍由GET独立驱动。
-            lane.end_upload().await;
-            finish_h3(&mut stream, xhttp).await;
-            return Ok(());
+            Ok::<(), io::Error>(())
+        };
+        tokio::select! {
+            biased;
+            _ = cancelled => return Err(closed()),
+            result = timeout_at(absolute, upload) => result.map_err(|_| auth_timeout())??,
         }
-        let mut payload = Vec::new();
-        while let Some(mut chunk) = stream.recv_data().await.map_err(h3_error)? {
-            let size = chunk.remaining();
-            if payload.len() + size > xhttp.sc_max_each_post_bytes as usize {
-                reject_h3(&mut stream, xhttp, StatusCode::PAYLOAD_TOO_LARGE).await;
-                return Ok(());
-            }
-            payload.extend_from_slice(&chunk.copy_to_bytes(size));
-        }
-        let payload = match uplink_payload(xhttp, request.headers(), payload) {
-            Ok(payload) => payload,
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                reject_h3(&mut stream, xhttp, StatusCode::PAYLOAD_TOO_LARGE).await;
-                return Ok(());
-            }
-            Err(_) => {
-                reject_h3(&mut stream, xhttp, StatusCode::BAD_REQUEST).await;
-                return Ok(());
-            }
-        };
-        let lane = match pool.get(&session_id) {
-            Some(lane) => lane,
-            None => pool.open(session_id.clone())?,
-        };
-        let Some(seq) = seq else {
-            reject_h3(&mut stream, xhttp, StatusCode::BAD_REQUEST).await;
-            return Ok(());
-        };
-        lane.push_seq(seq, payload, xhttp.sc_max_each_post_bytes as usize)
-            .await?;
-        finish_h3(&mut stream, xhttp).await;
         Ok(())
     } else {
-        reject_h3(&mut stream, xhttp, StatusCode::METHOD_NOT_ALLOWED).await;
+        reject_h3(&mut stream, xhttp, StatusCode::METHOD_NOT_ALLOWED, absolute).await;
         Ok(())
     }
 }
@@ -2703,25 +3049,36 @@ async fn reject_h3(
     stream: &mut RequestStream<BidiStream<Bytes>, Bytes>,
     xhttp: &Xhttp,
     status: StatusCode,
+    deadline: Instant,
 ) {
     let Ok(response) = status_head(xhttp, status) else {
         return;
     };
-    let _ = stream.send_response(response).await;
-    let _ = stream.finish().await;
+    let _ = timeout_at(deadline, async {
+        stream.send_response(response).await?;
+        stream.finish().await
+    })
+    .await;
 }
 
 /// 把下行字节写入 HTTP/3 响应体；通道关闭即结束流。
 async fn pump_h3(
     mut send: RequestStream<H3SendStream<Bytes>, Bytes>,
     mut rx: mpsc::Receiver<Bytes>,
-) {
+) -> io::Result<()> {
     while let Some(chunk) = rx.recv().await {
-        if send.send_data(chunk).await.is_err() {
-            return;
-        }
+        send.send_data(chunk).await.map_err(h3_error)?;
     }
-    let _ = send.finish().await;
+    send.finish().await.map_err(h3_error)
+}
+
+async fn h3_cancelled(
+    stopped: impl Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>>,
+) {
+    if matches!(stopped.await, Ok(None)) {
+        // 正常下行 FIN 不取消仍在进行的上行。
+        std::future::pending::<()>().await;
+    }
 }
 
 /// HTTP/3 请求体读取器；DATA 帧本身就是原始字节，无需 chunked 解码。
@@ -2816,6 +3173,216 @@ impl AsyncWrite for H3Sender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn paired_auth_releases_upload_permit_before_upload_is_polled_again() {
+        let xhttp = serde_json::from_str(r#"{"path":"/x"}"#).unwrap();
+        let pool = Pool::new(
+            &xhttp,
+            &Limits::default(),
+            Arc::new(Semaphore::new(4)),
+            Arc::default(),
+        );
+        let lane = pool.open("upload".into()).unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+        let auth = AuthSlot::new(crate::runtime::HandshakePermits::new(
+            slots.clone().try_acquire_owned().unwrap(),
+            None,
+        ));
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert!(lane.attach_upload(&auth));
+        let upload = drive_upload(&lane, deadline, std::future::pending());
+        tokio::pin!(upload);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(upload.as_mut().poll(cx).is_pending())).await
+        );
+        tokio::time::advance(Duration::from_millis(99)).await;
+        lane.finish_auth();
+        tokio::time::advance(Duration::from_millis(2)).await;
+        // 模拟连接驱动先到期检查，上传任务未再次轮询。
+        assert!(Instant::now() >= deadline);
+        assert!(!auth.pending());
+        assert_eq!(slots.available_permits(), 1);
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(upload.as_mut().poll(cx).is_pending())).await
+        );
+    }
+
+    #[tokio::test]
+    async fn packet_budget_is_charged_before_buffering_and_returned_on_consumption() {
+        let xhttp: Xhttp = serde_json::from_str(r#"{"path":"/x"}"#).unwrap();
+        let budget = Arc::new(Semaphore::new(4));
+        let pool = Pool::new(&xhttp, &Limits::default(), budget.clone(), Arc::default());
+        let lane = pool.open("queue".into()).unwrap();
+        let mut reader = ChannelReader::new(lane.take_reader().unwrap(), &lane);
+        let mut rejected = PacketBody::new(&budget, &xhttp, &HeaderMap::new()).unwrap();
+        assert!(rejected.append(&b"12345"[..]).is_err());
+        assert_eq!(rejected.chunk.0.capacity(), 0);
+        drop(rejected);
+        let mut accepted = PacketBody::new(&budget, &xhttp, &HeaderMap::new()).unwrap();
+        accepted.append(&b"data"[..]).unwrap();
+        assert_eq!(budget.available_permits(), 0);
+        lane.push_seq(0, accepted.chunk, accepted.limit, None)
+            .await
+            .unwrap();
+        let mut data = [0; 4];
+        reader.read_exact(&mut data).await.unwrap();
+        assert_eq!(&data, b"data");
+        assert_eq!(budget.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn cancelling_downlink_removes_session_and_pending_bytes() {
+        let xhttp: Xhttp = serde_json::from_str(r#"{"path":"/x"}"#).unwrap();
+        let budget = Arc::new(Semaphore::new(4));
+        let pool = Pool::new(&xhttp, &Limits::default(), budget.clone(), Arc::default());
+        let lane = pool.open("cancelled".into()).unwrap();
+        lane.push_seq(1, (b"data".to_vec(), reserve(&budget, 4).unwrap()), 4, None)
+            .await
+            .unwrap();
+        let guard = lane.claim(&pool).unwrap();
+        drop(guard);
+        assert!(pool.get("cancelled").is_none());
+        assert_eq!(budget.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn cancelling_packet_waiting_to_enqueue_does_not_consume_sequence() {
+        let xhttp: Xhttp =
+            serde_json::from_str(r#"{"path":"/x","sc_max_buffered_posts":1}"#).unwrap();
+        let budget = Arc::new(Semaphore::new(4));
+        let pool = Pool::new(&xhttp, &Limits::default(), budget.clone(), Arc::default());
+        let lane = pool.open("waiting".into()).unwrap();
+        let packet = |byte| (vec![byte], reserve(&budget, 1).unwrap());
+        lane.push_seq(0, packet(b'a'), 4, None).await.unwrap();
+        {
+            let push = lane.push_seq(1, packet(b'x'), 4, None);
+            tokio::pin!(push);
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(push.as_mut().poll(cx).is_pending())).await
+            );
+        }
+        assert_eq!(budget.available_permits(), 3);
+        let mut reader = ChannelReader::new(lane.take_reader().unwrap(), &lane);
+        assert_eq!(reader.read_u8().await.unwrap(), b'a');
+        lane.push_seq(1, packet(b'b'), 4, None).await.unwrap();
+        assert_eq!(reader.read_u8().await.unwrap(), b'b');
+        assert_eq!(budget.available_permits(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_partial_enqueue_reclaims_unpaired_session() {
+        let xhttp: Xhttp = serde_json::from_value(serde_json::json!({
+            "path": "/x", "sc_max_buffered_posts": 1, "session_ttl_ms": 30_000
+        }))
+        .unwrap();
+        let budget = Arc::new(Semaphore::new(4));
+        let limits = Limits {
+            max_xhttp_sessions: 1,
+            ..Limits::default()
+        };
+        let pool = Pool::new(&xhttp, &limits, budget.clone(), Arc::default());
+        let lane = pool.open("unpaired".into()).unwrap();
+        let packet = |byte| (vec![byte], reserve(&budget, 1).unwrap());
+        lane.push_seq(1, packet(b'b'), 4, None).await.unwrap();
+        {
+            let push = lane.push_seq(0, packet(b'a'), 4, None);
+            tokio::pin!(push);
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(push.as_mut().poll(cx).is_pending())).await
+            );
+            assert_eq!(crate::sync::locked(&lane.state).next_seq, 1);
+        }
+        assert_eq!(budget.available_permits(), 4);
+        drop(lane);
+        timeout(Duration::from_millis(500), async {
+            while pool.get("unpaired").is_some() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("未配对的已关闭会话不能继续占用名额");
+        assert!(pool.open("replacement".into()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_packet_enqueue_ends_paired_downlink() {
+        let id = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        let config = crate::config::Config::from_json(
+            &include_str!("../../examples/vless-xhttp.json")
+                .replace("REPLACE_WITH_A_RANDOM_VLESS_XHTTP_UUID_BEFORE_USE", id),
+        )
+        .unwrap();
+        let inbound = &config.inbounds[0];
+        let ctx = Arc::new(Context::new(&config).unwrap());
+        let mut xhttp = xhttp_config(inbound).unwrap().clone();
+        xhttp.sc_max_buffered_posts = 1;
+        let budget = Arc::new(Semaphore::new(128));
+        let limits = Limits {
+            max_xhttp_sessions: 1,
+            ..Limits::default()
+        };
+        let pool = Pool::new(&xhttp, &limits, budget.clone(), ctx.stats.clone());
+        let lane = pool.open("paired".into()).unwrap();
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut request = vec![0];
+        request.extend_from_slice(&crate::config::parse_uuid(id).unwrap());
+        request.extend_from_slice(&[0, 1]);
+        request.extend_from_slice(&target.local_addr().unwrap().port().to_be_bytes());
+        request.extend_from_slice(&[1, 127, 0, 0, 1]);
+        request.extend_from_slice(b"ping");
+        let packet = |data: Vec<u8>| {
+            let permit = reserve(&budget, data.len()).unwrap();
+            (data, permit)
+        };
+        lane.push_seq(0, packet(request), 64, None).await.unwrap();
+        let (writer, mut client) = tokio::io::duplex(64);
+        let reader = ChannelReader::new(lane.take_reader().unwrap(), &lane);
+        let relay = async {
+            let _session = lane.claim(&pool).unwrap();
+            dispatch(
+                Tunnel::new(reader, writer),
+                inbound,
+                &None,
+                &ctx,
+                Instant::now() + Duration::from_secs(2),
+                Some(&lane),
+                None,
+            )
+            .await
+        };
+        tokio::pin!(relay);
+        let ready = async {
+            let (mut peer, _) = target.accept().await.unwrap();
+            let mut bytes = [0; 4];
+            client.read_exact(&mut bytes[..2]).await.unwrap();
+            assert_eq!(&bytes[..2], b"\x00\x00");
+            peer.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"ping");
+            peer
+        };
+        let _peer = tokio::select! {
+            result = &mut relay => panic!("中继提前结束: {result:?}"),
+            peer = timeout(Duration::from_secs(2), ready) => peer.unwrap(),
+        };
+        lane.push_seq(2, packet(vec![2]), 64, None).await.unwrap();
+        {
+            let push = lane.push_seq(1, packet(vec![1]), 64, None);
+            tokio::pin!(push);
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(push.as_mut().poll(cx).is_pending())).await
+            );
+            assert_eq!(crate::sync::locked(&lane.state).next_seq, 2);
+        }
+        let error = timeout(Duration::from_millis(500), relay)
+            .await
+            .expect("目标未主动关闭时也应结束下行")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(pool.get("paired").is_none());
+        assert_eq!(ctx.stats.snapshot().tcp_flows, 0);
+        assert_eq!(budget.available_permits(), 128);
+    }
 
     #[test]
     fn head_and_meta_are_strict() {

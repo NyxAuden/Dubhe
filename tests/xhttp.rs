@@ -512,6 +512,30 @@ async fn wrong_path_and_oversized_padding_are_rejected() {
 }
 
 #[tokio::test]
+async fn h2c_accepts_a_split_preface() {
+    let server = Running::start(config("auto")).await;
+    let mut socket = connect(&server).await;
+    socket.set_nodelay(true).unwrap();
+    socket.write_all(b"PRI ").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    socket
+        .write_all(b"* HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .unwrap();
+    socket
+        .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut frame = [0; 9];
+    timeout(Duration::from_secs(2), socket.read_exact(&mut frame))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame[3], 4, "应收到 HTTP/2 SETTINGS");
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn h2c_stream_one_relays_through_the_h2_adapter() {
     let echo = Echo::tcp("127.0.0.1", false).await;
     let running = Running::start(config("auto")).await;
@@ -538,6 +562,45 @@ async fn h2c_stream_one_relays_through_the_h2_adapter() {
         }
     }
     assert!(out.windows(7).any(|window| window == b"h2-ping"));
+}
+
+#[tokio::test]
+async fn h2_stream_can_authenticate_after_the_connection_deadline() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let mut value = config("auto");
+    value["limits"]["handshake_timeout_ms"] = json!(500);
+    let server = Running::start(value).await;
+    let (mut client, connection) = h2::client::handshake(connect(&server).await).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let mut body = vless_request(echo.address);
+    body.extend_from_slice(b"ping");
+    for round in 0..2 {
+        if round == 1 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+        let request = http::Request::post("/GunService/Tun").body(()).unwrap();
+        let (response, mut send) = client.send_request(request, false).unwrap();
+        let mut incoming = timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_body();
+        send.send_data(Bytes::copy_from_slice(&body), true).unwrap();
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = incoming.data().await {
+                received.extend_from_slice(&chunk.unwrap());
+                if received.ends_with(b"ping") {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, b"\x00\x00ping");
+    }
+    driver.abort();
+    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -1329,6 +1392,28 @@ struct H3Client {
 }
 
 async fn h3_connect(running: &Running, cert: &common::Certificate) -> H3Client {
+    h3_connect_at(running.address, cert).await
+}
+
+async fn h3_connect_at(address: SocketAddr, cert: &common::Certificate) -> H3Client {
+    let (endpoint, connection) = h3_quic_connect(address, cert).await.unwrap();
+    let (mut connection, send) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .unwrap();
+    let driver = tokio::spawn(async move {
+        let _ = connection.wait_idle().await;
+    });
+    H3Client {
+        endpoint,
+        send,
+        driver,
+    }
+}
+
+async fn h3_quic_connect(
+    address: SocketAddr,
+    cert: &common::Certificate,
+) -> Result<(quinn::Endpoint, quinn::Connection), quinn::ConnectionError> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.der.clone()).unwrap();
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -1351,23 +1436,11 @@ async fn h3_connect(running: &Running, cert: &common::Certificate) -> H3Client {
     endpoint.set_default_client_config(client);
     let connection = timeout(
         Duration::from_secs(3),
-        endpoint.connect(running.address, "localhost").unwrap(),
+        endpoint.connect(address, "localhost").unwrap(),
     )
     .await
-    .expect("QUIC 握手不应挂起")
-    .expect("QUIC 握手应成功");
-
-    let (mut connection, send) = h3::client::new(h3_quinn::Connection::new(connection))
-        .await
-        .unwrap();
-    let driver = tokio::spawn(async move {
-        let _ = connection.wait_idle().await;
-    });
-    H3Client {
-        endpoint,
-        send,
-        driver,
-    }
+    .expect("QUIC 握手不应挂起")?;
+    Ok((endpoint, connection))
 }
 
 impl Drop for H3Client {
@@ -1375,6 +1448,24 @@ impl Drop for H3Client {
         self.endpoint.close(quinn::VarInt::from_u32(0), b"");
         self.driver.abort();
     }
+}
+
+#[tokio::test]
+async fn h3_unauthenticated_connection_holds_per_ip_slot_only_until_deadline() {
+    let cert = common::Certificate::new();
+    let mut value = h3_config(&cert, "auto");
+    value["limits"] = json!({"per_ip_handshakes": 1, "handshake_timeout_ms": 900});
+    let server = Running::start(value).await;
+    let (_endpoint, first) = h3_quic_connect(server.address, &cert).await.unwrap();
+    let rejected = server.stats.snapshot().rejected;
+    assert!(h3_quic_connect(server.address, &cert).await.is_err());
+    assert!(server.stats.snapshot().rejected > rejected);
+    timeout(Duration::from_millis(1500), first.closed())
+        .await
+        .expect("未认证连接必须在期限内关闭");
+    let next = h3_connect(&server, &cert).await;
+    drop(next);
+    server.shutdown().await;
 }
 
 async fn h3_read_body(
@@ -1494,6 +1585,246 @@ async fn h3_packet_up_posts_feed_a_get_downlink() {
             .any(|window| window == b"h3-packet"),
         "{data:?}"
     );
+}
+
+#[tokio::test]
+async fn packet_budget_is_shared_between_tcp_and_h3() {
+    let cert = common::Certificate::new();
+    let mut value = h3_config(&cert, "packet-up");
+    let h3 = value["inbounds"][0].clone();
+    value["inbounds"][0] = config("packet-up")["inbounds"][0].clone();
+    value["inbounds"].as_array_mut().unwrap().push(h3);
+    value["inbounds"][1]["tag"] = json!("h3");
+    value["limits"]["xhttp_buffer_bytes"] = json!(128);
+    let server = Running::start(value).await;
+    let mut client = h3_connect_at(server.addresses[1], &cert).await;
+    timeout(Duration::from_secs(3), async {
+        let post_h3 = |seq| {
+            http::Request::post(format!("https://localhost/GunService/Tun/h3/{seq}"))
+                .body(())
+                .unwrap()
+        };
+        for (seq, len, status) in [(0, 64, 200), (1, 1, 503)] {
+            if seq == 1 {
+                let reply = packet_reply(
+                    server.address,
+                    "tcp/0",
+                    "Content-Length: 64",
+                    &[0; 64],
+                    false,
+                )
+                .await;
+                assert!(reply.starts_with(b"HTTP/1.1 200 "));
+            }
+            let mut stream = client.send.send_request(post_h3(seq)).await.unwrap();
+            stream.send_data(Bytes::from(vec![0; len])).await.unwrap();
+            stream.finish().await.unwrap();
+            assert_eq!(stream.recv_response().await.unwrap().status(), status);
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn h3_split_upload_and_later_requests_survive_first_auth_deadline() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let cert = common::Certificate::new();
+    let mut value = h3_config(&cert, "auto");
+    value["limits"]["handshake_timeout_ms"] = json!(700);
+    let server = Running::start(value).await;
+    let mut up = h3_connect(&server, &cert).await;
+    let mut down = h3_connect(&server, &cert).await;
+    let mut upload = up
+        .send
+        .send_request(
+            http::Request::post("https://localhost/GunService/Tun/live")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut get = down
+        .send
+        .send_request(
+            http::Request::get("https://localhost/GunService/Tun/live")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    get.finish().await.unwrap();
+    let mut body = vless_request(echo.address);
+    body.extend_from_slice(b"first");
+    upload.send_data(Bytes::from(body)).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), get.recv_response())
+            .await
+            .unwrap()
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(h3_read_until(&mut get, b"first").await, b"\x00\x00first");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    upload
+        .send_data(Bytes::from_static(b"second"))
+        .await
+        .unwrap();
+    assert_eq!(h3_read_until(&mut get, b"second").await, b"second");
+    // Drop 也释放 pending read 所持有的 Quinn 接收半流，连接保持打开。
+    drop(get);
+    wait_for_closed_session(&server).await;
+    assert_eq!(
+        timeout(Duration::from_secs(2), upload.recv_response())
+            .await
+            .unwrap()
+            .unwrap()
+            .status(),
+        200
+    );
+    let mut next = up
+        .send
+        .send_request(
+            http::Request::post("https://localhost/GunService/Tun")
+                .body(())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut body = vless_request(echo.address);
+    body.extend_from_slice(b"third");
+    next.send_data(Bytes::from(body)).await.unwrap();
+    next.finish().await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), next.recv_response())
+            .await
+            .unwrap()
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(h3_read_until(&mut next, b"third").await, b"\x00\x00third");
+    drop((up, down));
+    let stats = server.stats.clone();
+    server.shutdown().await;
+    assert_eq!(stats.snapshot().xhttp_sessions, 0);
+}
+
+async fn wait_for_closed_session(server: &Running) {
+    timeout(Duration::from_secs(2), async {
+        while server.stats.snapshot().xhttp_sessions != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("取消下行流后必须立即归还会话名额");
+}
+
+#[tokio::test]
+async fn h2_reset_reclaims_session_without_closing_connection() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let mut value = config("auto");
+    value["limits"]["max_xhttp_sessions"] = json!(1);
+    let server = Running::start(value).await;
+    let (mut client, connection) = h2::client::handshake(connect(&server).await).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let mut upload = vless_request(echo.address);
+    upload.extend_from_slice(b"ping");
+    for id in ["first", "next"] {
+        let uri = format!("/GunService/Tun/{id}");
+        let (get, mut control) = client
+            .send_request(http::Request::get(&uri).body(()).unwrap(), true)
+            .unwrap();
+        let mut down = timeout(Duration::from_secs(2), get)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_body();
+        let (response, mut send) = client
+            .send_request(
+                http::Request::post(format!("{uri}/0")).body(()).unwrap(),
+                false,
+            )
+            .unwrap();
+        send.send_data(Bytes::copy_from_slice(&upload), true)
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), response)
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+            200
+        );
+        timeout(Duration::from_secs(2), async {
+            let mut read = Vec::new();
+            while read.len() < 6 {
+                read.extend_from_slice(&down.data().await.unwrap().unwrap());
+            }
+            assert_eq!(read, b"\x00\x00ping");
+        })
+        .await
+        .unwrap();
+        assert_eq!(server.stats.snapshot().xhttp_sessions, 1);
+        control.send_reset(h2::Reason::CANCEL);
+        wait_for_closed_session(&server).await;
+    }
+    driver.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn h2_reset_reclaims_session_after_upload_eof() {
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = target.local_addr().unwrap();
+    let mut value = config("stream-up");
+    value["limits"]["max_xhttp_sessions"] = json!(1);
+    let server = Running::start(value).await;
+    let (mut client, connection) = h2::client::handshake(connect(&server).await).await.unwrap();
+    let driver = tokio::spawn(connection);
+    for id in ["first", "next"] {
+        let peer = async {
+            let (mut peer, _) = target.accept().await.unwrap();
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, b"ping");
+            peer.write_all(b"pong").await.unwrap();
+            peer
+        };
+        let tunnel = async {
+            let uri = format!("/GunService/Tun/{id}");
+            let (get, control) = client
+                .send_request(http::Request::get(&uri).body(()).unwrap(), true)
+                .unwrap();
+            let mut down = get.await.unwrap().into_body();
+            let (post, mut send) = client
+                .send_request(http::Request::post(&uri).body(()).unwrap(), false)
+                .unwrap();
+            let mut upload = vless_request(address);
+            upload.extend_from_slice(b"ping");
+            send.send_data(Bytes::from(upload), true).unwrap();
+            assert_eq!(post.await.unwrap().status(), 200);
+            let mut reply = Vec::new();
+            while reply.len() < 6 {
+                reply.extend_from_slice(&down.data().await.unwrap().unwrap());
+            }
+            assert_eq!(reply, b"\x00\x00pong");
+            (control, down)
+        };
+        let (peer, (mut control, _down)) =
+            timeout(Duration::from_secs(2), async { tokio::join!(peer, tunnel) })
+                .await
+                .expect("上传 EOF 后仍须交付下行");
+        assert_eq!(server.stats.snapshot().xhttp_sessions, 1);
+        control.send_reset(h2::Reason::CANCEL);
+        wait_for_closed_session(&server).await;
+        drop(peer);
+    }
+    driver.abort();
+    server.shutdown().await;
 }
 
 // --- Xray extra 配置兼容：解析、冲突、拒绝与运行时生效 ---

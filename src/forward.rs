@@ -1,4 +1,9 @@
-use std::{io, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
@@ -18,10 +23,10 @@ use crate::{
 };
 
 #[derive(Debug)]
-struct RouteRejected;
+struct RouteRejected(&'static str);
 impl std::fmt::Display for RouteRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("路由拒绝")
+        f.write_str(self.0)
     }
 }
 impl std::error::Error for RouteRejected {}
@@ -238,7 +243,7 @@ impl Context {
 
     /// 基于旧实例的共享基础设施构造热重载后的 `Context`。
     ///
-    /// 统计、活动连接、子任务跟踪与 UDP 预算保持同一实例；仅替换路由、DNS、
+    /// 统计、活动连接、子任务跟踪与 UDP/XHTTP 预算保持同一实例；仅替换路由、DNS、
     /// 嗅探与反向 portal 配置。
     pub(crate) fn reloaded(config: &Config, previous: &Context) -> anyhow::Result<Self> {
         let router = Router::new(config)?;
@@ -355,40 +360,117 @@ impl Context {
         &self,
         inbound: &str,
         network: Network,
+        route: &Target,
         target: &Target,
         allow_udp_proxy: bool,
     ) -> io::Result<Selected> {
-        let mut selected = self.router.select_outbound(inbound, network, target);
-        let is_domain = matches!(target.host, Host::Domain(_));
+        let literal = match target.host {
+            Host::Ip(ip) => Some([ip]),
+            Host::Domain(_) => None,
+        };
+        let original_ip_policy = route != target
+            && self
+                .router
+                .has_ip_candidates(inbound, network, target, target.port);
+        let ip_policy = original_ip_policy
+            || self
+                .router
+                .has_ip_candidates(inbound, network, route, target.port);
+        let mut selected = self.router.select_for_target(
+            inbound,
+            network,
+            route,
+            target.port,
+            literal.as_ref().map(|ips| ips.as_slice()),
+        );
         // 两种解析理由，任一成立就要解析：
         // 1. **安全**：有规则因缺少地址而无法判定（`NeedIp`）。这跟
         //    `domain_strategy` 无关——否则默认的 `as-is` 会让 IP 规则永不生效。
         // 2. **选路**：`ip-if-non-match` 下没有任何规则命中时，按解析结果重试。
-        let needs_ip = is_domain && self.router.has_ip_candidates(inbound, network, target);
-        let retry_by_strategy = is_domain
+        let needs_ip = literal.is_none() && ip_policy;
+        let retry_by_strategy = literal.is_none()
             && !selected.matched
             && self.router.domain_strategy() == DomainStrategy::IpIfNonMatch;
-        if (needs_ip || retry_by_strategy)
-            && let Ok(addresses) = self.dns.resolve(target).await
-        {
-            let ips: Vec<IpAddr> = addresses.iter().map(|address| address.ip()).collect();
-            if !ips.is_empty() {
-                selected = self
-                    .router
-                    .select_with(inbound, network, target, Some(&ips));
-                // 只保留与规则判断一致的地址集合，供直连拨号复用。
-                selected.resolved = Some(addresses);
+        if needs_ip || retry_by_strategy {
+            // 嗅探域名参与规则匹配；IP 证据始终属于实际目标。
+            match self.dns.resolve(target).await {
+                Ok(addresses) if !addresses.is_empty() => {
+                    let ips: Vec<IpAddr> = addresses.iter().map(|address| address.ip()).collect();
+                    selected = self.router.select_for_target(
+                        inbound,
+                        network,
+                        route,
+                        target.port,
+                        Some(&ips),
+                    );
+                    if original_ip_policy && selected.kind == OutboundKind::Direct {
+                        let original = self.router.select_for_target(
+                            inbound,
+                            network,
+                            target,
+                            target.port,
+                            Some(&ips),
+                        );
+                        let allowed = ips
+                            .into_iter()
+                            .filter(|ip| {
+                                original.kind == OutboundKind::Direct
+                                    && original
+                                        .permitted
+                                        .as_ref()
+                                        .is_none_or(|set| set.contains(ip))
+                                    && selected
+                                        .permitted
+                                        .as_ref()
+                                        .is_none_or(|set| set.contains(ip))
+                            })
+                            .collect();
+                        selected.permitted = Some(allowed);
+                    }
+                    selected.resolved = Some(addresses);
+                }
+                _ if needs_ip => {
+                    self.stats.reject();
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        RouteRejected("出口规则缺少目标 IP 证据"),
+                    ));
+                }
+                _ => {}
             }
         }
         if selected.kind == OutboundKind::Reject {
             self.stats.reject();
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                RouteRejected,
+                RouteRejected("路由拒绝"),
             ));
         }
         if target.port == 0 && selected.kind != OutboundKind::Reverse {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "无效目标端口"));
+        }
+        if ip_policy && (selected.proxy.is_some() || selected.reverse.is_some()) {
+            self.stats.reject();
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                RouteRejected("远端出站不能使用本地 IP 授权结果"),
+            ));
+        }
+        if selected.kind == OutboundKind::Direct
+            && (selected.permitted.as_ref().is_some_and(Vec::is_empty)
+                || (original_ip_policy
+                    && literal.as_ref().is_some_and(|ips| {
+                        self.router
+                            .select_for_target(inbound, network, target, target.port, Some(ips))
+                            .kind
+                            != OutboundKind::Direct
+                    })))
+        {
+            self.stats.reject();
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                RouteRejected("没有符合出口规则的目标地址"),
+            ));
         }
         if network == Network::Udp && selected.proxy.is_some() {
             if !allow_udp_proxy {
@@ -441,14 +523,57 @@ impl Context {
         network: Network,
         target: &Target,
     ) -> io::Result<()> {
-        self.selected(inbound, network, target, false)
+        self.selected(inbound, network, target, target, false)
             .await
             .map(|_| ())
     }
 
     /// 共享 UDP 关联使用的选路：允许 SOCKS5 上游，HTTP 仍失败关闭。
     pub async fn udp_selected(&self, inbound: &str, target: &Target) -> io::Result<Selected> {
-        self.selected(inbound, Network::Udp, target, true).await
+        self.udp_selected_routed(inbound, target, target).await
+    }
+
+    pub(crate) async fn udp_selected_routed(
+        &self,
+        inbound: &str,
+        route: &Target,
+        target: &Target,
+    ) -> io::Result<Selected> {
+        self.selected(inbound, Network::Udp, route, target, true)
+            .await
+    }
+
+    pub(crate) async fn direct_addresses(
+        &self,
+        selected: &Selected,
+        target: &Target,
+    ) -> io::Result<Vec<SocketAddr>> {
+        let addresses = if selected.resolved.is_some() {
+            selected.dial_addresses()
+        } else {
+            let mut addresses = self.dns.resolve(target).await?;
+            addresses.retain(|address| selected.allows_direct_ip(address.ip()));
+            (!addresses.is_empty()).then_some(addresses)
+        };
+        addresses.ok_or_else(|| {
+            self.stats.reject();
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                RouteRejected("没有符合出口规则的目标地址"),
+            )
+        })
+    }
+
+    pub(crate) async fn direct_udp_address(
+        &self,
+        selected: &Selected,
+        target: &Target,
+    ) -> io::Result<SocketAddr> {
+        self.direct_addresses(selected, target)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "UDP目标无可用地址"))
     }
 
     /// 建立到目标（或上游代理）的 TCP/TLS 流。
@@ -470,51 +595,40 @@ impl Context {
         route: &Target,
         dial: &Target,
     ) -> io::Result<Upstream> {
-        let selected = self.selected(inbound, Network::Tcp, route, false).await?;
+        timeout(
+            Duration::from_millis(self.limits.dial_timeout_ms),
+            self.connect_routed_inner(inbound, route, dial),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连接目标超时"))?
+    }
+
+    async fn connect_routed_inner(
+        &self,
+        inbound: &str,
+        route: &Target,
+        dial: &Target,
+    ) -> io::Result<Upstream> {
+        let selected = self
+            .selected(inbound, Network::Tcp, route, dial, false)
+            .await?;
         let mut upstream = match &selected.reverse {
             Some(tag) => self.reverse.open(tag, dial).await?,
+            None if selected.proxy.is_none() => {
+                let addresses = self.direct_addresses(&selected, dial).await?;
+                let attempt = Duration::from_millis(self.limits.dial_attempt_timeout_ms);
+                let stream = dial_addresses(&addresses, attempt).await?;
+                let local = stream.local_addr().ok();
+                Upstream::new(Box::new(stream), local)
+            }
             None => {
-                // 直连且规则已经解析过地址时，复用同一份结果：
-                // 重新解析可能拿到不同地址，规则检查就失去意义。
-                // 只用「满足命中规则 IP 条件」的地址。
-                //
-                // 注意区分两种情况：`resolved` 为 None 表示规则阶段没解析过
-                // （交给 connect_selected 正常解析）；`resolved` 有值但
-                // `dial_addresses()` 为 None 表示**解析出的地址全都不满足
-                // 规则**——此时必须拒绝，退化成重新解析会让允许列表失效。
-                if selected.proxy.is_none()
-                    && selected.resolved.is_some()
-                    && selected.dial_addresses().is_none()
-                {
-                    self.stats.reject();
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "解析出的地址均不满足出口策略",
-                    ));
-                }
-                let dial_set = selected.dial_addresses();
-                match (selected.proxy.as_deref(), dial_set) {
-                    (None, Some(addresses)) => {
-                        let attempt = Duration::from_millis(self.limits.dial_attempt_timeout_ms);
-                        let stream = timeout(
-                            Duration::from_millis(self.limits.dial_timeout_ms),
-                            dial_addresses(&addresses, attempt),
-                        )
-                        .await
-                        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连接目标超时"))??;
-                        let local = stream.local_addr().ok();
-                        Upstream::new(Box::new(stream), local)
-                    }
-                    _ => {
-                        self.connect_selected(selected.proxy.as_deref(), dial)
-                            .await?
-                    }
-                }
+                self.connect_selected(selected.proxy.as_deref(), dial)
+                    .await?
             }
         };
         upstream.track(
             self.connections
-                .register(inbound, selected.kind.name(), route),
+                .register(inbound, selected.kind.name(), dial),
         );
         Ok(upstream)
     }
@@ -1734,7 +1848,7 @@ async fn idle_watchdog(activity: Arc<std::sync::atomic::AtomicU64>, idle: Durati
 
 #[cfg(test)]
 mod lease_tests {
-    use super::{Lease, relay};
+    use super::{Context, Lease, relay};
     use crate::telemetry::Stats;
     use std::sync::{
         Arc,
@@ -1790,6 +1904,29 @@ mod lease_tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0, "子任务仍持有lease");
         drop(child);
         assert_eq!(drops.load(Ordering::SeqCst), 1, "最后一个持有者释放");
+    }
+
+    #[tokio::test]
+    async fn reloaded_context_preserves_in_use_xhttp_budget() {
+        let config = crate::config::Config::from_json(
+            &include_str!("../examples/vless-xhttp.json").replace(
+                "REPLACE_WITH_A_RANDOM_VLESS_XHTTP_UUID_BEFORE_USE",
+                "b831381d-6324-4d53-ad4f-8cda48b30811",
+            ),
+        )
+        .unwrap();
+        let before = Context::new(&config).unwrap();
+        let lease = before.xhttp_bytes.clone().try_acquire_owned().unwrap();
+        let after = Context::reloaded(&config, &before).unwrap();
+        assert_eq!(
+            after.xhttp_bytes.available_permits(),
+            config.limits.xhttp_buffer_bytes - 1
+        );
+        drop(lease);
+        assert_eq!(
+            after.xhttp_bytes.available_permits(),
+            config.limits.xhttp_buffer_bytes
+        );
     }
 
     #[tokio::test(start_paused = true)]

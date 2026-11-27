@@ -400,6 +400,41 @@ async fn partially_invalid_user_limits_are_rejected() {
 }
 
 #[tokio::test]
+async fn explicit_empty_filters_do_not_change_user_state() {
+    let server = Running::start(config()).await;
+    let api = server.api_address.unwrap();
+    for name in ["alice", "bob"] {
+        let user = server.stats.user_counter("socks", name);
+        user.add(true, 7);
+        user.add(false, 9);
+        user.set_quota(100);
+    }
+    let before = read_users(api).await;
+    for (endpoint, query) in [
+        ("reset", "inbound=socks&user="),
+        ("reset", "inbound"),
+        ("reset", "user=alice&%75ser=bob"),
+        ("limits", "inbound=&quota_bytes=1"),
+        ("limits", "user=%20&quota_bytes=1"),
+    ] {
+        let (head, _) = request(api, format!(
+            "POST /stats/users/{endpoint}?{query} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 0\r\n\r\n"
+        ).as_bytes()).await;
+        assert!(head.starts_with("HTTP/1.1 400"), "{query}: {head}");
+        assert_eq!(read_users(api).await, before);
+    }
+    let (head, body) = request(api, format!(
+        "POST /stats/users/reset HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 0\r\n\r\n"
+    ).as_bytes()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["reset"],
+        2
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn user_traffic_is_attributed_after_an_authenticated_socks_connection() {
     let mut config = socks_config();
     config["inbounds"][0] = json!({

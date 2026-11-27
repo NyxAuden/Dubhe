@@ -144,9 +144,13 @@ where
         &self,
         stream: FrameStream<C::BidiStream, B>,
     ) -> RequestResolver<C, B> {
+        let request_end = std::sync::Arc::new(RequestEnd {
+            request_end: self.request_end_send.clone(),
+            stream_id: stream.send_id(),
+        });
         RequestResolver {
             frame_stream: stream,
-            request_end_send: self.request_end_send.clone(),
+            request_end,
             send_grease_frame: self.inner.send_grease_frame,
             max_field_section_size: self.max_field_section_size,
             shared: self.inner.shared.clone(),

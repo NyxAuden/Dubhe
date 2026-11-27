@@ -1046,7 +1046,11 @@ async fn udp_session(
 /// 直连保持原有快路径（每目标一个 connected socket + 读任务）；代理出站
 /// 共用一个 `RoutedUdp`，由它负责上游关联与回程。
 enum UdpMapping {
-    Direct(Arc<UdpSocket>),
+    Direct {
+        socket: Arc<UdpSocket>,
+        peer: SocketAddr,
+        reader: tokio::task::AbortHandle,
+    },
     Proxied {
         outgoing: mpsc::Sender<crate::udp::QueuedUplink>,
     },
@@ -1076,10 +1080,6 @@ async fn forward_to(
     // 否则保持原有的直连快路径。
     let selected = ctx.udp_selected(tag, &packet.target).await?;
     let proxied = selected.udp_proxied()?;
-    // 规则阶段解析过的地址要复用，否则重新解析可能换一个地址，
-    // 规则检查的集合就不等于实际发送的目标。
-    let rule_resolved: Option<Vec<SocketAddr>> =
-        selected.resolved_addresses().map(<[SocketAddr]>::to_vec);
     let payload_limit = ctx.limits.max_udp_payload.min(wire::MAX_UDP_PAYLOAD);
     if packet.payload.len() > payload_limit {
         return Err(invalid("Hysteria2 UDP 载荷过长"));
@@ -1088,9 +1088,13 @@ async fn forward_to(
     // 路由变化可能把同一目标从直连改为代理（或反之）；旧映射不再适用。
     if mappings
         .get(&packet.target)
-        .is_some_and(|mapping| mapping.is_proxied() != proxied)
+        .is_some_and(|mapping| {
+            mapping.is_proxied() != proxied
+                || matches!(mapping, UdpMapping::Direct { peer, .. } if !selected.allows_cached_peer(*peer))
+        })
+        && let Some(UdpMapping::Direct { reader, .. }) = mappings.remove(&packet.target)
     {
-        mappings.remove(&packet.target);
+        reader.abort();
     }
 
     if proxied {
@@ -1200,14 +1204,7 @@ async fn forward_to(
         if mappings.len() >= ctx.limits.max_udp_targets {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "UDP 目标上限"));
         }
-        let addresses = match &rule_resolved {
-            Some(addresses) => addresses.clone(),
-            None => ctx.dns.resolve(&packet.target).await?,
-        };
-        let address = addresses
-            .first()
-            .copied()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "无可用地址"))?;
+        let address = ctx.direct_udp_address(&selected, &packet.target).await?;
         let bind = if address.is_ipv4() {
             SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
         } else {
@@ -1223,7 +1220,7 @@ async fn forward_to(
         let reader_activity = activity.clone();
         let reader_packet_id = packet_id.clone();
         let tracker = ctx.children.clone();
-        let _ = tasks.spawn(tracker.track_future(async move {
+        let reader = tasks.spawn(tracker.track_future(async move {
             let mut buffer = vec![0u8; wire::MAX_UDP_PAYLOAD];
             loop {
                 let length = match reader_socket.recv(&mut buffer).await {
@@ -1266,10 +1263,17 @@ async fn forward_to(
                 }
             }
         }));
-        mappings.insert(packet.target.clone(), UdpMapping::Direct(socket.clone()));
+        mappings.insert(
+            packet.target.clone(),
+            UdpMapping::Direct {
+                socket,
+                peer: address,
+                reader,
+            },
+        );
     }
 
-    let Some(UdpMapping::Direct(socket)) = mappings.get(&packet.target) else {
+    let Some(UdpMapping::Direct { socket, .. }) = mappings.get(&packet.target) else {
         return Err(io::Error::other("UDP 映射丢失"));
     };
     let written = socket.send(&packet.payload).await?;

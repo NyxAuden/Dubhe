@@ -153,6 +153,26 @@ async fn handle(
         };
         return respond(&mut stream, deadline, code, reason, headers, b"").await;
     }
+    let (inbound, user) = if request.method == "POST"
+        && matches!(route, "/stats/users/reset" | "/stats/users/limits")
+    {
+        match query_filters(request.path) {
+            Ok(filters) => filters,
+            Err(error) => {
+                return respond(
+                    &mut stream,
+                    deadline,
+                    400,
+                    "Bad Request",
+                    "",
+                    error.as_bytes(),
+                )
+                .await;
+            }
+        }
+    } else {
+        (None, None)
+    };
     match (request.method, route) {
         ("GET", "/healthz") => {
             respond(&mut stream, deadline, 200, "OK", "", br#"{"status":"ok"}"#).await
@@ -185,9 +205,7 @@ async fn handle(
                 .map_err(|_| io::Error::other("用户统计序列化失败"))?;
             respond(&mut stream, deadline, 200, "OK", "", &body).await
         }
-        // 清零累计字节。`?inbound=` / `?user=` 可缩小范围，省略则清全部。
-        ("POST", _) if route.starts_with("/stats/users/reset") => {
-            let (inbound, user) = query_filters(request.path);
+        ("POST", "/stats/users/reset") => {
             let count = stats.reset_users(inbound.as_deref(), user.as_deref());
             let body = serde_json::to_vec(&serde_json::json!({ "reset": count }))
                 .map_err(|_| io::Error::other("重置结果序列化失败"))?;
@@ -195,9 +213,7 @@ async fn handle(
         }
         // 设置软配额与到期时间（`?quota_bytes=` / `?expires_at_ms=`）。
         // 只影响之后的新连接，不断开已有连接。
-        ("POST", _) if route.starts_with("/stats/users/limits") => {
-            // 从**原始** `request.path` 取查询串：`route` 已把 `?...` 去掉。
-            let (inbound, user) = query_filters(request.path);
+        ("POST", "/stats/users/limits") => {
             // 两个参数各自可选，但**给了就必须能解析**：此前分别 `.ok()`，
             // 一个写错、另一个合法时仍返回 200 并静默忽略错误字段。
             let quota = match parse_optional(request.path, "quota_bytes") {
@@ -307,10 +323,24 @@ fn query_value(path: &str, key: &str) -> Option<String> {
         .map(|(_, value)| percent_decode(value))
 }
 
-/// 取 `inbound` 与 `user` 两个过滤项。空字符串视为未指定。
-fn query_filters(path: &str) -> (Option<String>, Option<String>) {
-    let pick = |key: &str| query_value(path, key).filter(|value| !value.is_empty());
-    (pick("inbound"), pick("user"))
+/// 只有真正省略才允许扩大范围。
+fn query_filters(path: &str) -> Result<(Option<String>, Option<String>), String> {
+    let (mut inbound, mut user) = (None, None);
+    for pair in query_of(path).unwrap_or_default().split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(key);
+        let slot = match key.as_str() {
+            "inbound" => &mut inbound,
+            "user" => &mut user,
+            _ => continue,
+        };
+        let value = percent_decode(value);
+        if slot.is_some() || value.trim().is_empty() {
+            return Err(format!(r#"{{"error":"invalid {key}"}}"#));
+        }
+        *slot = Some(value);
+    }
+    Ok((inbound, user))
 }
 
 /// 只解码 `%XX` 与 `+`；这两个接口的取值是 tag 与用户名，不含其它需要转义的字符。

@@ -63,7 +63,7 @@
 - 每个会话标识要求 1..=128 字节 ASCII 可见字符，排除 `/`、`?`、`#`、`&`、`=`、`;`、`,`。
 - 与 Xray 一致，GET 下行可以先于 POST 到达，此时建立待上行会话。
 - `packet-up` 的上行数据默认来自请求体；`uplinkDataPlacement: "header"` 读取 `{key}-0`、`{key}-1`… 头块，`"cookie"` 读取 `{key}_0`、`{key}_1`… Cookie 块，`"auto"` 按 header + cookie + body 顺序拼接。每块是 URL-safe base64（无填充），拼接后解码；解码失败返回 400，总长超过 `sc_max_each_post_bytes` 返回 413。即使使用 header/cookie 放置，请求体仍按同一上限有界读取/丢弃，避免连接复用被污染。
-- `packet-up` 的序号必须单调且不重复；重复序号与超出 `sc_max_buffered_posts` 的乱序缓冲返回 413。
+- `packet-up` 按序号交付并允许有界乱序；重复序号拒绝，拒绝的正文不会占用该序号。
 - 超出 `sc_max_each_post_bytes` 的上行请求体直接拒绝。
 - padding 默认范围 100..=1000。非混淆模式（默认）先从 `Referer` 查询参数、否则从请求查询参数读取 `x_padding`；值为 URL-safe base64 时按解码后长度、否则按原文长度校验，越界视为无效请求。**空 padding 仍接受**（本内核旧客户端默认不发送），这是相对 Xray 服务端的有意放宽。
 - 混淆模式（`xPaddingObfsMode: true`）按 Xray 顺序读取：Cookie `x_padding_key` → `x_padding_header`（`header` 放置直接取值，其余按 URL 查询参数解析）→ 请求查询参数 `x_padding_key`；缺失或长度不符返回 400。下行响应按同一放置位置回送 padding：`header`/`queryInHeader` 写入配置的头，`cookie` 写入 `Set-Cookie`，`query` 不回送。
@@ -72,13 +72,13 @@
 
 ## 资源与期限
 
-- 全局 `limits.max_xhttp_sessions` 默认 256；会话超过 `session_ttl_ms`（默认 30000，范围 1000..600000）未活动即回收。
+- 每入口 `limits.max_xhttp_sessions` 默认 256；未配对下行的会话从创建起超过 `session_ttl_ms`（默认 30000，范围 1000..600000）即回收。
 - `sc_max_each_post_bytes` 默认 1,000,000，范围 64..16 MiB。
-- `sc_max_buffered_posts` 默认 30，范围 1..1024。
-- `limits.xhttp_buffer_bytes` 默认 8 MiB，是同一进程内各 TCP/H3 入口共用的排队字节预算，不是进程 RSS 或所有正文缓冲的上限。
-- HTTP/1.1 的 `packet-up` 请求体须在连接原握手期限内读完。`stream-up` 的 POST 在配对 GET 的内层协议认证成功前也受原期限约束；认证后归还握手名额，上传可继续，直至上传结束或中继不再读取。HTTP 200 不代表认证成功。
+- `sc_max_buffered_posts` 默认 30，范围 1..1024，限制每会话已排序、等待交付的队列项数；`stream-up` 按数据块入队。乱序 `packet-up` 另限 1024 条及 `max(64 KiB, 2 × sc_max_each_post_bytes)` 字节，同时受共享预算约束。
+- `limits.xhttp_buffer_bytes` 默认 8 MiB，各 TCP/H3 入口共用。`packet-up` 解码后的负载以及 `stream-up` 排队的应用缓冲在分配前计费，读完整段即退还；该值不包含拼接 header/cookie 编码片段的临时缓冲，也不限制协议库、内核缓冲或进程 RSS。
+- TLS/QUIC、HTTP 建连到首次内层认证共用绝对期限。已认证连接的新请求有各自的期限：H2 从请求头交付后起算，H3 包含请求头读取；`packet-up` 正文读取受请求期限约束。`stream-up` 的分离 POST 在配对 GET 认证成功时归还握手名额，上传可继续；上传 EOF 不截断下行。HTTP 200 不代表认证成功。H3 同样按入口执行 `per_ip_handshakes`。
 - `server_max_header_bytes` 默认 8192，范围 128..16 MiB；作用于 HTTP/1.1 请求头解析和 HTTP/2 `SETTINGS_MAX_HEADER_LIST_SIZE`，HTTP/3 不受控（与 Xray `http3.Server` 不使用该字段一致）。
-- 会话在关闭、超时、客户端 RST 或服务端 stop 时释放；泄漏会计入 `xhttp_sessions` 计量。
+- 已配对会话由下行任务负责清理，任务退出或被取消时归还会话名额；H2 下行取消不依赖上行仍在读取。`packet-up` 在部分数据已入队后取消时关闭会话，未配对的会话也无需等到 TTL 才回收。
 - stop 后拒绝新会话准入，已有会话在 `shutdown_timeout_ms` 内排空；期限到或 force 后取消。
 
 ## 明确不支持

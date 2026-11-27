@@ -43,6 +43,91 @@ fn target(name: &str) -> Target {
 }
 
 #[tokio::test]
+async fn route_only_connects_to_original_peer_without_resolving_sniffed_domain() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let value = serde_json::json!({
+        "version": 1,
+        "inbounds": [{"type": "socks5", "tag": "s", "listen": "127.0.0.1:0"}],
+        "outbounds": [{"type": "direct", "tag": "d"}, {"type": "reject", "tag": "r"}],
+        "route": {"default": "r", "rules": [
+            {"domains": ["route.test"], "ip_cidrs": ["127.0.0.1/32"], "outbound": "d"}
+        ]},
+        "dns": {"servers": [dns.local_addr().unwrap().to_string()]}
+    });
+    let ctx = Context::new(&Config::from_json(&value.to_string()).unwrap()).unwrap();
+    let route = Target {
+        port: address.port(),
+        ..target("route.test")
+    };
+    let _upstream = ctx
+        .connect_routed("s", &route, &address.into())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(1), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(dns.try_recv_from(&mut [0; 512]).is_err());
+}
+
+#[tokio::test]
+async fn missing_required_dns_evidence_fails_closed() {
+    let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let value = serde_json::json!({
+        "version": 1,
+        "inbounds": [{"type": "socks5", "tag": "s", "listen": "127.0.0.1:0"}],
+        "outbounds": [{"type": "direct", "tag": "d"}, {"type": "reject", "tag": "r"}],
+        "route": {"default": "d", "rules": [{"ip_is_private": true, "outbound": "r"}]}
+    });
+    let mut ctx = Context::new(&Config::from_json(&value.to_string()).unwrap()).unwrap();
+    ctx.dns = Dns::new(
+        resolver(dns.local_addr().unwrap(), false),
+        1,
+        Duration::from_millis(20),
+    );
+    let dest = target("unanswered.test.");
+    assert_eq!(
+        ctx.connect("s", &dest).await.err().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        ctx.udp_selected("s", &dest).await.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+}
+
+#[tokio::test]
+async fn direct_dial_requires_a_concrete_destination() {
+    let mut value = serde_json::json!({
+        "version": 1,
+        "inbounds": [{"type": "socks5", "tag": "s", "listen": "127.0.0.1:0"}],
+        "outbounds": [{"type": "direct", "tag": "d"}, {"type": "reject", "tag": "r"}],
+        "route": {"default": "d", "rules": [{"ip_cidrs": ["127.0.0.0/8"], "outbound": "r"}]},
+        "dns": {"hosts": {"unspecified.test": ["0.0.0.0", "::", "::ffff:0.0.0.0"]}}
+    });
+    let targets = [
+        Target::from("0.0.0.0:80".parse::<SocketAddr>().unwrap()),
+        Target::from("[::]:80".parse::<SocketAddr>().unwrap()),
+        Target::from("[::ffff:0.0.0.0]:80".parse::<SocketAddr>().unwrap()),
+        target("unspecified.test"),
+    ];
+    for rules in [value["route"]["rules"].clone(), serde_json::json!([])] {
+        value["route"]["rules"] = rules;
+        let ctx = Context::new(&Config::from_json(&value.to_string()).unwrap()).unwrap();
+        for dest in &targets {
+            let error = ctx.connect("s", dest).await.err().unwrap();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{dest:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn controlled_dns_answers_nxdomain_and_no_ip_lookup() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();

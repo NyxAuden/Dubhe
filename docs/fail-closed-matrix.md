@@ -39,7 +39,7 @@
 | 入口/组件 | 畸形长度/截断 | 认证/重放 | 资源上限 | 取消/停机 | 主要证据 |
 |---|---|---|---|---|---|
 | SOCKS5 / HTTP / Mixed | 有 | 有 | 有 | 有 | `tests/integration.rs`、`tests/http_proxy.rs`、`tests/resources.rs` |
-| VLESS / Vision / XUDP | 有 | 有 | 有 | 有 | `tests/vless.rs`、`tests/vision.rs`、`tests/xudp.rs`、`tests/mux_cool.rs` |
+| VLESS / Vision / XUDP | 有 | 有 | 有 | 有 | `tests/vless.rs`、`tests/vision.rs`、`tests/xudp.rs`、`src/mux/tests.rs` |
 | VMess AEAD / UDP | 有 | 有 | 有 | 有 | `tests/vmess.rs`、`tests/xudp.rs` |
 | Trojan / TLS / WS / fallback | 有 | 有 | 有 | 有 | `tests/integration.rs`、`tests/httpupgrade.rs`、`tests/websocket_trojan.rs`、`tests/fallback.rs` |
 | Shadowsocks AEAD/2022 | 有 | 有 | 有 | 有 | `tests/shadowsocks_udp_wire.rs`、`tests/shadowsocks_resources.rs`、`tests/shadowsocks_listener.rs` |

@@ -1041,6 +1041,22 @@ async fn h2_handshake_without_any_rpc_is_closed_at_deadline() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn completing_http2_handshake_does_not_restart_first_auth_deadline() {
+    let mut value = config(None, None);
+    value["limits"]["handshake_timeout_ms"] = json!(1000);
+    let server = Running::start(value).await;
+    let socket = TcpStream::connect(server.address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    let (_sender, connection) = h2::client::handshake(socket).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let _closed = timeout(Duration::from_millis(750), driver)
+        .await
+        .expect("首个 RPC 必须继承 TCP 连接的原期限")
+        .unwrap();
+    server.shutdown().await;
+}
+
 /// 回归：**发出 RPC 但未完成认证**的连接，许可不得归还。
 ///
 /// 上一版在「收到 RPC」时就 `handshake.take()`，于是攻击者只要发一个空帧

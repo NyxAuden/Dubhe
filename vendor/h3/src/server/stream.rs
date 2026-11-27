@@ -112,6 +112,11 @@ where
     S: quic::SendStream<B>,
     B: Buf,
 {
+    /// Access the backend stream to observe transport-level cancellation.
+    pub fn quic_stream(&self) -> &S {
+        self.inner.stream.stream.quic_stream()
+    }
+
     /// Send the HTTP/3 response
     ///
     /// This should be called before trying to send any data with

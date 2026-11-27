@@ -302,6 +302,13 @@ impl<B: Buf> quic::RecvStream for BidiStream<B> {
     }
 }
 
+impl<B: Buf> BidiStream<B> {
+    /// Completes when the peer stops the sending half or acknowledges its FIN.
+    pub fn stopped(&self) -> impl Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>> + Send + 'static {
+        self.send.stopped()
+    }
+}
+
 impl<B> quic::SendStream<B> for BidiStream<B>
 where
     B: Buf,
@@ -450,6 +457,11 @@ impl<B> SendStream<B>
 where
     B: Buf,
 {
+    /// Completes when the peer stops this stream or acknowledges its FIN.
+    pub fn stopped(&self) -> impl Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>> + Send + 'static {
+        self.stream.stopped()
+    }
+
     fn new(stream: quinn::SendStream) -> SendStream<B> {
         Self {
             stream: stream,

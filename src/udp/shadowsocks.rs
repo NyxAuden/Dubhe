@@ -531,8 +531,7 @@ impl Dispatcher {
             let Some(transport) = &session.transport else {
                 return Err(io::Error::other("UDP会话已终止"));
             };
-            let addresses = self.ctx.dns.resolve(&target).await?;
-            let destination = normalize(addresses[0]);
+            let destination = normalize(self.ctx.direct_udp_address(&selected, &target).await?);
             {
                 let allowed = transport
                     .allowed

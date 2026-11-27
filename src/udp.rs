@@ -192,7 +192,7 @@ impl RoutedUdp {
                 .try_acquire_owned()
                 .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "UDP 关联上限"))?;
             let gauge = ctx.stats.enter(Gauge::Udp);
-            let addresses = ctx.dns.resolve(&target).await?;
+            let addresses = ctx.direct_addresses(&selected, &target).await?;
             if addresses.is_empty() {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "UDP目标无可用地址"));
             }
@@ -200,6 +200,8 @@ impl RoutedUdp {
             let mut last_error = None;
             for address in addresses {
                 let target = Target::from(address);
+                let mut selected = selected.clone();
+                selected.resolved = Some(vec![address]);
                 let (mut association, replies) = Association::new(ctx.clone(), inbound.clone());
                 association.fixed = Some(Fixed {
                     selected: selected.clone(),
@@ -312,6 +314,7 @@ impl Drop for RoutedUdp {
 }
 
 struct Mapping {
+    peer: SocketAddr,
     socket: Arc<UdpSocket>,
     task: AbortHandle,
     last_used: Arc<std::sync::Mutex<Instant>>,
@@ -539,7 +542,9 @@ impl Association {
                 payload,
             );
             // 非固定入口保持首包嗅探/按报文选路，不因预备接口改变。
-            self.ctx.udp_selected(&self.inbound, &route).await?
+            self.ctx
+                .udp_selected_routed(&self.inbound, &route, &target)
+                .await?
         };
         self.expire();
         if let Some(tag) = selected.reverse {
@@ -556,7 +561,7 @@ impl Association {
         if let Some(proxy) = selected.proxy.clone() {
             return self.send_proxy(proxy, &target, payload).await;
         }
-        self.prepare_direct(&target).await?;
+        self.prepare_direct(&selected, &target).await?;
         let mapping = self
             .mappings
             .get_mut(&target)
@@ -581,20 +586,21 @@ impl Association {
         if let Some(proxy) = selected.proxy.clone() {
             return self.prepare_proxy(proxy, target).await;
         }
-        self.prepare_direct(target).await
+        self.prepare_direct(&selected, target).await
     }
 
-    async fn prepare_direct(&mut self, target: &Target) -> io::Result<()> {
+    async fn prepare_direct(&mut self, selected: &Selected, target: &Target) -> io::Result<()> {
+        if self
+            .mappings
+            .get(target)
+            .is_some_and(|mapping| !selected.allows_cached_peer(mapping.peer))
+            && let Some(mapping) = self.mappings.remove(target)
+        {
+            mapping.task.abort();
+        }
         if !self.mappings.contains_key(target) {
             self.ensure_target_capacity(target)?;
-            let address = self
-                .ctx
-                .dns
-                .resolve(target)
-                .await?
-                .into_iter()
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "UDP目标无可用地址"))?;
+            let address = self.ctx.direct_udp_address(selected, target).await?;
             let bind = if address.is_ipv4() {
                 SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
             } else {
@@ -646,6 +652,7 @@ impl Association {
             self.mappings.insert(
                 target.clone(),
                 Mapping {
+                    peer: address,
                     socket,
                     task,
                     last_used,
@@ -2312,6 +2319,69 @@ mod tests {
         assert_eq!(ctx.udp_bytes.available_permits(), 128);
         let _rebound = UdpSocket::bind(peer).await.unwrap();
     }
+    #[tokio::test]
+    async fn direct_association_uses_and_rechecks_approved_peer() {
+        let approved = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = approved.local_addr().unwrap().port();
+        let other = UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).await.unwrap();
+        let target = Target {
+            host: Host::Domain("mixed.test".into()),
+            port,
+        };
+        let config = |ips: serde_json::Value, rules: serde_json::Value| {
+            let value = serde_json::json!({"version":1,
+                "inbounds":[{"type":"socks5","tag":"socks","listen":"127.0.0.1:0"}],
+                "outbounds":[{"type":"direct","tag":"direct"}],
+                "route":{"default":"direct", "rules":rules},
+                "dns":{"hosts":{"mixed.test":ips}}
+            });
+            Config::from_json(&value.to_string()).unwrap()
+        };
+        let ctx = Arc::new(
+            Context::new(&config(
+                serde_json::json!(["::1", "127.0.0.1"]),
+                serde_json::json!([{"ip_cidrs":["127.0.0.1/32"], "outbound":"direct"}]),
+            ))
+            .unwrap(),
+        );
+        let (mut assoc, _replies) = Association::new(ctx.clone(), "socks".into());
+        assoc.send(target.clone(), b"approved").await.unwrap();
+        let mut buf = [0; 32];
+        let (n, _) = timeout(Duration::from_secs(1), approved.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"approved");
+        assert_eq!(
+            other.try_recv_from(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        // 用同一关联，注入另一份地址证据，检查替换实际 peer 而不只是重走选路。
+        let changed = Context::new(&config(
+            serde_json::json!(["::1"]),
+            serde_json::json!([{"ip_cidrs":["::1/128"], "outbound":"direct"}]),
+        ))
+        .unwrap();
+        let old_reader = assoc.mappings[&target].task.clone();
+        assoc.ctx = Arc::new(changed);
+        assoc.send(target.clone(), b"changed").await.unwrap();
+        let (n, _) = timeout(Duration::from_secs(1), other.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"changed");
+        assert_ne!(assoc.mappings[&target].task.id(), old_reader.id());
+        let finished = timeout(Duration::from_secs(1), assoc.tasks.join_next_with_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(finished.is_cancelled());
+        assert_eq!(finished.id(), old_reader.id());
+        assoc.close().await;
+    }
+
     #[tokio::test]
     async fn prepared_fixes_target_without_probing_and_releases_owner_resources() {
         let value = serde_json::json!({"version":1,
