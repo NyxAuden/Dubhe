@@ -191,6 +191,34 @@ async fn vless_over_http2_tls() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn http2_unused_connection_releases_handshake_permit_at_deadline() {
+    let cert = Certificate::new();
+    let mut cfg = config(json!({
+        "type":"vless-http","tag":"vless","listen":"127.0.0.1:0",
+        "users":[{"name":"test","uuid":UUID}],
+        "http":{"path":"/h2","host":["localhost"]},
+        "certificate": cert.dir.path().join("cert.pem"),
+        "private_key": cert.dir.path().join("key.pem")
+    }));
+    cfg["limits"] = json!({"handshake_timeout_ms": 300, "max_handshakes": 1});
+    let server = Running::start(cfg).await;
+
+    let tls = cert.connect_alpn(server.address, &[b"h2"]).await;
+    let (client, connection) = h2::client::handshake(tls).await.unwrap();
+    let mut driver = tokio::spawn(connection);
+    timeout(Duration::from_secs(2), &mut driver)
+        .await
+        .expect("未使用的 H2 连接必须在握手期限后关闭")
+        .unwrap()
+        .ok();
+    drop(client);
+
+    // 到期连接必须归还唯一的握手名额，新连接仍可进行 TLS 握手。
+    drop(cert.connect_alpn(server.address, &[b"h2"]).await);
+    server.shutdown().await;
+}
+
 /// 回归：V2Ray HTTP/2 的握手许可必须在**首个流认证成功**后归还。
 ///
 /// 此前 H1 在认证后归还，H2 却一直持到整条连接关闭。于是一个正常的长连接
