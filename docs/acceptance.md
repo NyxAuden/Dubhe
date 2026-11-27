@@ -47,6 +47,8 @@
 - 官方 Rust 多架构容器镜像固定为 `rust@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1`。
 - 源码只读挂载到 `/workspace`，Cargo 与 target 使用本项目专用命名卷，没有容器端口映射到主机公网。
 
+复跑时不要让容器与宿主共用 `CARGO_TARGET_DIR`：部分集成测试会通过 `CARGO_BIN_EXE_dubhe` 启动构建出来的 CLI，同为 ARM64 也不能混用 ELF 和 Mach-O。CLI 的不可写目录用例还需要普通用户权限；若容器必须用 root，在运行测试时去掉 `CAP_DAC_OVERRIDE` 和 `CAP_DAC_READ_SEARCH`。
+
 本机命令：
 
 ```sh

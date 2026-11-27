@@ -84,3 +84,5 @@ sing-box 的 `Revision` 输出为 `c005f35300ce76427dc285481ec5695f5b179cd2`，�
 机器可读结果在 [reference-clients.json](../.test-artifacts/reference-clients.json)。每个客户端记录绝对二进制路径、固定版本、官方资产来源、归档及二进制 SHA-256、上游校验状态、tag commit、版本命令、原始版本输出及准备状态。`status: ready` 才表示该客户端完成下载、解压和版本验证；`status: blocked` 会记录具体错误，脚本不会替换为其他版本。
 
 互通测试从 manifest 的 `clients[].path` 读取二进制路径；路径属于本机临时测试产物，不应作为跨机器固定路径。重新运行脚本会创建新目录并更新 manifest，同时保留之前的二进制。版本命令只验证产品与版本报告，不能单独证明代理互通；后续实际运行的结果见 [interop-report.md](interop-report.md)。manifest 的 `execution_scope` 只描述下载脚本的版本检查阶段，不是后续运行授权或互通结果。
+
+将客户端复制到 Linux 容器时，sing-box v1.14.4 应连同同一已校验发布归档里的 `libcronet.so` 一起复制，让两者留在同一目录。`sing-box version` 不加载该库；只复制主程序会使 Naive 互通在客户端初始化阶段失败，而不是协议不支持。直接使用下载脚本解压后的路径则无需再复制。
