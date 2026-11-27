@@ -1260,6 +1260,16 @@ impl UdpInner {
         *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(slot);
     }
 
+    /// 主动归还活动槽。代清理（停机/重载）时调用：此时关联可能仍被调用方
+    /// 的 `Arc` 持有，不主动释放就会把配额留在未归还状态。
+    fn release_slot(&self) {
+        let _ = self
+            .slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+
     fn set_sink(&self, sender: mpsc::Sender<Event>, owner: u64, budget: Arc<Semaphore>) {
         let previous = self
             .sink
@@ -1650,7 +1660,22 @@ pub(crate) fn release_instance(ctx: &Context) {
     let mut global = global_ids()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    // 先取回被清掉条目的活动槽。仅从登记表移除不够：槽挂在 UdpInner 上，
+    // 而 UdpInner 仍可能被调用方的 Arc 持有，不主动释放就会让配额停在
+    // 未归还状态，代清理后新连接无槽可用。
+    let dropped: Vec<Arc<UdpInner>> = global
+        .iter()
+        .filter(|((id, ..), _)| *id == instance)
+        .filter_map(|(_, entry)| match &entry.state {
+            GlobalState::Active { inner, .. } => inner.upgrade(),
+            GlobalState::Expiring { inner, .. } => Some(inner.clone()),
+        })
+        .collect();
     global.retain(|(id, ..), _| *id != instance);
+    drop(global);
+    for inner in dropped {
+        inner.release_slot();
+    }
 }
 
 /// 清理失效条目：会话消失的 Active 条目与到期的 Expiring 条目。
@@ -1876,5 +1901,87 @@ mod global_id_isolation_tests {
         assert_eq!(ctx.udp_slots.available_permits(), before);
 
         release_instance(&ctx);
+    }
+
+    /// 停机/重载代清理必须同时归还宽限期条目占用的活动槽。
+    ///
+    /// `release_instance` 直接按实例清空登记表；若槽仍挂在被清掉的条目上，
+    /// 第二次清理时配额就不再回到基线。
+    #[tokio::test]
+    async fn release_instance_reclaims_slots_held_by_expiring_entries() {
+        let config = Config::from_json(
+            r#"{
+                "version": 1,
+                "inbounds": [{"type": "socks5", "tag": "in", "listen": "127.0.0.1:0"}],
+                "outbounds": [{"type": "direct", "tag": "direct"}],
+                "route": {"default": "direct"}
+            }"#,
+        )
+        .unwrap();
+        let ctx = Arc::new(Context::new(&config).unwrap());
+        let before = ctx.udp_slots.available_permits();
+
+        let mut held = Vec::new();
+        for index in 0..3u8 {
+            let id = [0x30 + index; 8];
+            let association = acquire_global(id, ctx.clone(), "in", "alice", index as u64, 1).unwrap();
+            let slot = ctx.udp_slots.clone().try_acquire_owned().unwrap();
+            association.hold_slot(slot);
+            association.inner.detach(1).await;
+            held.push(association);
+        }
+        assert_eq!(ctx.udp_slots.available_permits(), before - 3);
+
+        release_instance(&ctx);
+        assert_eq!(
+            ctx.udp_slots.available_permits(),
+            before,
+            "代清理后活动槽必须回到基线"
+        );
+        // 仍被本测试持有的句柄不应让清理结果反弹。
+        drop(held);
+        assert_eq!(ctx.udp_slots.available_permits(), before);
+    }
+
+    /// 两个入口共享同一份全局配额时，一个入口不得靠宽限期超额占用。
+    ///
+    /// 全局上限存在不等于按入口公平；至少保证「同一实例内所有入口各自持有的
+    /// 活动槽总和」不会因为 GlobalID 宽限期而超出。
+    #[tokio::test]
+    async fn two_inbounds_cannot_exceed_the_shared_slot_budget() {
+        let config = Config::from_json(
+            r#"{
+                "version": 1,
+                "limits": {"max_udp_associations": 2},
+                "inbounds": [
+                    {"type": "socks5", "tag": "a", "listen": "127.0.0.1:0"},
+                    {"type": "socks5", "tag": "b", "listen": "127.0.0.1:0"}
+                ],
+                "outbounds": [{"type": "direct", "tag": "direct"}],
+                "route": {"default": "direct"}
+            }"#,
+        )
+        .unwrap();
+        let ctx = Arc::new(Context::new(&config).unwrap());
+        assert_eq!(ctx.udp_slots.available_permits(), 2);
+
+        let a = acquire_global([0x11; 8], ctx.clone(), "a", "u", 1, 1).unwrap();
+        a.hold_slot(ctx.udp_slots.clone().try_acquire_owned().unwrap());
+        let b = acquire_global([0x22; 8], ctx.clone(), "b", "u", 2, 2).unwrap();
+        b.hold_slot(ctx.udp_slots.clone().try_acquire_owned().unwrap());
+        assert_eq!(ctx.udp_slots.available_permits(), 0);
+
+        // 两个入口都进入宽限期，配额仍应被占满：新关联必须被拒绝。
+        a.inner.detach(1).await;
+        b.inner.detach(2).await;
+        assert!(
+            ctx.udp_slots.clone().try_acquire_owned().is_err(),
+            "宽限期内不得出现可用的额外配额"
+        );
+
+        // 清理后才能恢复。
+        release_instance(&ctx);
+        assert_eq!(ctx.udp_slots.available_permits(), 2);
+        drop((a, b));
     }
 }

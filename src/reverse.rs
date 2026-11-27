@@ -1014,6 +1014,71 @@ mod tests {
         let error = registry.open("portal", &target).await.expect_err("应失败");
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
     }
+
+    /// 载体数量到达上限时必须拒绝新载体，而不是让它挤进来。
+    #[tokio::test]
+    async fn carrier_limit_is_enforced() {
+        let ctx = portal_context();
+        // 先填满上限。
+        let mut carriers = Vec::new();
+        for _ in 0..MAX_CARRIERS {
+            let (carrier, peer) = tokio::io::duplex(64);
+            ctx.reverse.attach("portal", carrier, &ctx).unwrap();
+            carriers.push(peer);
+        }
+        let (extra, _peer) = tokio::io::duplex(64);
+        let error = ctx
+            .reverse
+            .attach("portal", extra, &ctx)
+            .expect_err("满额后必须拒绝");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        // 释放一个名额后应重新接受。
+        drop(carriers.pop());
+        // 让被丢弃的载体任务观察到关闭，再触发惰性清理。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (again, _peer2) = tokio::io::duplex(64);
+        ctx.reverse
+            .attach("portal", again, &ctx)
+            .expect("释放名额后应可再次接入");
+    }
+
+    /// 载体对端主动取消后，其名额必须可被回收。
+    ///
+    /// 覆盖「拒绝、取消、排空」里的取消路径：对端断开后载体进入关闭状态，
+    /// 不应继续占位。
+    #[tokio::test]
+    async fn cancelled_carrier_frees_its_slot_for_a_new_one() {
+        let ctx = portal_context();
+        let (carrier, peer) = tokio::io::duplex(64);
+        ctx.reverse.attach("portal", carrier, &ctx).unwrap();
+        let clients = || {
+            ctx.reverse
+                .portals
+                .get("portal")
+                .unwrap()
+                .clients
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(clients().len(), 1);
+
+        drop(peer);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // 断开后载体应被标记关闭，从而不计入名额。
+        assert!(
+            clients().iter().all(|client| client.is_closed()),
+            "对端断开后载体应进入关闭状态"
+        );
+
+        let (next, _peer2) = tokio::io::duplex(64);
+        ctx.reverse.attach("portal", next, &ctx).unwrap();
+        let live = clients().into_iter().filter(|client| !client.is_closed()).count();
+        assert_eq!(live, 1, "只应留下新载体");
+    }
     /// 已关闭的载体不能继续占用 `MAX_CARRIERS` 名额。
     ///
     /// 此前只清理 `strong_count == 0` 的端口项。载体 `close()` 之后仍被本地
