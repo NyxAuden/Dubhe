@@ -1,6 +1,6 @@
 # XHTTP 入站/出站边界（开发实现，待集中验收）
 
-本页描述本仓库 XHTTP 入站的**已实现行为与明确限制**。已与官方 Xray v26.10.31 完成 VLESS/XHTTP TLS（auto/stream-one/stream-up/packet-up）与 VLESS/VMess/Trojan REALITY-over-XHTTP 的双向 TCP 本机互通，以及 Xray VLESS/XHTTP TLS auto XUDP 到本内核入站的 TCP/UDP（服务端 `xudp:true`；`xudp:false` 时 UDP 按设计关闭）；完整官方矩阵、Linux x86_64、Windows、可发布 release 与最终报告均未执行；macOS ARM64 的 Rust1.91/1.95 与 Linux ARM64 的 Rust1.95 全量测试已通过。当前 `tests/xhttp.rs` 30 项本机入站回环/配置兼容测试通过，不等于完整官方兼容。`extra` 新增字段仅完成本地解析与本地入站运行验证，**没有**用官方 Xray 的对应配置样本做端到端互通。
+本页描述本仓库 XHTTP 入站的**已实现行为与明确限制**。已与官方 Xray v26.10.31 完成 VLESS/XHTTP TLS（auto/stream-one/stream-up/packet-up）与 VLESS/VMess/Trojan REALITY-over-XHTTP 的双向 TCP 本机互通，以及 Xray VLESS/XHTTP TLS auto XUDP 到本内核入站的 TCP/UDP（服务端 `xudp:true`；`xudp:false` 时 UDP 按设计关闭）。这些组合不代表完整官方兼容；Linux x86_64 和 Windows 尚未验收。`extra` 新增字段仅完成本地解析与本地入站运行验证，**没有**用官方 Xray 的对应配置样本做端到端互通。
 
 ## 入口与配置
 
@@ -54,7 +54,7 @@
 | 模式 | 上行 | 下行 |
 |---|---|---|
 | `stream-one` | 单个 POST，整个连接是一个流 | 该 POST 的响应体直接承载下行字节 |
-| `stream-up` | 一个 GET 建立下行，随后多个 POST 顺序追加 | GET 的响应体承载下行 |
+| `stream-up` | 一个持续 POST，不与带序号的 POST 混用 | 同一会话的 GET 响应体承载下行 |
 | `packet-up` | 多个独立 POST，各自带序号 | 一个 GET 响应体承载下行 |
 | `auto` | 接受以上任一形状 | 按实际形状选择 |
 
@@ -75,6 +75,8 @@
 - 全局 `limits.max_xhttp_sessions` 默认 256；会话超过 `session_ttl_ms`（默认 30000，范围 1000..600000）未活动即回收。
 - `sc_max_each_post_bytes` 默认 1,000,000，范围 64..16 MiB。
 - `sc_max_buffered_posts` 默认 30，范围 1..1024。
+- `limits.xhttp_buffer_bytes` 默认 8 MiB，是同一进程内各 TCP/H3 入口共用的排队字节预算，不是进程 RSS 或所有正文缓冲的上限。
+- HTTP/1.1 的 `packet-up` 请求体须在连接原握手期限内读完。`stream-up` 的 POST 在配对 GET 的内层协议认证成功前也受原期限约束；认证后归还握手名额，上传可继续，直至上传结束或中继不再读取。HTTP 200 不代表认证成功。
 - `server_max_header_bytes` 默认 8192，范围 128..16 MiB；作用于 HTTP/1.1 请求头解析和 HTTP/2 `SETTINGS_MAX_HEADER_LIST_SIZE`，HTTP/3 不受控（与 Xray `http3.Server` 不使用该字段一致）。
 - 会话在关闭、超时、客户端 RST 或服务端 stop 时释放；泄漏会计入 `xhttp_sessions` 计量。
 - stop 后拒绝新会话准入，已有会话在 `shutdown_timeout_ms` 内排空；期限到或 force 后取消。
@@ -111,4 +113,6 @@
 
 ## 证据
 
-本地测试覆盖 packet-up、stream-one、stream-up、乱序、会话隔离与重复序号、413、会话上限、TTL 过期、h2c、真实 TLS h2、自定义头与 Cookie、三协议承载及非法路径/超限 padding。测试入口 `tests/xhttp.rs`（30 项），其中 `extra` 兼容覆盖：支持字段映射（整数与 `"from-to"` 两种 Xray 形状）、顶层/`extra` 冲突拒绝、15 个仍不支持字段的显式拒绝、未知键拒绝、非法范围/资源上限、`tokenish` 值拒绝，以及运行中实际生效项：`scMaxEachPostBytes`/`noSSEHeader`、混淆 padding（header 放置的请求校验与响应回送）、header 放置的会话/序号、header 放置的 packet-up 上行数据、`serverMaxHeaderBytes` 的 HTTP/1.1 请求头上限。`tests/xhttp_outbound_client.rs` 6 项本机回环通过（H1 split、stream-up EOF、H2/H3 跨窗口、取消与 reset）。已与官方 Xray v26.10.31 完成 TLS 下四种模式与 REALITY-over-XHTTP 的双向本机互通；新增 `extra` 字段未用官方 Xray 配置样本做端到端互通；sing-box、Linux x86_64/Windows、可发布 release 仍未验收，不能据此宣称完整外部互通。
+Xray v26.10.31 的 VLESS/XHTTP TLS `stream-up` 已在 macOS ARM64 强制使用 HTTP/1.1 验证：同一条隧道在服务端握手期限前后各完成一次回显。相关本机回归还验证了 GET/POST 归还握手名额、中继空闲结束后归还会话槽，以及上传正常 EOF 后仍可接收下行。
+
+本地测试覆盖 packet-up、stream-one、stream-up、乱序、会话隔离与重复序号、413、会话上限、TTL 过期、h2c、真实 TLS h2、自定义头与 Cookie、三协议承载及非法路径/超限 padding。测试入口 `tests/xhttp.rs`，其中 `extra` 兼容覆盖：支持字段映射（整数与 `"from-to"` 两种 Xray 形状）、顶层/`extra` 冲突拒绝、15 个仍不支持字段的显式拒绝、未知键拒绝、非法范围/资源上限、`tokenish` 值拒绝，以及运行中实际生效项：`scMaxEachPostBytes`/`noSSEHeader`、混淆 padding（header 放置的请求校验与响应回送）、header 放置的会话/序号、header 放置的 packet-up 上行数据、`serverMaxHeaderBytes` 的 HTTP/1.1 请求头上限。`tests/xhttp_outbound_client.rs` 6 项本机回环通过（H1 split、stream-up EOF、H2/H3 跨窗口、取消与 reset）。已与官方 Xray v26.10.31 完成 TLS 下四种模式与 REALITY-over-XHTTP 的双向本机互通；新增 `extra` 字段未用官方 Xray 配置样本做端到端互通；sing-box、Linux x86_64/Windows、可发布 release 仍未验收，不能据此宣称完整外部互通。

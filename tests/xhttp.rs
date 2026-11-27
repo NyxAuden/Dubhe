@@ -644,6 +644,106 @@ async fn h2c_trojan_stream_one_relays_tcp() {
 }
 
 #[tokio::test]
+async fn stream_up_keeps_upload_open_after_handshake_deadline() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let mut value = config("stream-up");
+    value["limits"] = json!({
+        "handshake_timeout_ms": 500,
+        "max_handshakes": 2,
+        "per_ip_handshakes": 2
+    });
+    let running = Running::start(value).await;
+
+    timeout(Duration::from_secs(5), async {
+        let mut upload = connect(&running).await;
+        upload.write_all(b"POST /GunService/Tun/long HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        assert!(read_head(&mut upload).await.0.starts_with("HTTP/1.1 200 "));
+        let mut download = connect(&running).await;
+        download.write_all(b"GET /GunService/Tun/long HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        assert!(read_head(&mut download).await.0.starts_with("HTTP/1.1 200 "));
+
+        let mut body = vless_request(echo.address);
+        body.extend_from_slice(b"first");
+        upload.write_all(format!("{:x}\r\n", body.len()).as_bytes()).await.unwrap();
+        upload.write_all(&body).await.unwrap();
+        upload.write_all(b"\r\n").await.unwrap();
+        assert!(read_chunked_until(&mut download, b"first").await.ends_with(b"first"));
+
+        // 第一对 GET/POST 都不关闭；另一对必须仍能拿到两个握手名额。
+        let mut other_upload = connect(&running).await;
+        other_upload.write_all(b"POST /GunService/Tun/other HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        assert!(read_head(&mut other_upload).await.0.starts_with("HTTP/1.1 200 "));
+        let mut other_download = connect(&running).await;
+        other_download.write_all(b"GET /GunService/Tun/other HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        assert!(read_head(&mut other_download).await.0.starts_with("HTTP/1.1 200 "));
+        drop((other_upload, other_download));
+
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        upload.write_all(b"6\r\nsecond\r\n0\r\n\r\n").await.unwrap();
+        assert!(timeout(Duration::from_secs(2), read_chunked_until(&mut download, b"second"))
+            .await
+            .expect("握手期限过后仍须收到第二次回显")
+            .ends_with(b"second"));
+    })
+    .await
+    .expect("认证后的 stream-up 到达握手期限后仍须继续转发");
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn stream_up_ends_upload_response_when_relay_goes_idle() {
+    let echo = Echo::tcp("127.0.0.1", false).await;
+    let mut value = config("auto");
+    value["limits"] = json!({"max_xhttp_sessions": 1, "idle_timeout_ms": 200});
+    let running = Running::start(value).await;
+    timeout(Duration::from_secs(3), async {
+        let mut upload = connect(&running).await;
+        upload.write_all(b"POST /GunService/Tun/idle HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        let (headers, _) = read_head(&mut upload).await;
+        assert!(headers.contains("transfer-encoding: chunked\r\n"));
+        let mut download = connect(&running).await;
+        download.write_all(b"GET /GunService/Tun/idle HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+        assert!(read_head(&mut download).await.0.starts_with("HTTP/1.1 200 "));
+
+        let mut body = vless_request(echo.address);
+        body.extend_from_slice(b"before-idle");
+        upload.write_all(format!("{:x}\r\n", body.len()).as_bytes()).await.unwrap();
+        upload.write_all(&body).await.unwrap();
+        upload.write_all(b"\r\n").await.unwrap();
+        assert!(read_chunked_until(&mut download, b"before-idle").await.ends_with(b"before-idle"));
+
+        let mut tail = Vec::new();
+        upload.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(tail, b"0\r\n\r\n");
+        let reply = post(&running, "/GunService/Tun/next/0", b"a").await;
+        assert!(reply.starts_with("HTTP/1.1 200 "));
+    })
+    .await
+    .expect("中继空闲结束后必须结束上传响应并归还会话槽");
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn stream_up_accepts_only_one_upload_per_session() {
+    let running = Running::start(config("stream-up")).await;
+    timeout(Duration::from_secs(3), async {
+        let request = b"POST /GunService/Tun/single HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut first = connect(&running).await;
+        first.write_all(request).await.unwrap();
+        assert!(read_head(&mut first).await.0.starts_with("HTTP/1.1 200 "));
+
+        let mut second = connect(&running).await;
+        second.write_all(request).await.unwrap();
+        assert!(read_head(&mut second).await.0.starts_with("HTTP/1.1 409 "));
+
+        first.write_all(b"0\r\n\r\n").await.unwrap();
+    })
+    .await
+    .unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test]
 async fn stream_up_keeps_downlink_open_after_upload_end() {
     let echo = Echo::tcp("127.0.0.1", true).await;
     let running = Running::start(config("auto")).await;

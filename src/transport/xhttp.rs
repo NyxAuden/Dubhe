@@ -86,6 +86,8 @@ impl Pool {
             tx: tokio::sync::Mutex::new(Some(tx)),
             rx: tokio::sync::Mutex::new(Some(rx)),
             done: AtomicBool::new(false),
+            authenticated: CancellationToken::new(),
+            reader_closed: CancellationToken::new(),
             lease: Lease::new(SessionHold {
                 _slot: slot,
                 _gauge: gauge,
@@ -150,16 +152,18 @@ struct State {
     pending: BTreeMap<u64, QueuedChunk>,
     pending_bytes: usize,
     connected: bool,
-    upload_closed: bool,
+    upload_attached: bool,
 }
 
-struct Session {
+pub(super) struct Session {
     id: String,
     state: Mutex<State>,
     push: tokio::sync::Mutex<()>,
     tx: tokio::sync::Mutex<Option<mpsc::Sender<QueuedChunk>>>,
     rx: tokio::sync::Mutex<Option<mpsc::Receiver<QueuedChunk>>>,
     done: AtomicBool,
+    authenticated: CancellationToken,
+    reader_closed: CancellationToken,
     lease: Lease,
     /// 本入口的共享排队字节预算（来自 `Pool`）。
     budget: Arc<Semaphore>,
@@ -210,6 +214,12 @@ impl Session {
         let mut ready: Vec<(Vec<u8>, Option<tokio::sync::OwnedSemaphorePermit>)> = Vec::new();
         {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.upload_attached {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "XHTTP上行模式冲突",
+                ));
+            }
             if seq < state.next_seq {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "重复XHTTP序号"));
             }
@@ -265,11 +275,16 @@ impl Session {
             .connected = true;
     }
 
+    fn attach_upload(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.upload_attached || state.next_seq != 0 || !state.pending.is_empty() {
+            return false;
+        }
+        state.upload_attached = true;
+        true
+    }
+
     async fn end_upload(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .upload_closed = true;
         self.done.store(true, Ordering::SeqCst);
         // 丢弃最后一个sender使下行reader在排空后读到EOF。
         self.tx.lock().await.take();
@@ -664,7 +679,7 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let (read, write) = tokio::io::split(conn.io);
         drop(read);
         let tunnel = Tunnel::new(
-            ChannelReader::new(rx),
+            ChannelReader::new(rx, &lane),
             FinishOnDrop::new(ChunkedWriter::new(write)),
         );
         let result = dispatch(
@@ -673,7 +688,7 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             vmess,
             ctx,
             absolute,
-            Some(lane.lease()),
+            Some(&lane),
             Some(auth),
         )
         .await;
@@ -710,7 +725,7 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             vmess,
             ctx,
             absolute,
-            Some(lane.lease()),
+            Some(&lane),
             Some(auth),
         )
         .await;
@@ -732,19 +747,36 @@ async fn handle_h1<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             return Ok(None);
         }
         let lane = pool.open(session_id.clone())?;
-        write_status(&mut conn.io, xhttp, "200 OK").await?;
-        // 正文读取同样受绝对期限约束：此前只有请求头有，半帧正文可以让
-        // 连接一直挂着（实测超出 0.3 s 期限 6 倍仍未关闭）。
-        match tokio::time::timeout_at(absolute, conn.stream_body(&head.body, &lane)).await {
-            Ok(result) => result?,
-            Err(_) => {
+        if !lane.attach_upload() {
+            write_status(&mut conn.io, xhttp, "409 Conflict").await?;
+            return Ok(None);
+        }
+        let upload = async {
+            write_stream_headers(&mut conn.io, xhttp).await?;
+            tokio::select! {
+                result = conn.stream_body(&head.body, &lane) => result?,
+                _ = lane.reader_closed.cancelled() => {},
+            }
+            conn.io.write_all(b"0\r\n\r\n").await?;
+            conn.io.flush().await
+        };
+        tokio::pin!(upload);
+        // GET 完成内层认证前，分离的 POST 也必须受本连接的握手期限约束。
+        tokio::select! {
+            biased;
+            _ = lane.authenticated.cancelled() => {
+                auth.release();
+                upload.await?;
+            }
+            _ = tokio::time::sleep_until(absolute) => {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "XHTTP 上行正文超时",
                 ));
             }
+            result = &mut upload => result?,
         }
-        return Ok(Some(conn));
+        return Ok(None);
     }
     // packet-up：有界读取后按 seq 入队。
     if !matches!(
@@ -926,7 +958,7 @@ async fn handle_h2(
         };
         lane.mark_connected();
         let tunnel = Tunnel::new(
-            ChannelReader::new(rx),
+            ChannelReader::new(rx, &lane),
             FinishOnDrop::new(H2Writer::new(send)),
         );
         let result = dispatch(
@@ -935,7 +967,7 @@ async fn handle_h2(
             vmess,
             ctx,
             absolute,
-            Some(lane.lease()),
+            Some(&lane),
             Some(auth),
         )
         .await;
@@ -959,6 +991,10 @@ async fn handle_h2(
                 Some(lane) => lane,
                 None => pool.open(session_id.clone())?,
             };
+            if !lane.attach_upload() {
+                reject_h2(&mut respond, xhttp, StatusCode::CONFLICT).await;
+                return Ok(());
+            }
             let mut send = respond
                 .send_response(
                     Response::builder()
@@ -1079,19 +1115,28 @@ fn metrics_reject(ctx: &Arc<Context>) {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn dispatch<S>(
+pub(super) async fn dispatch<S>(
     app: S,
     config: &Inbound,
     vmess: &Option<Arc<vmess::Prepared>>,
     ctx: &Arc<Context>,
     deadline: Instant,
-    lease: Option<Lease>,
+    lane: Option<&Session>,
     auth: Option<&crate::runtime::AuthSlot>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let duration = Duration::from_millis(ctx.limits.handshake_timeout_ms);
+    let lease = lane.map(Session::lease);
+    let finish_auth = || {
+        if let Some(auth) = auth {
+            auth.release();
+        }
+        if let Some(lane) = lane {
+            lane.authenticated.cancel();
+        }
+    };
     match config {
         Inbound::VlessXhttp {
             tag, users, xudp, ..
@@ -1112,9 +1157,7 @@ where
             let accepted = timeout_at(deadline, vless::read_plain_request(&mut app, users, *xudp))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP/VLESS认证超时"))??;
-            if let Some(auth) = auth {
-                auth.release();
-            }
+            finish_auth();
             crate::runtime::serve_plain_vless_scoped(
                 app,
                 accepted,
@@ -1131,9 +1174,7 @@ where
             let request = timeout_at(deadline, trojan::read_request(&mut app, users))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP/Trojan认证超时"))??;
-            if let Some(auth) = auth {
-                auth.release();
-            }
+            finish_auth();
             match request.command {
                 Command::Connect => {
                     crate::runtime::serve_trojan_connect(app, tag, ctx.clone(), &request).await
@@ -1162,9 +1203,7 @@ where
             let accepted = timeout_at(deadline, prepared.handshake(&mut app, true))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP/VMess认证超时"))??;
-            if let Some(auth) = auth {
-                auth.release();
-            }
+            finish_auth();
             let allow_udp = prepared.allow_udp();
             crate::runtime::serve_vmess_scoped(
                 app,
@@ -1465,6 +1504,7 @@ type QueuedChunk = (Vec<u8>, tokio::sync::OwnedSemaphorePermit);
 
 struct ChannelReader {
     rx: mpsc::Receiver<QueuedChunk>,
+    _on_drop: tokio_util::sync::DropGuard,
     current: Vec<u8>,
     /// 当前段持有的预算 permit；替换 `current` 时自动归还。
     _current_budget: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -1472,9 +1512,10 @@ struct ChannelReader {
 }
 
 impl ChannelReader {
-    fn new(rx: mpsc::Receiver<QueuedChunk>) -> Self {
+    fn new(rx: mpsc::Receiver<QueuedChunk>, lane: &Session) -> Self {
         Self {
             rx,
+            _on_drop: lane.reader_closed.clone().drop_guard(),
             current: Vec::new(),
             _current_budget: None,
             offset: 0,
@@ -2558,14 +2599,17 @@ async fn handle_h3(
             let _recv = recv;
             pump_h3(send, out).await;
         });
-        let tunnel = Tunnel::new(ChannelReader::new(rx), FinishOnDrop::new(H3Sender::new(tx)));
+        let tunnel = Tunnel::new(
+            ChannelReader::new(rx, &lane),
+            FinishOnDrop::new(H3Sender::new(tx)),
+        );
         let result = dispatch(
             tunnel,
             config,
             vmess,
             ctx,
             absolute,
-            Some(lane.lease()),
+            Some(&lane),
             Some(auth),
         )
         .await;
@@ -2592,6 +2636,10 @@ async fn handle_h3(
                 Some(lane) => lane,
                 None => pool.open(session_id.clone())?,
             };
+            if !lane.attach_upload() {
+                reject_h3(&mut stream, xhttp, StatusCode::CONFLICT).await;
+                return Ok(());
+            }
             while let Some(mut chunk) = stream.recv_data().await.map_err(h3_error)? {
                 while chunk.has_remaining() {
                     let take = chunk.remaining().min(STREAM_CHUNK);

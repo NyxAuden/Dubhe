@@ -2813,6 +2813,76 @@ async fn xray_vless_xhttp_authentication() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "需要已校验官方客户端和执行许可"]
+async fn xray_xhttp_h1_stream_up_survives_handshake_deadline() -> Result<()> {
+    let client = reference_client("xray")?;
+    let certificate = Certificate::new();
+    let protocol = Protocol::VlessXhttp;
+    let mut config = socks_config();
+    config["inbounds"] = json!([protocol.inbound(&certificate, None)]);
+    config["limits"]["handshake_timeout_ms"] = json!(1000);
+    let server = Running::start(config).await;
+    let target = Echo::tcp("127.0.0.1", false).await;
+    let directory = tempfile::tempdir()?;
+    let trust = certificate.dir.path().join("cert.pem");
+    let process = ClientProcess::start_configured(
+        &client,
+        directory.path(),
+        |listen| {
+            let mut config = client_config(
+                "xray",
+                protocol,
+                listen,
+                server.address,
+                &trust,
+                UUID,
+                &certificate_fingerprint(&certificate),
+            )?;
+            let stream = &mut config["outbounds"][0]["streamSettings"];
+            stream["tlsSettings"]["alpn"] = json!(["http/1.1"]);
+            // 默认 Chrome ClientHello 仍会声明 h2；使用 Go TLS，让 ALPN 与 HTTP 版本一致。
+            stream["tlsSettings"]["fingerprint"] = json!("unsafe");
+            stream["xhttpSettings"]["mode"] = json!("stream-up");
+            config["log"]["loglevel"] = json!("info");
+            Ok(config)
+        },
+        |_| {},
+    )
+    .await?;
+
+    let result = timeout(DEADLINE, async {
+        let (mut stream, _) = socks(1, address(target.address), process.address).await;
+        for (index, payload) in [
+            b"before-handshake-deadline".as_slice(),
+            b"after-handshake-deadline",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index > 0 {
+                sleep(Duration::from_millis(1100)).await;
+            }
+            stream.write_all(payload).await?;
+            let mut reply = vec![0; payload.len()];
+            stream
+                .read_exact(&mut reply)
+                .await
+                .with_context(|| format!("第 {} 次回显失败", index + 1))?;
+            ensure!(reply == payload, "回显内容不符");
+        }
+        Ok(())
+    })
+    .await;
+    if !matches!(&result, Ok(Ok(()))) {
+        eprintln!("{}", fs::read_to_string(&process.log_path)?);
+    }
+    result.context("Xray HTTP/1.1 stream-up 未完成跨握手期限回显")??;
+    process.stop()?;
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需要已校验官方客户端和执行许可"]
 async fn mihomo_vless_httpupgrade_authentication() -> Result<()> {
     real_interop("mihomo", Protocol::VlessHttpUpgrade).await
 }
