@@ -75,7 +75,7 @@ Egress 与 Portal 一样是独立子系统：**不经过本内核 route/outbound
 > `dubhe_rejected_total` **不包含 NW3 的认证失败**。
 >
 > **2026-11-24 变更**：`out` 为 `direct`（默认）时，内核会注入一个
-> **仅供本进程使用**的 loopback SOCKS5 入口（tag `__nw3_internal`），并把
+> 带随机凭据、逐 Portal 分配的 loopback SOCKS5 入口，并把
 > Portal 的 `out` 指向它。因此 NW3 的业务流量现在会经过本内核的
 > `route` / `limits` / 统计——`route.rules` 对 NW3 生效，业务字节计入
 > `/stats` 与 `/stats/users`。
@@ -95,9 +95,9 @@ Egress 与 Portal 一样是独立子系统：**不经过本内核 route/outbound
 
 ## Portal 的出口选择（`out`）
 
-`out` 支持三种取值，本内核把它们直接映射到 Nowhere Portal URL 的 `out` 查询参数：
+`out` 支持三种取值：
 
-- `direct`（默认）：Portal 自行解析并连接目标，可用 `dial`/`dial4`/`dial6` 控制源地址。
+- `direct`（默认）：实际传给 Portal 的是内部 relay；业务目的地址按本内核路由处理。
 - `egress`：Portal 不再自己连接目标，而是通过 Egress 注册队列把每条 Flow 交给一个 Egress。
 - `USER:PASS@HOST:PORT` 或 `HOST:PORT`：把目标连接交给 SOCKS5 上游。`@` 与第一个 `:` 是结构分隔符；凭据内部若需要这些字符必须写成 `%40`/`%3A`，单独的 `%` 写成 `%25`。凭据不会出现在本内核的 `Debug` 输出中（只显示 `socks`）。
 
@@ -141,10 +141,10 @@ Egress 与 Portal 一样是独立子系统：**不经过本内核 route/outbound
 
 ## 与本内核其余入口的差异
 
-NW3 **不是一个接入本内核转发链的入站**，而是把 Nowhere 的 Portal 作为独立子系统嵌入同一进程：
+Nowhere Portal 是同进程中的独立子系统；业务流量是否进入 Dubhe 转发链取决于出口模式：
 
 - **自行绑定端口**：TCP 与 UDP 都在 `run()` 阶段由 Portal 绑定，不在 `Server::bind` 阶段。因此 `local_addr` 返回的是配置值；端口被占用、证书不可读等问题会在启动进入 `ready` 之后才暴露为监听任务失败，而不是绑定阶段失败。
-- **自行出站**：`out=direct`（默认）时由 Nowhere 的 `OutboundDialer` 直接解析并连接；`out=egress` 时交给注册到该 Portal 的 Egress；SOCKS5 上游时由 Nowhere 的 SOCKS 客户端转发。三者都**不经过本内核的 `outbounds`、`route`、`reject`、DNS 解析策略，也不计入本内核的流量统计与连接限额**。需要按本内核路由规则限制目标时，当前无法用 NW3 满足。
+- **独立出口的配置护栏**：仅 `out=direct` 经内部 relay；缺少 relay 时拒绝构造 Portal。Portal `out=egress`、显式 SOCKS 上游及顶层 `nw3_egress` 不能执行内核业务路由。配置含其中任何一个时，只允许 `route.rules` 为空且 `route.default` 指向 direct 类型（可声明但不使用 reject 出站）。已有混合部署须拆分进程；不要通过删除保护规则来迁移。放行配置不表示独立出口有 DNS、限额或统计保障，仍需进程外策略。
 - **独立日志**：`nowhere::Logger` 直接按自己的格式写 stdout/stderr，不经 `tracing` 结构化输出，也不受本内核日志配置控制。
 - **本地 IPC**：Portal 会在 `$TMPDIR/nowhere-telemetry-<uid>`（权限 0700）下建立每实例的 Unix 套接字与注册表文件，供 Nowhere 自带的 `status`/telemetry 访问。多个 NW3 入站各有独立实例 ID。IPC 建立失败只记录一行错误，不影响服务。
 - **运行时调优**：`NOW_*` 环境变量（握手超时、UDP 空闲、关闭超时、证书重载间隔等）由 Nowhere 自行读取，本内核配置不覆盖它们。

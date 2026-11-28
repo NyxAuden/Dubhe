@@ -1034,6 +1034,34 @@ fn grpc_stream_limits_have_defaults_and_bounds() {
 }
 
 #[test]
+fn nw3_independent_exit_requires_plain_direct_routing() {
+    let mut value = valid_value();
+    value["inbounds"] = json!([{"type":"nw3", "tag":"portal", "listen":"127.0.0.1:8080",
+        "key":"0123456789abcdef0123456789abcdef"}]);
+    value["route"]["rules"] = json!([{"ports":[{"start":80,"end":80}], "outbound":"blocked"}]);
+    parse_value(&value).unwrap(); // direct 经过内部 relay，保留拒绝规则。
+    for out in ["egress", "127.0.0.1:1080"] {
+        value["inbounds"][0]["out"] = json!(out);
+        assert!(
+            parse_value(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("NW3 独立出口")
+        );
+    }
+    value["inbounds"][0]["out"] = json!("direct");
+    value["nw3_egress"] = json!({"tag":"exit", "endpoint":"localhost:443",
+        "key":"0123456789abcdef0123456789abcdef"});
+    value["route"] = json!({"default":"blocked"});
+    assert!(
+        parse_value(&value)
+            .unwrap_err()
+            .to_string()
+            .contains("NW3 独立出口")
+    );
+}
+
+#[test]
 fn nw3_egress_defaults_and_validation() {
     const KEY: &str = "0123456789abcdef0123456789abcdef";
     let mut value = valid_value();

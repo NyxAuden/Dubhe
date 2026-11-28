@@ -143,6 +143,9 @@ pub(crate) fn prepare_with_out(
             overridden = crate::config::Nw3Out::Socks(value.to_owned());
             &overridden
         }
+        None if matches!(out, Nw3Out::Direct) => {
+            return Err(io::Error::other("NW3 direct 缺少内部 relay，拒绝自行直连"));
+        }
         None => out,
     };
     let url = portal_url(
@@ -234,6 +237,18 @@ mod tests {
 
     fn query(url: &Url) -> HashMap<String, String> {
         url.query_pairs().into_owned().collect()
+    }
+
+    #[test]
+    fn direct_requires_internal_relay() {
+        let inbound: Inbound = serde_json::from_value(serde_json::json!({
+            "type":"nw3", "tag":"p", "listen":"127.0.0.1:8080", "key":KEY
+        }))
+        .unwrap();
+        let err = prepare_with_out(&inbound, None)
+            .err()
+            .expect("missing relay");
+        assert!(err.to_string().contains("缺少内部 relay"));
     }
 
     #[test]

@@ -2058,6 +2058,18 @@ impl Config {
             outbound_by_tag[self.route.default.as_str()].kind != OutboundKind::ShadowTls,
             "route.default 不得使用 shadowtls 出站"
         );
+        // 独立出口无法执行内核的选路，连 selector 中的间接拒绝也不能保证。
+        if self.nw3_egress.is_some()
+            || self.inbounds.iter().any(|inbound| {
+                matches!(inbound, Inbound::Nw3 { out, .. } if !matches!(out, Nw3Out::Direct))
+            })
+        {
+            ensure!(
+                self.route.rules.is_empty()
+                    && outbound_by_tag[self.route.default.as_str()].kind == OutboundKind::Direct,
+                "NW3 独立出口（Portal out=egress/SOCKS 或 nw3_egress）不能执行内核 route；请与自定义路由分进程部署，并在进程外限制出口"
+            );
+        }
         for (index, rule) in self.route.rules.iter().enumerate() {
             ensure!(
                 outbound_tags.contains(rule.outbound.as_str()),
