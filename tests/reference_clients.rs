@@ -1557,21 +1557,61 @@ async fn positive_traffic(
     protocol: Protocol,
     udp: bool,
 ) -> Result<Value> {
+    // 阶段标记只打边界与耗时，便于定位「哪一步在等 / 哪一步被重置」。
+    // begin 一定要打：panic 时可能没有对应的 end。
+    let started = std::time::Instant::now();
+    let stage = |name: &str| {
+        eprintln!(
+            "[stage] {} protocol={} mode={} at_ms={}",
+            name,
+            protocol.name(),
+            protocol.mode(),
+            started.elapsed().as_millis()
+        );
+    };
     let tcp = Echo::tcp("127.0.0.1", false).await;
     let payload = format!("official-client-{}-tcp", protocol.name());
     let payload = [payload.as_bytes(), b"\0\xff"].concat();
+    stage("begin: socks connect");
     let (mut stream, _) = socks(1, address(tcp.address), proxy).await;
+    stage("begin: tcp echo");
     exchange(&mut stream, &payload).await;
+    stage("end: tcp echo");
     drop(stream);
     let mut result = if udp {
-        positive_udp(proxy, protocol).await?
+        stage("begin: udp");
+        let value = positive_udp(proxy, protocol).await?;
+        stage("end: udp");
+        value
     } else {
         json!({"udp": "unsupported_by_client_baseline"})
     };
-    let snapshot = server.stats.snapshot();
+    // 服务端计数发生在 relay 的 poll_write 中，与客户端收到回显是两条时间线。
+    // 这里只重读计数、不重发流量：给「转发完成后计数可见」一个有界窗口。
+    // 持续为零仍判失败，所以真漏计不会被这层等待掩盖。
+    stage("begin: stats wait");
+    let first = server.stats.snapshot();
+    let wait_started = std::time::Instant::now();
+    let deadline = wait_started + std::time::Duration::from_secs(2);
+    let snapshot = loop {
+        let snapshot = server.stats.snapshot();
+        if snapshot.uplink > 0 && snapshot.downlink > 0 {
+            break snapshot;
+        }
+        if std::time::Instant::now() >= deadline {
+            break snapshot;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    stage("end: stats wait");
     ensure!(
         snapshot.uplink > 0 && snapshot.downlink > 0,
-        "项目服务端未统计到真实转发流量"
+        "项目服务端未统计到真实转发流量（首读 uplink={} downlink={}；等待 {} ms 后 uplink={} downlink={}）",
+        first.uplink,
+        first.downlink,
+        wait_started.elapsed().as_millis(),
+        snapshot.uplink,
+        snapshot.downlink
     );
     result["tcp"] = json!("passed");
     result["server_stats"] = json!(snapshot);
@@ -1950,9 +1990,39 @@ async fn run_scenarios(
                 directory.display()
             )
         });
-        process.assert_running()?;
-        process.stop()?;
-        server.shutdown().await;
+        // 先固定业务错误，再做清理：清理自身失败不应覆盖首个真实错误，
+        // 否则报出来的会是「客户端已退出」之类，掩盖最初的失败原因。
+        let cleanup_started = std::time::Instant::now();
+        let running = process.assert_running();
+        let stopped = process.stop();
+        let shutdown = server.shutdown().await;
+        eprintln!(
+            "[stage] cleanup protocol={} mode={} scenario={} at_ms={} business={}",
+            protocol.name(),
+            protocol.mode(),
+            scenario.name(protocol),
+            cleanup_started.elapsed().as_millis(),
+            if result.is_ok() { "ok" } else { "failed" }
+        );
+        // 业务失败优先；业务成功时才报告清理问题。
+        let result = match result {
+            Ok(value) => {
+                running?;
+                stopped?;
+                shutdown;
+                Ok(value)
+            }
+            Err(error) => {
+                if running.is_err() || stopped.is_err() {
+                    eprintln!(
+                        "[stage] cleanup 亦失败（已忽略，保留首个业务错误）protocol={} mode={}",
+                        protocol.name(),
+                        protocol.mode()
+                    );
+                }
+                Err(error)
+            }
+        };
         results.insert(scenario.name(protocol).to_owned(), result?);
         eprintln!(
             "{} {} {} {}: passed",
