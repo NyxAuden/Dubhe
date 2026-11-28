@@ -48,6 +48,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aho-corasick"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -455,9 +464,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.7"
+version = "4.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa8876b300ab35ba921adea3dfd70157a46249b33f95c9084ae5709785478946"
+checksum = "ac230478587d0269d8d6998b82ae69ea51509d55df66d9e92edd1f986904cd4a"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -477,9 +486,9 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.7"
+version = "4.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9c751b79415d4e559e3d1fcf128e09e720eb673a06d26cf6f392d37d75b66e0"
+checksum = "895c9d8d2ac2dd8b8a29f3724a14e72aaaa6debcf8c38c82f97305c6a172767a"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -796,6 +805,71 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "dubhe"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "anyhow",
+ "argon2",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "blake2",
+ "blake3",
+ "boringtun",
+ "bytes",
+ "chacha20poly1305 0.11.0",
+ "clap",
+ "crc32fast",
+ "cryptoxide",
+ "ctr",
+ "futures-util",
+ "h2",
+ "h3",
+ "h3-quinn",
+ "hickory-resolver",
+ "http",
+ "httparse",
+ "ipnet",
+ "md-5",
+ "ml-kem",
+ "nowhere",
+ "prost",
+ "quinn",
+ "quinn-proto",
+ "rcgen 0.13.2",
+ "regex",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "shadowsocks",
+ "shake",
+ "smoltcp",
+ "socket2",
+ "subtle",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "tungstenite",
+ "url",
+ "x509-parser",
+]
+
+[[package]]
+name = "dubhe-fuzz"
+version = "0.0.0"
+dependencies = [
+ "dubhe",
+ "futures",
+ "libfuzzer-sys",
 ]
 
 [[package]]
@@ -2168,6 +2242,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
+name = "regex-automata"
+version = "0.4.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41d60ef07df457506a0a1a2073112eb4aae5733dbd2813c3da77d1b0fd441158"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-syntax",
+]
+
+[[package]]
+name = "regex-syntax"
+version = "0.8.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
+
+[[package]]
 name = "resolv-conf"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2185,72 +2288,6 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rust-proxy-kernel"
-version = "0.1.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "anyhow",
- "argon2",
- "aws-lc-rs",
- "base64 0.22.1",
- "blake2",
- "blake3",
- "boringtun",
- "bytes",
- "chacha20poly1305 0.11.0",
- "clap",
- "crc32fast",
- "cryptoxide",
- "ctr",
- "futures-util",
- "h2",
- "h3",
- "h3-datagram",
- "h3-quinn",
- "hickory-resolver",
- "http",
- "httparse",
- "ipnet",
- "md-5",
- "ml-kem",
- "nowhere",
- "prost",
- "quinn",
- "quinn-proto",
- "rcgen 0.13.2",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "shadowsocks",
- "shake",
- "smoltcp",
- "socket2",
- "subtle",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tokio-util",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "tungstenite",
- "url",
- "x509-parser",
-]
-
-[[package]]
-name = "rust-proxy-kernel-fuzz"
-version = "0.0.0"
-dependencies = [
- "futures",
- "libfuzzer-sys",
- "rust-proxy-kernel",
 ]
 
 [[package]]
