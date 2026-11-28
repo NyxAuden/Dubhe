@@ -23,24 +23,24 @@ blake3 = "1.8"
 bytes = "1"
 chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["alloc"] }
 clap = { version = "4", features = ["derive"] }
-crc32fast = "=1.5.4"
+crc32fast = "=1.5.6"
 cryptoxide = { version = "=0.5.1", default-features = false, features = ["hmac", "sha2"] }
 ctr = { version = "=0.10.1", default-features = false }
 md-5 = { version = "=0.11.0", default-features = false }
 maxminddb = "=0.33.0"
-prost = { version = "=0.14.4", default-features = false, features = ["derive", "std"] }
-quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+prost = { version = "=0.14.6", default-features = false, features = ["derive", "std"] }
+quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 # 与 quinn 0.11.11 已解析的 quinn-proto 版本相同；仅直接命名
 # `RttEstimator` 与委托 `Cubic`，不引入新包或新版本。
 quinn-proto = { version = "=0.11.19", default-features = false }
 shake = { version = "=0.1.0", default-features = false }
-hickory-resolver = { version = "=0.26.2", default-features = true }
+hickory-resolver = { version = "=0.26.4", default-features = true }
 http = { version = "=1.5.0", default-features = false, features = ["std"] }
 ml-kem = { version = "=0.3.4", default-features = false, features = ["alloc", "getrandom"] }
 nowhere = { path = "vendor/nowhere" }
 httparse = { version = "=1.10.1", default-features = false, features = ["std"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"] }
-h2 = { version = "=0.4.20", default-features = false }
+h2 = { version = "=0.4.21", default-features = false }
 h3 = { version = "=0.0.8", default-features = false }
 h3-quinn = { version = "=0.0.10", default-features = false, features = ["datagram"] }
 ipnet = { version = "2", features = ["serde"] }
@@ -48,7 +48,7 @@ rcgen = { version = "=0.13.2", default-features = false }
 # 已在 env_filter 的依赖树内；直接命名用于路由 domain_regex。
 # unicode-perl 是必需的：真实 geosite.dat 里有 `\d` 这类 Perl 字符类
 # （例如 ^cdn\d-epicgames-\d+\.file\.myqcloud\.com$），缺了它整条规则会被拒。
-regex = { version = "=1.13.1", default-features = false, features = ["std", "perf", "unicode-perl"] }
+regex = { version = "=1.13.2", default-features = false, features = ["std", "perf", "unicode-perl"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "aws_lc_rs", "std", "tls12", "reality"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
