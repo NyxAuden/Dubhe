@@ -54,7 +54,13 @@ s = socket.create_server(("127.0.0.2", 35201))
 s.settimeout(15)
 try:
     c, _ = s.accept()
-    c.sendall(b"pong")
+    c.settimeout(5)
+    # 先确认确实收到业务字节，再回 pong；否则只验证了返回路径。
+    got = c.recv(16)
+    if got == b"ping":
+        c.sendall(b"pong")
+    else:
+        c.sendall(b"bad:" + got[:8])
     c.close()
 except Exception:
     pass
@@ -84,14 +90,24 @@ s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.2") + struct.pack("!H"
 r = s.recv(4)
 if len(r) < 2 or r[1] != 0:
     print("REJECTED"); sys.exit()
+# 读完 SOCKS 应答的 BND.ADDR/BND.PORT，否则会被当成载荷。
+size = {1: 4, 4: 16}.get(r[3])
+if size is None:
+    print("unexpected:bad-atyp"); sys.exit()
+s.recv(size + 2)
 s.sendall(b"ping")
-print(s.recv(16).decode(errors="replace"))
+# 只输出 ASCII 可判定的结果，避免非 UTF-8/latin-1 字节让 print 抛异常。
+data = s.recv(16)
+if data == b"pong":
+    print("pong")
+else:
+    print("unexpected:" + data.hex())
 s.close()
 PY
 )
     case "$got" in
-        *pong*) ok "允许路径转发（127.0.0.2 收到并回送）" ;;
-        *)      bad "允许路径转发：$got" ;;
+        pong) ok "允许路径转发（目标收到 ping 并回送 pong）" ;;
+        *)    bad "允许路径转发：$got" ;;
     esac
 
     # 5) 拒绝路径：显式 reject 规则必须让拨号在建立前失败，且目标不应收到连接。
@@ -105,17 +121,27 @@ PY
   ]}
 }
 JSON
-    # 目标侧监听：若被拒绝，这里不应收到任何连接。
-    python3 - <<'PY' &
-import socket
-s = socket.create_server(("127.0.0.3", 35201))
+    # 目标侧监听：结果写入文件，由主流程判定。
+    # 只有「观察窗口内 accept 超时」算通过；收到连接或异常都算失败。
+    REJ_RESULT="$WORK/rej-target.txt"
+    : > "$REJ_RESULT"
+    python3 - "$REJ_RESULT" <<'PY' &
+import socket, sys
+out = sys.argv[1]
+try:
+    s = socket.create_server(("127.0.0.3", 35201))
+except OSError:
+    open(out, "w").write("listen-failed\n")
+    sys.exit(0)
 s.settimeout(8)
 try:
     c, _ = s.accept()
-    # 收到连接说明拒绝失效
     c.close()
+    open(out, "w").write("connection-received\n")
+except socket.timeout:
+    open(out, "w").write("no-connection\n")
 except Exception:
-    pass
+    open(out, "w").write("listener-error\n")
 finally:
     s.close()
 PY
@@ -140,8 +166,19 @@ s.close()
 PY
 )
     if [ "$rej" = "REJECTED" ]; then ok "出口拒绝生效（SOCKS 应答非 0）"; else bad "出口拒绝生效（得到 $rej）"; fi
-    # 目标侧不应收到连接
-    if wait "$REJ_LISTENER" 2>/dev/null; then ok "拒绝目标未收到连接"; else bad "拒绝目标收到连接"; fi
+    # 目标侧判定：必须完成观察窗口且未收到连接。
+    wait "$REJ_LISTENER" 2>/dev/null
+    rej_target=$(tr -d '\n' < "$REJ_RESULT" 2>/dev/null)
+    case "$rej_target" in
+        no-connection)
+            ok "拒绝目标未收到连接（观察窗口内 accept 超时）" ;;
+        connection-received)
+            bad "拒绝目标收到连接——出口拒绝失效" ;;
+        "")
+            bad "拒绝目标监听器无结果（未完成观察窗口）" ;;
+        *)
+            bad "拒绝目标监听异常：$rej_target" ;;
+    esac
     kill -TERM "$REJ_SRV" 2>/dev/null; wait "$REJ_SRV" 2>/dev/null
 fi
 
