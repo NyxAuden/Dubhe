@@ -26,8 +26,8 @@ jobs:
           - macos-15
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: |
             ~/.cargo/registry
@@ -52,7 +52,7 @@ jobs:
           cargo test --locked --all-targets --no-fail-fast 2>&1 | tee test-output.log
       - name: Upload test log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-output-${{ matrix.os }}
           path: test-output.log
@@ -64,7 +64,7 @@ jobs:
     name: supply-chain
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install cargo-deny
         # 必须固定版本：cargo-deny 0.22 要求 rustc 1.95，而本项目固定 1.91.0，
         # 不固定会直接装不上导致 supply-chain job 失败。
@@ -78,8 +78,8 @@ jobs:
     # 不放进三平台矩阵，是因为 34 MB 下载 × 3 既慢又放大网络失败面。
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: .test-artifacts/geodata
           # 与 tools/fetch_geodata.sh 里钉的版本保持一致；改数据版本时同步改这里。
@@ -94,7 +94,7 @@ jobs:
           cargo test --locked --test geo_routing 2>&1 | tee geo-real.log
       - name: Upload geodata test log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: geo-real-log
           path: geo-real.log
@@ -105,7 +105,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Build twice and compare
         run: SOURCE_DATE_EPOCH=1700000000 ./tools/repro-check.sh
 
@@ -115,7 +115,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install nightly and cargo-fuzz
         run: |
           rustup toolchain install nightly
@@ -141,8 +141,8 @@ jobs:
           - macos-15
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: |
             ~/.cargo/registry
@@ -162,7 +162,7 @@ jobs:
           cargo test --locked --test reference_clients -- --ignored --test-threads=1 2>&1 | tee interop.log
       - name: Upload interop log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: interop-log-${{ matrix.os }}
           path: interop.log

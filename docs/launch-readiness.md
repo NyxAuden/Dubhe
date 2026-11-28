@@ -43,12 +43,7 @@
 
 ### 1. NW3 绕过统一出口策略
 
-NW3 不是接入内核转发链的入站，而是把 Nowhere 的 Portal 作为独立子系统嵌入同一进程：
-自行绑定端口、**自行出站**（`out=direct` 时由 Nowhere 的 `OutboundDialer` 直接连接）、
-独立日志、独立 `NOW_*` 环境变量。
-
-**三者都不经过本内核的 `outbounds`、`route`、`reject`、DNS 策略，也不计入流量统计
-与连接限额。** 详见 `docs/nw3.md`。
+更正：Portal `out=direct` 的业务转发已经过内核的内部 SOCKS5 relay。显式 SOCKS 上游、`out=egress` 及顶层 `nw3_egress` 仍独立出站。不要混用二者的路由和计量证据。配置限制和迁移见 [NW3](nw3.md#与本内核其余入口的差异)。
 
 → 首轮单租户灰度应**禁用 NW3 Portal/Egress**，以及在进程外验证默认拒绝。
 
@@ -78,6 +73,8 @@ NW3 不是接入内核转发链的入站，而是把 Nowhere 的 Portal 作为�
    *完成标志*：换一个操作者按手册能识别故障、恢复服务并证明恢复成功。
 
 ## 必须明确排除的承诺
+
+执行第 1 项以[受控试用边界与回切清单](trial-boundary.md)为准。
 
 - 公网多租户
 - 无人值守生产 SLA

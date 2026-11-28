@@ -40,12 +40,14 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.91.0"
+        run: |
+          rustup toolchain install 1.91.0 --profile minimal
+          echo 'RUSTUP_TOOLCHAIN=1.91.0' >> "$GITHUB_ENV"
 
       # musl 目标的 C 依赖（aws-lc-rs、ring、blake3 等）要走 musl-gcc，
       # 只加 Rust 标准库不够：这些 crate 自带 C/汇编实现，需要对应的 C 工具链。
@@ -76,7 +78,7 @@ jobs:
 
       # 解包后必须能从 ELF 属性上确认「这就是静态 musl」，而不是误打包了
       # 宿主 GNU 二进制。构建路径与打包路径同时受 target 影响，两者要一起改。
-      - name: Verify ELF
+      - name: Record build digest
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -89,20 +91,8 @@ jobs:
           fi
           echo "BIN=$bin" >> "$GITHUB_ENV"
           file "$bin"
-          if [ "${{ matrix.asset }}" = "linux-x86_64-musl" ]; then
-            # 静态 ELF 不应有 PT_INTERP 与 DT_NEEDED；有则说明链接成了动态。
-            if readelf -lW "$bin" | grep -q 'INTERP'; then
-              echo "::error::musl 工件含 PT_INTERP，不是静态链接" >&2
-              exit 1
-            fi
-            if readelf -dW "$bin" | grep -q 'NEEDED'; then
-              echo "::error::musl 工件含 DT_NEEDED，不是静态链接" >&2
-              exit 1
-            fi
-            echo "已确认：x86_64 静态 ELF，无 PT_INTERP / DT_NEEDED"
-          fi
-          sha256sum "$bin" | tee "$RUNNER_TEMP/bin.sha256" || shasum -a 256 "$bin"
-          echo "BIN_SHA=$(cut -d' ' -f1 "$RUNNER_TEMP/bin.sha256")" >> "$GITHUB_ENV"
+          digest=$(shasum -a 256 "$bin")
+          echo "BIN_SHA=${digest%% *}" >> "$GITHUB_ENV"
 
       - name: Package
         shell: bash
@@ -131,7 +121,9 @@ jobs:
           cp packaging/systemd/dubhe.service "$name/systemd/"
           # 随包放一个只监听回环的示例：README 的快速开始引用了它，
           # 缺了它会让解包后的 `check` 直接失败。
-          cp examples/socks5.json "$name/examples/"
+          cp examples/{socks5,trojan}.json "$name/examples/"
+          mkdir -p "$name/docs"
+          cp docs/{trial-boundary,fail-closed-matrix}.md "$name/docs/"
           # 保留 vendor 目录结构，避免不同组件的同名许可互相覆盖。
           for dir in vendor/*/; do
             component="$(basename "$dir")"
@@ -155,9 +147,9 @@ jobs:
           else
             shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           fi
-          "$name/dubhe" version
+          bash tools/verify-release-package.sh "$name" "$BIN_SHA" "${{ matrix.asset }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.asset }}
           path: |
@@ -175,7 +167,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
           merge-multiple: true
@@ -183,7 +175,7 @@ jobs:
       - name: List assets
         run: ls -l artifacts
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2
         with:
           files: artifacts/*
           generate_release_notes: true
