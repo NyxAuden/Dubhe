@@ -493,7 +493,8 @@ async fn target_limit_applies_before_waiting_for_request_line_end() {
     assert!(io.output.starts_with(b"HTTP/1.1 431 "));
 }
 
-#[tokio::test]
+// MemoryIo 自行唤醒每次短读写；只有等待不存在的正文才应触发超时。
+#[tokio::test(start_paused = true)]
 async fn finite_preread_and_no_http_body_read() {
     let head = request("/ws", "example.test", "");
     let mut wire = head.clone();
@@ -508,7 +509,7 @@ async fn finite_preread_and_no_http_body_read() {
     let mut io = MemoryIo::short(head.clone(), 1, 7);
     io.input_empty_is_pending = true;
     let result = tokio::time::timeout(Duration::from_millis(100), accept(&mut io, &config())).await;
-    assert!(matches!(result, Ok(Err(_))));
+    assert!(result.expect("只收到头部时 Upgrade 不得等待正文").is_err());
     assert_eq!(io.reads, head.len() * 2);
     assert!(io.output.starts_with(b"HTTP/1.1 400 "));
 }
