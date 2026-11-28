@@ -293,11 +293,7 @@ impl Registry {
                 .unwrap_or_else(|error| error.into_inner());
             // 只按 strong_count 清理会漏掉已关闭的载体：`close()` 之后仍有
             // 本地会话持有 Arc，载体因此在 MAX_CARRIERS 名额里继续占位。
-            clients.retain(|client| {
-                client
-                    .upgrade()
-                    .is_some_and(|client| !client.is_closed())
-            });
+            clients.retain(|client| client.upgrade().is_some_and(|client| !client.is_closed()));
             if clients.len() >= MAX_CARRIERS {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -384,11 +380,7 @@ impl Registry {
                 .unwrap_or_else(|error| error.into_inner());
             // 只按 strong_count 清理会漏掉已关闭的载体：`close()` 之后仍有
             // 本地会话持有 Arc，载体因此在 MAX_CARRIERS 名额里继续占位。
-            clients.retain(|client| {
-                client
-                    .upgrade()
-                    .is_some_and(|client| !client.is_closed())
-            });
+            clients.retain(|client| client.upgrade().is_some_and(|client| !client.is_closed()));
             if clients.len() >= MAX_CARRIERS {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -1076,7 +1068,10 @@ mod tests {
 
         let (next, _peer2) = tokio::io::duplex(64);
         ctx.reverse.attach("portal", next, &ctx).unwrap();
-        let live = clients().into_iter().filter(|client| !client.is_closed()).count();
+        let live = clients()
+            .into_iter()
+            .filter(|client| !client.is_closed())
+            .count();
         assert_eq!(live, 1, "只应留下新载体");
     }
     /// 已关闭的载体不能继续占用 `MAX_CARRIERS` 名额。

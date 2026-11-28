@@ -1795,7 +1795,9 @@ async fn invalid_uplink_frame_after_auth_reports_non_zero_status() {
     let (mut stream, mut body, driver) = plain_client(server.address, "/GunService/Tun").await;
 
     // 完成认证：先发 VLESS 请求头并读到首响应。
-    stream.send_data(frame(&vless_request(echo.address)), false).unwrap();
+    stream
+        .send_data(frame(&vless_request(echo.address)), false)
+        .unwrap();
     assert_eq!(body.next().await.expect("VLESS应答"), vec![0, 0]);
 
     // 随后发送一个长度前缀超限的非法帧，上行 pump 会以 InvalidData 结束。

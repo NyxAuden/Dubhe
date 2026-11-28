@@ -1995,7 +1995,7 @@ async fn run_scenarios(
         let cleanup_started = std::time::Instant::now();
         let running = process.assert_running();
         let stopped = process.stop();
-        let shutdown = server.shutdown().await;
+        server.shutdown().await;
         eprintln!(
             "[stage] cleanup protocol={} mode={} scenario={} at_ms={} business={}",
             protocol.name(),
@@ -2009,7 +2009,6 @@ async fn run_scenarios(
             Ok(value) => {
                 running?;
                 stopped?;
-                shutdown;
                 Ok(value)
             }
             Err(error) => {

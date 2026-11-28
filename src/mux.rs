@@ -1924,7 +1924,8 @@ mod global_id_isolation_tests {
         let mut held = Vec::new();
         for index in 0..3u8 {
             let id = [0x30 + index; 8];
-            let association = acquire_global(id, ctx.clone(), "in", "alice", index as u64, 1).unwrap();
+            let association =
+                acquire_global(id, ctx.clone(), "in", "alice", index as u64, 1).unwrap();
             let slot = ctx.udp_slots.clone().try_acquire_owned().unwrap();
             association.hold_slot(slot);
             association.inner.detach(1).await;

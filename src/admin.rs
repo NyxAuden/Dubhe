@@ -522,8 +522,7 @@ mod tests {
     /// 空值视同非法，而不是当成 0 或「未提供」。
     #[test]
     fn empty_numeric_parameter_is_rejected() {
-        let error =
-            parse_optional("/q?quota_bytes=", "quota_bytes").expect_err("空值应被拒绝");
+        let error = parse_optional("/q?quota_bytes=", "quota_bytes").expect_err("空值应被拒绝");
         assert!(error.contains("invalid quota_bytes"), "{error}");
     }
 
