@@ -13,6 +13,13 @@ use tokio_util::sync::CancellationToken;
 
 pub const PASSWORD: &str = "test-only-not-a-production-secret";
 
+/// 等待服务端任务结束的上限。
+///
+/// 这不是性能断言，而是防止停机挂死时测试永久阻塞。单核机器上 QUIC
+/// 关闭（发送 CONNECTION_CLOSE 并等待排空）明显慢于多核，3 秒会误报；
+/// 放宽到 10 秒仍能可靠捕获真正的挂死。
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// 会话关闭只同步释放所有权，映射读任务的 abort 由运行时异步完成；
 /// 断言旧端口可重新绑定时允许短暂重试，避免测试与任务回收调度竞态。
 pub async fn rebind_udp(addr: SocketAddr) -> UdpSocket {
@@ -182,7 +189,7 @@ impl Running {
 
     pub async fn shutdown(mut self) {
         self.stop.cancel();
-        timeout(Duration::from_secs(3), self.task.as_mut().unwrap())
+        timeout(SHUTDOWN_TIMEOUT, self.task.as_mut().unwrap())
             .await
             .unwrap()
             .unwrap()

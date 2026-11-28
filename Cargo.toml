@@ -101,6 +101,11 @@ strip = "debuginfo"
 # 但无法在依赖内部单步查看变量）。改动会使构建指纹失效，需全量重编一次。
 [profile.dev]
 debug = "line-tables-only"
+# incremental 缓存按「源码 + flags + 依赖指纹」分目录，且 Cargo 从不清理
+# 陈旧目录：191 个历史目录曾累积到 12 GiB，是本仓库 target 体积的主要噪声。
+# 保留它带来的收益只体现在连续微改同一 crate 的重编时间上，对本项目的
+# 集中验收节奏不划算。需要快速迭代时用 `CARGO_INCREMENTAL=1` 临时覆盖。
+incremental = false
 
 [profile.dev.package."*"]
 debug = false
