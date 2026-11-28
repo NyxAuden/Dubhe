@@ -1,5 +1,14 @@
 # 生产可用性评估（2026-11-13）
 
+> **本文是 2026-11-13 的历史快照，平台状态已过时。**
+> 当前平台证据以 [fail-closed-matrix.md 的平台状态与可对外使用表述](fail-closed-matrix.md#平台状态)
+> 为准。本文后续章节中的「Linux x86_64 未取得可信全量结果」等表述**不再代表现状**；
+> 其余生产门禁条目（审计、容量、长稳）仍然有效。
+>
+> 平台状态的正确定位方式：按**候选与实际交付工件**区分，而不是按平台曾经跑过什么。
+> 历史上 Linux ARM64 做过 Colima 回归与 release 冒烟，但那是旧候选；当前候选与拟交付
+> 工件缺哪些证据，须逐项对照当前矩阵。
+
 结论：**当前版本可用于受控实验/内测和明确的协议子集服务端角色，不应直接作为生产代理或完整替代 Xray/sing-box/Nowhere。**
 
 本文只列生产门禁，不把单机回环、编译通过或单个官方客户端结果扩称为生产兼容。
@@ -34,8 +43,11 @@
 ### 1. 发布矩阵与可复现产物
 
 - 已加入固定工具链、三平台 CI、`tools/ci.sh`、`tools/release.sh`、`deny.toml` 和
-  `tools/supply-chain.sh`；但 **Linux x86_64 原生全量测试和 release 仍未完成**，
-  Windows/macOS x86_64 没有构建产物。
+  `tools/supply-chain.sh`。~~但 **Linux x86_64 原生全量测试和 release 仍未完成**，
+  Windows/macOS x86_64 没有构建产物。~~
+  **（历史快照，已被推翻）** 截至 2026-11-28：Linux x86_64 原生分批回归 1709 通过 /
+  0 失败 / 91 忽略，静态 musl release 工件已完成回环冒烟。Windows/macOS x86_64 仍无
+  构建产物。
 - 已完成 macOS ARM64 的双干净目录可复现构建比对；已本地生成 CycloneDX SBOM
   （312 组件，见 [SBOM 记录](sbom.md)），但仍无签名产物、正式发布包、
   安装包/容器镜像，版本升级/回滚流程仍需落地。
@@ -144,12 +156,14 @@
 - REALITY：剩余官方客户端/平台/异常矩阵。
 - Snell：QUIC 目标（上游有明确实现后再做）；ShadowTLS v1/v2 明确不支持。
 - Mihomo REALITY、TUIC 0-RTT、官方 Anywhere 等需要上游真实客户端证据。
-- Linux x86_64 全量与 release；Windows 构建与运行验收。
+- 平台：Linux x86_64 已完成原生分批全量与静态 musl release 冒烟（见当前矩阵）；
+  剩余为 ARM64 当前候选复验、glibc 工件、Windows/macOS x86_64。
 
 ## 建议生产门禁顺序
 
 1. 固定并签署版本；生成 SBOM、校验和、源码提供说明。
-2. 完成 Linux x86_64 全量与 release；至少再完成一个非 macOS 真机/原生平台。
+2. ~~完成 Linux x86_64 全量与 release~~（已完成，见当前矩阵）；补齐实际要分发的
+   其余平台工件，并让冒烟/soak 指向同一个待交付二进制。
 3. 独立安全审计 + 模糊/差分/恶意输入测试 + 依赖公告持续扫描。
 4. 加入 systemd/launchd、权限降级、日志轮转、Prometheus/OTel、ACME 和完整热重载。
 5. 做连接/UDP/握手/慢客户端/长稳容量压测，形成容量与故障手册。

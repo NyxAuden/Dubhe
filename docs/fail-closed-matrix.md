@@ -97,15 +97,25 @@
 
 ### release 工件冒烟（x86_64，单独一节）
 
+> **验收绑定到具体 ELF，不是绑定到资产名。** Debian 11 x86_64 非 root 回环冒烟 7/7，
+> 通过对象为静态 musl ELF，SHA-256
+> `4641055bb4f9e2c6ddd8ef95cbb2b0fee0968935bac5d3d119492d29558a7e80`。
+> 该记录**不覆盖**其他构建目标产生的包。后续发布资产按**包内二进制 SHA** 单独列示
+> 验收结果；包内 SHA 不同即需对该 ELF 另行冒烟，不能沿用本条。
+
 对 release profile 构建的静态 musl 工件做非 root 原生冒烟：
 
 | 项 | 值 |
 |---|---|
 | 构建 | `cargo build --locked --release --target x86_64-unknown-linux-musl` |
-| 大小 | 39,367,272 字节，ELF64 x86_64，静态（无 `ld-linux` 依赖） |
+| 大小 | 39,367,272 字节，ELF64 x86_64，静态 |
 | SHA-256 | `4641055bb4f9e2c6ddd8ef95cbb2b0fee0968935bac5d3d119492d29558a7e80` |
 | 执行身份 | `setpriv --reuid=65534`，`id -u` = 65534 |
 | 结果 | **7 项全过，退出码 0** |
+
+静态性以 ELF 属性确认，不只看 `file` 输出：`readelf -lW` 无 `PT_INTERP`、
+`readelf -dW` 无 `DT_NEEDED`。该判据已用动态链接的 `/bin/ls` 做对照
+（`INTERP` 1、`NEEDED` 2），确认具备区分能力，不是恒真判断。
 
 覆盖：`version`、`config check`、启动监听、允许路径转发、出口拒绝生效（SOCKS
 应答非 0）、拒绝目标未收到连接、SIGTERM 停机 `exit=0`。
@@ -131,6 +141,29 @@
 早前版本「先发 SIGTERM 再取时、且未确认服务端已监听」，其 34 ms 属无效结果，
 已作废。已改为：同一进程在发信号前取单调时间、写配置失败即退出、
 并先确认被测进程已监听。本项不升级为发布门槛。
+
+### 发布工作流的构建目标（待 CI 验证）
+
+发布工作流此前用 `cargo build --locked --release`（无 `--target`），在
+`ubuntu-24.04` 上产出的是 **glibc 动态链接**二进制，与上节冒烟的静态 musl ELF
+**不是同一个工件**；资产名 `linux-x86_64` 会把 7/7 证据错误地转移过去。
+
+已改为按 target 构建，并让打包路径随之变化：
+
+| 资产 | target | 链接方式 |
+|---|---|---|
+| `linux-x86_64-musl` | `x86_64-unknown-linux-musl` | 静态（ELF 属性检查放行） |
+| `linux-aarch64-gnu` | 宿主默认 | GNU 动态；运行基线与验证状态单列 |
+| `darwin-arm64` | 宿主默认 | 平台惯用 |
+
+同时新增两项门禁：打包前用 `readelf` 确认 x86_64 工件无 `PT_INTERP` / `DT_NEEDED`；
+包内写入 `dubhe.sha256`，使验收结果可绑定到具体 ELF。
+
+> **状态：改动未经 CI 验证。** 本机是 macOS，没有 `musl-gcc`，无法验证
+> `musl-tools` 能否编过 `aws-lc-rs`、`ring`、`blake3` 等项目的原生依赖。
+> 该链路须以首次干净 CI 构建结果为准；在此之前不得声称 CI 可产出静态 musl 工件。
+> 另：`workflow_dispatch` 与 `v*` tag 是两次独立构建，演练包通过不代表 tag 包相同，
+> 正式包仍需比对包内 ELF 的 SHA，不同则补验。
 
 ### 官方对端互通（x86_64，单独一节）
 

@@ -22,12 +22,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # x86_64 交付静态 musl：目标环境是 Debian 11 这类老 glibc 系统，
+          # 静态 ELF 不依赖宿主 libc 版本。资产名标注 libc，避免与 GNU 包混淆。
           - os: ubuntu-24.04
-            asset: linux-x86_64
+            asset: linux-x86_64-musl
+            target: x86_64-unknown-linux-musl
+          # ARM64 Linux 暂保留宿主 GNU 构建；其运行基线与验证状态单列，
+          # 不因共享 `linux-` 前缀而享有 x86_64 的验收结果。
           - os: ubuntu-24.04-arm
-            asset: linux-aarch64
+            asset: linux-aarch64-gnu
+            target: ""
           - os: macos-15
             asset: darwin-arm64
+            target: ""
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -37,8 +45,62 @@ jobs:
         with:
           toolchain: "1.91.0"
 
+      # musl 目标的 C 依赖（aws-lc-rs、ring、blake3 等）要走 musl-gcc，
+      # 只加 Rust 标准库不够：这些 crate 自带 C/汇编实现，需要对应的 C 工具链。
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          musl-gcc --version | head -1
+
+      - name: Install Rust target
+        if: matrix.target != ''
+        run: rustup target add "${{ matrix.target }}"
+
       - name: Build
-        run: cargo build --locked --release --bin dubhe
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TARGET" ]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+            cargo build --locked --release --bin dubhe --target "$TARGET"
+          else
+            cargo build --locked --release --bin dubhe
+          fi
+
+      # 解包后必须能从 ELF 属性上确认「这就是静态 musl」，而不是误打包了
+      # 宿主 GNU 二进制。构建路径与打包路径同时受 target 影响，两者要一起改。
+      - name: Verify ELF
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TARGET" ]; then
+            bin="target/${TARGET}/release/dubhe"
+          else
+            bin="target/release/dubhe"
+          fi
+          echo "BIN=$bin" >> "$GITHUB_ENV"
+          file "$bin"
+          if [ "${{ matrix.asset }}" = "linux-x86_64-musl" ]; then
+            # 静态 ELF 不应有 PT_INTERP 与 DT_NEEDED；有则说明链接成了动态。
+            if readelf -lW "$bin" | grep -q 'INTERP'; then
+              echo "::error::musl 工件含 PT_INTERP，不是静态链接" >&2
+              exit 1
+            fi
+            if readelf -dW "$bin" | grep -q 'NEEDED'; then
+              echo "::error::musl 工件含 DT_NEEDED，不是静态链接" >&2
+              exit 1
+            fi
+            echo "已确认：x86_64 静态 ELF，无 PT_INTERP / DT_NEEDED"
+          fi
+          sha256sum "$bin" | tee "$RUNNER_TEMP/bin.sha256" || shasum -a 256 "$bin"
+          echo "BIN_SHA=$(cut -d' ' -f1 "$RUNNER_TEMP/bin.sha256")" >> "$GITHUB_ENV"
 
       - name: Package
         shell: bash
@@ -53,7 +115,13 @@ jobs:
           fi
           name="dubhe-${version}-${{ matrix.asset }}"
           mkdir -p "$name/systemd" "$name/examples" "$name/licenses"
-          cp target/release/dubhe "$name/"
+          # 打包路径必须与构建 target 一致，否则会把宿主默认目标的二进制
+          # 打进包里（x86_64 上就是 GNU 动态链接）。
+          cp "$BIN" "$name/"
+          # 记录包内二进制的 SHA，便于把「验收结果」绑定到具体 ELF，
+          # 而不是绑定到包名。
+          printf '%s  dubhe\n' "$BIN_SHA" > "$name/dubhe.sha256"
+          echo "包内二进制 SHA-256: $BIN_SHA"
           # NOTICE 的「分发义务」要求随二进制附带 NOTICE 本身与 vendor/ 下
           # 各组件的原始许可文本；此前只复制 LICENSE/THIRD-PARTY/README，
           # 不满足该义务。
