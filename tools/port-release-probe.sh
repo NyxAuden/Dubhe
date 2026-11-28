@@ -74,3 +74,5 @@ cat "$OUT"
 if [ "$rc" = 0 ]; then
     printf "%s  %s\n" "$(date -u +%FT%TZ)" "$(cat "$OUT")" >> port-release-samples.txt
 fi
+# 透传探测结果：仍占用、未监听、空转失败都要能被调用方看到。
+exit "$rc"
