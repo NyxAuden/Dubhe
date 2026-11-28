@@ -183,13 +183,14 @@ impl ApiConfig {
                     self.token.is_empty(),
                     "api.token 与 api.token_file 只能配置一个"
                 );
-                let input = std::fs::read_to_string(path)
-                    .map_err(|_| anyhow!("api.token_file 不可读取"))?;
-                let token = input.trim_end_matches(['\r', '\n']).to_owned();
+                use std::io::Read;
+                let mut file =
+                    std::fs::File::open(path).map_err(|_| anyhow!("api.token_file 不可读取"))?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let mode = std::fs::metadata(path)
+                    let mode = file
+                        .metadata()
                         .map_err(|_| anyhow!("api.token_file 不可读取"))?
                         .permissions()
                         .mode();
@@ -198,7 +199,10 @@ impl ApiConfig {
                         "api.token_file 权限必须为 0600（不得允许组或其他用户读取）"
                     );
                 }
-                token
+                let mut input = String::new();
+                file.read_to_string(&mut input)
+                    .map_err(|_| anyhow!("api.token_file 不可读取"))?;
+                input.trim_end_matches(['\r', '\n']).to_owned()
             }
             None => self.token.clone(),
         };

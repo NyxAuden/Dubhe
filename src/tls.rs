@@ -261,9 +261,10 @@ impl ReloadHandle {
 }
 
 #[cfg(unix)]
-fn check_private_key_permissions(path: &Path) -> Result<()> {
+fn check_private_key_permissions(file: &std::fs::File) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(path)
+    let mode = file
+        .metadata()
         .map_err(|_| anyhow!("无法读取 TLS 私钥"))?
         .permissions()
         .mode();
@@ -274,13 +275,14 @@ fn check_private_key_permissions(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn check_private_key_permissions(_path: &Path) -> Result<()> {
+fn check_private_key_permissions(_file: &std::fs::File) -> Result<()> {
     Ok(())
 }
 
 /// 加载 PEM 证书链及私钥，错误不包含路径、PEM 内容或底层解析详情。
 pub fn load(certificate: &Path, private_key: &Path) -> Result<Arc<ServerConfig>> {
-    check_private_key_permissions(private_key)?;
+    let private_key = std::fs::File::open(private_key).map_err(|_| anyhow!("无法读取 TLS 私钥"))?;
+    check_private_key_permissions(&private_key)?;
     let certificates = CertificateDer::pem_file_iter(certificate)
         .map_err(|_| anyhow!("无法读取 TLS 证书"))?
         .collect::<Result<Vec<_>, _>>()
@@ -289,7 +291,7 @@ pub fn load(certificate: &Path, private_key: &Path) -> Result<Arc<ServerConfig>>
         return Err(anyhow!("TLS 证书链为空"));
     }
     let key =
-        PrivateKeyDer::from_pem_file(private_key).map_err(|_| anyhow!("无法解析 TLS 私钥"))?;
+        PrivateKeyDer::from_pem_reader(private_key).map_err(|_| anyhow!("无法解析 TLS 私钥"))?;
 
     // 显式选择局部 provider，不修改嵌入程序的全局密码学配置。
     let config =
