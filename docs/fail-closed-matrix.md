@@ -92,7 +92,7 @@
   `reality_official_outbound` 1、`reverse_official_bridge` 1）；其余 10 项是
   REALITY 系列的 Python cryptography/MLDSA 门禁、`resources` 与 lib 各 1 项。
   这些测试检测到依赖缺失后跳过，**不等于通过，也不算失败**。
-- 本轮证据支持**默认功能回归**；官方对端互通与最终 release 工件另列验收。
+- 本轮证据支持**默认功能回归**；官方对端互通与指定 release 工件冒烟另列下方两节。
 - Windows、macOS x86_64 状态不变。
 
 ### release 工件冒烟（x86_64，单独一节）
@@ -116,16 +116,21 @@
   故该断言同时证明「请求到达目标」与「响应返回客户端」两个方向。
 - **拒绝目标**由监听器把结果写入文件，按 `no-connection` / `connection-received`
   / 空（未完成观察）三态判定；只有「观察窗口内 `accept` 超时」算通过。
-  脚本先用「放行场景」做对照，确认监听器能报出 `connection-received`，
-  以排除恒真断言。
+  空文件与 `listen-failed`、`listener-error` 均判失败。另**单独做过一次放行对照**，
+  确认监听器在规则放行时能报出 `connection-received`，以排除恒真断言。
 
 > 早前版本的拒绝目标断言在收到连接与超时两种情况下退出码均为 0，属假通过；
-> 已修正并用对照场景验证其区分能力（`tools/reject-assertion-control.sh`）。
-> 该对照脚本为一次性验证用，未纳入版本库。
+> 已修正。放行对照为一次性验证，不随每次冒烟运行，也未纳入版本库。
+>
+> 长期作为 CI 门禁仍需加固：监听器目前靠 `sleep 1` 同步、8 秒观察窗独立计时，
+> 请求发得过早或过晚都可能得到「SOCKS 非零应答 + 目标超时」。最小加固是让
+> 监听器报告 `ready` 后再发请求，并确认拒绝应答在观察窗口结束前收到。
 
-端口释放为单独探测：以单调时钟实测，从 `SIGTERM` 到端口可重新绑定，
-非 root 下四次观察为 36 / 34 / 29 / 31 ms。这是该工件的观察值，
-**不作为固定时限的验收保证**。
+端口释放为单独探测：本次正常停机后**探测到端口可重新绑定**。该脚本为可选诊断，
+其耗时数字**不作为验收值**；逐次原始输出见证据目录 `port-release-samples.log`。
+早前版本「先发 SIGTERM 再取时、且未确认服务端已监听」，其 34 ms 属无效结果，
+已作废。已改为：同一进程在发信号前取单调时间、写配置失败即退出、
+并先确认被测进程已监听。本项不升级为发布门槛。
 
 ### 官方对端互通（x86_64，单独一节）
 
@@ -146,11 +151,13 @@ linux-amd64，上游校验和已核对（mihomo v1.19.33、sing-box v1.14.4、Xr
 
 sing-box 的唯一失败是 **Naive 在 `valid` 阶段客户端提前退出**，单列。
 
-**16 项失败不能统一归因。** mihomo 的 15 项中，至少 4 项发生在 `valid`（正向）
-阶段：SS2022 AES-128-GCM EIH、SS ChaCha20-Poly1305 单用户（连接被重置），
-以及 VLESS 裸 TCP（项目服务端未统计到真实转发流量）；其余分布于
-`wrong-uuid`、`untrusted-certificate`、`wrong-password`、`wrong-identity-psk`
-等负向阶段。故**不可**把失败整体描述为「负向时序问题」。
+**16 项失败不能统一归因。** mihomo 的 15 项失败中，主日志明确标出 **3 项 `valid`**
+（两项 Shadowsocks 连接重置：SS2022 AES-128-GCM EIH、SS ChaCha20-Poly1305 单用户；
+一项 VLESS 裸 TCP 未观察到转发计量）、**7 项负向**（`wrong-uuid` 3、`wrong-password` 2、
+`untrusted-certificate` 1、`wrong-identity-psk` 1）；余 **5 项**（ShadowTLS、Trojan、
+TUIC、VLESS-WS、VMess）只落在公共 `read_exact` 助手并 `ConnectionReset` panic，
+阶段未判明。加上 sing-box Naive 的 `valid` 阶段客户端提前退出，
+**两客户端合计明确的正向失败 4 项**。故**不可**把失败整体描述为「负向时序问题」。
 
 已用外部进程独立探测验证产品侧行为正确（仅覆盖所抽查的 VLESS 裸 TCP 与
 HTTPUpgrade 错误凭据场景，不能替代正向失败、Naive 或其他协议的复验）：
@@ -180,3 +187,15 @@ sing-box 1 项失败待查）；mihomo 8 项通过、15 项失败，失败阶段
 3. 在 Linux ARM64 做 1–4 小时 soak；x86_64 默认功能回归已完成，指定 release
    工件的非 root 原生冒烟已完成（7/7，见上）；仍缺 WAN、容量与长稳。
 4. 把本矩阵与 `docs/fuzzing.md`、官方互通记录一起提交审计。
+
+## 可对外使用的平台状态
+
+> **Linux x86_64 原生默认功能回归已完成。** Debian 11 上分批执行静态 musl 的
+> test-profile 工件，覆盖主包 lib 和 82 个集成测试目标；按套件最终复验去重，
+> 1709 通过、0 失败、91 忽略。指定静态 musl release 工件（SHA-256
+> `4641055b…`）另在目标平台完成非 root 回环冒烟，7/7 通过，含允许路径双向载荷、
+> 拒绝应答及目标监听窗口内未收到连接、SIGTERM 正常退出。官方客户端矩阵已执行：
+> 51 项实际互通通过、12 项预期不支持、16 项失败待查。
+
+不得延伸至 glibc 工件、WAN、生产容量或长稳；也不得把 16 项互通失败算作
+产品缺陷或整体豁免为测试设施问题。
