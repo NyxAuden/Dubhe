@@ -1,6 +1,15 @@
 # 生产运维基线
 
-本文是 v1 服务端部署的最小运维基线，不把“能启动”当成生产验收。当前仍未完成外部安全审计、原生 Linux x86_64 全量/release、容量与长稳测试；完整门禁见 [生产可用性评估](production-readiness.md)，威胁与部署约束见 [威胁模型](threat-model.md)。
+本文是 v1 服务端部署的最小运维基线，不把“能启动”当成生产验收。
+
+平台状态按证据分三档，不要混为一谈（细节见 [当前矩阵](fail-closed-matrix.md)）：
+
+- **已完成**：Linux x86_64 原生分批默认功能回归；
+- **已完成（限定工件）**：静态 musl ELF `4641055b…` 在 Debian 11 非 root 的 7/7 回环冒烟；
+- **待验**：当前 CI 发布包、长稳、容量、WAN，以及其余平台。
+
+外部安全审计、长稳与容量测试仍未完成。完整门禁见 [生产可用性评估](production-readiness.md)，
+威胁与部署约束见 [威胁模型](threat-model.md)。
 
 ## v1 支持面
 
@@ -33,11 +42,16 @@ sudo chmod 0600 /etc/dubhe/api.token
 证书和私钥同样应只允许运行用户读取；Unix 下 TLS 私钥若允许组或其他用户读取，
 启动/检查会失败（要求 0600）。不要通过命令行参数传递 token 或私钥。
 
-安装 systemd unit：
+安装 systemd unit。**从发布包安装**时 unit 在包内 `systemd/` 目录；**从源码树安装**
+时在 `packaging/systemd/`。两者内容相同，别混用路径：
 
 ```sh
-sudo install -m 0644 packaging/systemd/dubhe.service \
-  /etc/systemd/system/dubhe.service
+# 从发布包（解包后的目录内）
+sudo install -m 0644 systemd/dubhe.service /etc/systemd/system/dubhe.service
+
+# 或从源码树
+# sudo install -m 0644 packaging/systemd/dubhe.service /etc/systemd/system/dubhe.service
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now dubhe
 ```

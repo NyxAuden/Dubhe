@@ -59,7 +59,7 @@
 | **ShadowTLS** | v3（含 SNI 映射与 wildcard SNI） |
 | **Naive** | H1 / H2 / H3，含 padding 层 |
 | **WireGuard** | 用户态服务端，无 TUN |
-| **NW3** | Portal 入站（含 `direct` / `egress` / SOCKS5 出口） |
+| **NW3** | Portal 入站（含 `direct` / `egress` / SOCKS5 出口）。**注意：自行出站，不经本内核 `route` / `reject` / 统计与限额**，见 [NW3](docs/nw3.md) |
 | **通用** | SOCKS5（CONNECT / UDP ASSOCIATE / BIND）· HTTP · Mixed · dokodemo-door |
 
 **13 个协议族，不是 40 个协议。** 上表的 `-ws` / `-grpc` 等是同一协议的承载变体，
