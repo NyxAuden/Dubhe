@@ -99,47 +99,51 @@ impl Target {
     /// 消费原连接，先回放已读下行，再排空原始双向流；没有第二次目标拨号。
     /// 两向 pump 是同一 future 的子 future，不生成后台任务；外层 drop 即关闭两 socket。
     pub(crate) async fn fallback(self, mut client: TcpStream, config: &Reality) -> io::Result<()> {
-        let idle = Duration::from_millis(config.fallback_idle_timeout_ms);
-        let total = Duration::from_millis(config.fallback_max_duration_ms);
-        if idle.is_zero() || total < idle {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "REALITY 回落期限无效",
-            ));
-        }
-        let now = Instant::now();
-        let deadline = now.checked_add(total).ok_or_else(elapsed)?;
-        let (progress, mut observed) = watch::channel(now);
-        let Self {
-            mut stream,
-            capture,
-            ..
-        } = self;
-        let (client_read, client_write) = client.split();
-        let (target_read, target_write) = stream.split();
-        let relay = async {
-            tokio::try_join!(
-                pump(client_read, target_write, &[], &progress),
-                pump(target_read, client_write, &capture.bytes, &progress),
-            )?;
-            Ok(())
-        };
-        tokio::pin!(relay);
-        loop {
-            let last = *observed.borrow_and_update();
-            let idle_deadline = last.checked_add(idle).ok_or_else(elapsed)?;
-            tokio::select! {
-                biased;
-                _ = sleep_until(deadline) => return Err(elapsed()),
-                _ = sleep_until(idle_deadline) => {
-                    // 同一 poll 中另一方向可能刚推进，不能按旧快照误判 idle。
-                    if Instant::now().duration_since(*observed.borrow()) >= idle {
-                        return Err(elapsed());
-                    }
+        let mut stream = self.stream;
+        fallback_relay(client.split(), stream.split(), &self.capture.bytes, config).await
+    }
+}
+
+// 借用 TCP 半流，不增加任务或缓冲；测试可以用内存半流精确驱动两条期限。
+async fn fallback_relay(
+    (client_read, client_write): (impl AsyncRead + Unpin, impl AsyncWrite + Unpin),
+    (target_read, target_write): (impl AsyncRead + Unpin, impl AsyncWrite + Unpin),
+    captured: &[u8],
+    config: &Reality,
+) -> io::Result<()> {
+    let idle = Duration::from_millis(config.fallback_idle_timeout_ms);
+    let total = Duration::from_millis(config.fallback_max_duration_ms);
+    if idle.is_zero() || total < idle {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "REALITY 回落期限无效",
+        ));
+    }
+    let now = Instant::now();
+    let deadline = now.checked_add(total).ok_or_else(elapsed)?;
+    let (progress, mut observed) = watch::channel(now);
+    let relay = async {
+        tokio::try_join!(
+            pump(client_read, target_write, &[], &progress),
+            pump(target_read, client_write, captured, &progress),
+        )?;
+        Ok(())
+    };
+    tokio::pin!(relay);
+    loop {
+        let last = *observed.borrow_and_update();
+        let idle_deadline = last.checked_add(idle).ok_or_else(elapsed)?;
+        tokio::select! {
+            biased;
+            _ = sleep_until(deadline) => return Err(elapsed()),
+            _ = sleep_until(idle_deadline) => {
+                // 同一 poll 中另一方向可能刚推进，不能按旧快照误判 idle。
+                if Instant::now().duration_since(*observed.borrow()) >= idle {
+                    return Err(elapsed());
                 }
-                result = &mut relay => return result,
-                _ = observed.changed() => {}
             }
+            result = &mut relay => return result,
+            _ = observed.changed() => {}
         }
     }
 }
@@ -669,33 +673,34 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn target_fallback_idle_and_total_deadlines_are_distinct() {
-        let (stream, mut peer) = sockets().await;
-        let (mut user, client) = sockets().await;
+        let (stream, mut peer) = duplex(64);
+        let (mut user, client) = duplex(64);
         let mut config = configuration(1);
         config.fallback_idle_timeout_ms = 25;
         config.fallback_max_duration_ms = 100;
-        let target = Target {
-            stream,
-            capture: Capture::default(),
-            template_started: false,
-        };
+        let began = Instant::now();
         assert_eq!(
-            target.fallback(client, &config).await.unwrap_err().kind(),
+            fallback_relay(
+                tokio::io::split(client),
+                tokio::io::split(stream),
+                &[],
+                &config
+            )
+            .await
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::TimedOut
         );
+        assert_eq!(began.elapsed(), Duration::from_millis(25));
         let mut byte = [0];
         assert_eq!(user.read(&mut byte).await.unwrap(), 0);
         assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
 
-        let (stream, mut peer) = sockets().await;
-        let (mut user, client) = sockets().await;
-        let target = Target {
-            stream,
-            capture: Capture::default(),
-            template_started: false,
-        };
+        let (stream, mut peer) = duplex(64);
+        let (mut user, client) = duplex(64);
+        let mut exchanges = 0;
         let user_side = async {
             let mut data = [0];
             loop {
@@ -703,6 +708,8 @@ mod tests {
                 {
                     break;
                 }
+                assert_eq!(data, [1]);
+                exchanges += 1;
                 sleep(Duration::from_millis(5)).await;
             }
         };
@@ -716,13 +723,22 @@ mod tests {
         };
         let began = Instant::now();
         timeout(Duration::from_secs(2), async {
-            let (result, (), ()) =
-                tokio::join!(target.fallback(client, &config), user_side, peer_side);
+            let (result, (), ()) = tokio::join!(
+                fallback_relay(
+                    tokio::io::split(client),
+                    tokio::io::split(stream),
+                    &[],
+                    &config
+                ),
+                user_side,
+                peer_side
+            );
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         })
         .await
         .unwrap();
-        assert!(began.elapsed() >= Duration::from_millis(90));
+        assert!(exchanges >= 4);
+        assert_eq!(began.elapsed(), Duration::from_millis(100));
     }
 
     #[tokio::test]

@@ -208,19 +208,27 @@ async fn outbound_lengths_flush_and_replaced_pending_slice_match_the_wire() {
     assert_eq!(*written.lock().unwrap(), expected);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn short_writes_and_pending_accept_each_business_byte_once_with_fixed_segments() {
     for limit in [1, 7, 17] {
         let io = Probe::new(vec![], limit);
         let written = io.output.clone();
         let mut socket = WebSocket::new(io, vec![], vec![]).await;
         let data: Vec<u8> = (0..80_019).map(|n| (n % 251) as u8).collect();
-        // 8 万字节按 1/7/17 字节分片写入，单核争抢时 3 秒不够；
-        // 放宽到 15 秒只影响失败等待时间，不改变断言语义。
-        tokio::time::timeout(Duration::from_secs(15), async {
+        // Probe 每次短写都主动唤醒。虚拟期限抓漏唤醒；poll 上限抓只唤醒不推进。
+        let mut write = std::pin::pin!(async {
             socket.write_all(&data).await.unwrap();
             socket.flush().await.unwrap();
-        })
+        });
+        let mut polls = 0;
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            std::future::poll_fn(|cx| {
+                polls += 1;
+                assert!(polls <= 4 * data.len(), "短写未在有界 poll 内完成");
+                std::future::Future::poll(write.as_mut(), cx)
+            }),
+        )
         .await
         .unwrap();
         let messages = decode_server(&written.lock().unwrap());
