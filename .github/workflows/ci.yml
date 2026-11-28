@@ -52,7 +52,7 @@ jobs:
           cargo test --locked --all-targets --no-fail-fast 2>&1 | tee test-output.log
       - name: Upload test log
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-output-${{ matrix.os }}
           path: test-output.log
@@ -94,7 +94,7 @@ jobs:
           cargo test --locked --test geo_routing 2>&1 | tee geo-real.log
       - name: Upload geodata test log
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: geo-real-log
           path: geo-real.log
@@ -162,7 +162,7 @@ jobs:
           cargo test --locked --test reference_clients -- --ignored --test-threads=1 2>&1 | tee interop.log
       - name: Upload interop log
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: interop-log-${{ matrix.os }}
           path: interop.log
