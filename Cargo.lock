@@ -894,7 +894,7 @@ dependencies = [
  "tungstenite",
  "url",
  "x509-parser",
- "yasna 0.5.2",
+ "yasna 0.6.0",
 ]
 
 [[package]]
