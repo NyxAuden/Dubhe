@@ -377,3 +377,14 @@ pub async fn trojan_recv<S: AsyncRead + Unpin>(s: &mut S) -> (SocketAddr, Vec<u8
     read_exact(s, &mut data).await;
     (address, data)
 }
+
+/// 被测 `dubhe` 可执行文件路径。
+///
+/// 默认用 Cargo 编译出的二进制；跨平台交叉测试（例如把测试二进制单独
+/// 拷到另一台机器）可用 `DUBHE_TEST_BINARY` 指定实际路径，因为
+/// `CARGO_BIN_EXE_dubhe` 是**编译时**写死的绝对路径。
+pub fn test_binary() -> std::path::PathBuf {
+    std::env::var_os("DUBHE_TEST_BINARY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_dubhe").into())
+}

@@ -64,8 +64,11 @@
 
 ## 明确缺口
 
-1. **私钥/证书/配置文件权限**：`api.token_file` 已检查 0600；TLS 私钥现在也会拒绝
-   组/其他用户可读（Unix），但配置文件权限仍依赖部署层，尚未 fail-closed。
+1. **私钥/证书/配置文件权限**：`api.token_file` 与 TLS 私钥均已 fail-closed
+   （0600，组/其他用户可读时拒绝启动）。**配置文件本身不在此列**：程序无法
+   判断任意配置文件是否敏感（可能只含非机密字段），强制 0600 会破坏正常部署；
+   该权限由部署层负责，属设计边界而非缺陷。若配置内含 `api.token` 明文或
+   内联私钥，应改用 `token_file`/文件路径并确保 0600。
 2. **完整握手 fuzz**：当前 fuzz 覆盖配置、Vision、SOCKS5/HTTP 数据报、XUDP、VLESS/
    Trojan/Snell/TUIC 解析、XHTTP/gRPC/VMess header；未覆盖 Shadowsocks AEAD/2022 EIH、
    REALITY、XHTTP 会话、gRPC stream、mKCP、TUIC 状态机、WireGuard、ShadowTLS 的完整

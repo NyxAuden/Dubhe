@@ -16,7 +16,11 @@ use tokio::{
 };
 
 const TOKEN: &str = "0123456789abcdef";
-const BINARY: &str = env!("CARGO_BIN_EXE_dubhe");
+fn binary() -> std::path::PathBuf {
+    std::env::var_os("DUBHE_TEST_BINARY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_dubhe").into())
+}
 const WAIT: Duration = Duration::from_secs(20);
 
 /// 独立端口段：`tests/cli.rs` 独占 20000–22499，这里用 24000–25999。
@@ -60,7 +64,7 @@ impl Cli {
         fs::write(&config, configuration.to_string()).unwrap();
         let stderr = directory.path().join("stderr.log");
         let stdout = directory.path().join("stdout.log");
-        let child = std::process::Command::new(BINARY)
+        let child = std::process::Command::new(binary())
             .args(["run", "-c", config.to_str().unwrap()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(

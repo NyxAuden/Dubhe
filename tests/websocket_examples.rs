@@ -22,7 +22,11 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-const BINARY: &str = env!("CARGO_BIN_EXE_dubhe");
+fn binary() -> std::path::PathBuf {
+    std::env::var_os("DUBHE_TEST_BINARY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_dubhe").into())
+}
 const WAIT: Duration = Duration::from_secs(5);
 const EXAMPLES: [(&str, &str); 6] = [
     ("vless-ws", include_str!("../examples/vless-ws.json")),
@@ -46,7 +50,7 @@ impl Check {
         let stdout = directory.path().join("stdout.log");
         let stderr = directory.path().join("stderr.log");
         fs::write(&path, configuration).unwrap();
-        let child = Command::new(BINARY)
+        let child = Command::new(binary())
             .arg("check")
             .arg("-c")
             .arg(&path)

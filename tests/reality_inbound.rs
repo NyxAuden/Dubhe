@@ -3,7 +3,7 @@ mod common;
 mod peer;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use common::{Echo, Running, socks_config};
+use common::{Echo, Running, socks_config, test_binary};
 use peer::{ClientOptions, Outer, PreparedClient, TargetGroup, TargetOptions, TargetPeer};
 use serde_json::{Value, json};
 use std::{net::SocketAddr, time::Duration};
@@ -162,7 +162,7 @@ async fn example_placeholder_replacement_real_check_start_and_vision_data() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("reality.json");
     std::fs::write(&file, value.to_string()).unwrap();
-    let checked = std::process::Command::new(env!("CARGO_BIN_EXE_dubhe"))
+    let checked = std::process::Command::new(test_binary())
         .args(["check", "-c"])
         .arg(file)
         .output()

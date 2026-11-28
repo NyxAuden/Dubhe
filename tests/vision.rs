@@ -123,7 +123,7 @@ async fn vision_example_checks_starts_and_transfers_after_placeholder_replacemen
     dubhe::Server::check(&cfg).unwrap();
     let path = cert.dir.path().join("vision-config.json");
     std::fs::write(&path, value.to_string()).unwrap();
-    let checked = std::process::Command::new(env!("CARGO_BIN_EXE_dubhe"))
+    let checked = std::process::Command::new(test_binary())
         .args(["check", "-c"])
         .arg(&path)
         .output()

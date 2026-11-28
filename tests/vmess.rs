@@ -691,7 +691,7 @@ async fn documented_vmess_templates_cli_check_and_real_start_after_placeholder_r
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.json");
         std::fs::write(&path, value.to_string()).unwrap();
-        let result = std::process::Command::new(env!("CARGO_BIN_EXE_dubhe"))
+        let result = std::process::Command::new(test_binary())
             .arg("check")
             .arg("-c")
             .arg(path)

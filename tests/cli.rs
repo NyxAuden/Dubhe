@@ -12,7 +12,11 @@ use common::*;
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 
-const BINARY: &str = env!("CARGO_BIN_EXE_dubhe");
+fn binary() -> std::path::PathBuf {
+    std::env::var_os("DUBHE_TEST_BINARY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_dubhe").into())
+}
 // CLI 子进程启动 + 证书轮换在 2 核 CI runner 上可能超过 5 秒；
 // 这里是等待上限，不是性能断言，放宽不放松正确性要求。
 const WAIT: Duration = Duration::from_secs(20);
@@ -30,7 +34,7 @@ impl CliProcess {
         let directory = tempfile::tempdir().unwrap();
         let stdout = directory.path().join("stdout.log");
         let stderr = directory.path().join("stderr.log");
-        let mut process = Command::new(BINARY);
+        let mut process = Command::new(binary());
         process.arg(command);
         if let Some(configuration) = configuration {
             let path = directory.path().join("config.json");
@@ -138,7 +142,7 @@ async fn export_refuses_a_target_with_no_usable_node() {
     fs::write(&config_path, configuration.to_string()).unwrap();
 
     let export_dir = directory.path().join("all");
-    let status = Command::new(BINARY)
+    let status = Command::new(binary())
         .args([
             "export",
             "-c",
@@ -161,7 +165,7 @@ async fn export_refuses_a_target_with_no_usable_node() {
 
     // 同一个节点导出到 Xray 仍然可行（自定义路径只有它能表达）。
     let xray_dir = directory.path().join("xray");
-    let status = Command::new(BINARY)
+    let status = Command::new(binary())
         .args([
             "export",
             "--to",
@@ -205,7 +209,7 @@ async fn failed_write_keeps_the_previous_config() {
 
     // 目录变成只读：临时文件创建失败，写入必须整体失败。
     fs::set_permissions(&export_dir, fs::Permissions::from_mode(0o500)).unwrap();
-    let status = Command::new(BINARY)
+    let status = Command::new(binary())
         .args([
             "export",
             "--to",
@@ -273,7 +277,7 @@ async fn export_and_convert_outputs_are_owner_only() {
     fs::write(&config_path, configuration.to_string()).unwrap();
 
     let export_dir = directory.path().join("export");
-    let status = Command::new(BINARY)
+    let status = Command::new(binary())
         .args([
             "export",
             "-c",
@@ -304,7 +308,7 @@ async fn export_and_convert_outputs_are_owner_only() {
     // （临时文件 + rename），目录里不能留下 .tmp。
     fs::write(&convert_output, "old").unwrap();
     fs::set_permissions(&convert_output, fs::Permissions::from_mode(0o644)).unwrap();
-    let status = Command::new(BINARY)
+    let status = Command::new(binary())
         .args([
             "convert",
             "-i",

@@ -3,7 +3,7 @@ mod common;
 mod reality_peer;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use common::{Running, socks_config};
+use common::{Running, socks_config, test_binary};
 use dubhe::{Config, Server};
 use reality_peer::{ClientOptions, PreparedClient, TargetBehavior, TargetOptions, TargetPeer};
 use serde_json::{Value, json};
@@ -844,7 +844,7 @@ async fn check_cli_is_local_no_bind_no_target_and_secret_safe_on_errors() {
         }
         let stdout = dir.path().join("stdout");
         let stderr = dir.path().join("stderr");
-        let child = std::process::Command::new(env!("CARGO_BIN_EXE_dubhe"))
+        let child = std::process::Command::new(test_binary())
             .args(["check", "-c"])
             .arg(&path)
             .stdin(Stdio::null())
