@@ -30,6 +30,43 @@ fn empty(snapshot: &Snapshot) -> bool {
     snapshot.connections == 0 && snapshot.tcp_flows == 0 && snapshot.udp_associations == 0
 }
 
+#[tokio::test]
+async fn partial_trojan_connect_releases_only_slot_before_next_login() {
+    let cert = Certificate::new();
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = socks_config();
+    config["inbounds"] = serde_json::json!([cert.inbound()]);
+    config["limits"]["max_connections"] = 1.into();
+    let server = Running::start(config).await;
+    let request = trojan_header(1, address(target.local_addr().unwrap()), PASSWORD);
+    let mut client = cert.connect(server.address).await;
+    client
+        .write_all(&request[..request.len() - 1])
+        .await
+        .unwrap();
+    closed(&mut client).await; // 认证字段正确，但末尾 CRLF 不完整；必须在握手期限内关闭。
+    wait_stats(&server.stats, empty).await;
+    assert!(
+        timeout(Duration::from_millis(50), target.accept())
+            .await
+            .is_err()
+    );
+
+    // Trojan 凭据可跨 TLS 会话复用；不得把它误当成一次性 nonce。
+    for _ in 0..2 {
+        let mut client = cert.connect(server.address).await;
+        client.write_all(&request).await.unwrap();
+        client.write_all(b"x").await.unwrap();
+        let (mut peer, _) = timeout(WAIT, target.accept()).await.unwrap().unwrap();
+        let mut byte = [0];
+        read_exact(&mut peer, &mut byte).await;
+        assert_eq!(byte, *b"x");
+        drop((client, peer));
+        wait_stats(&server.stats, empty).await;
+    }
+    server.shutdown().await;
+}
+
 async fn closed<R: AsyncRead + Unpin>(stream: &mut R) {
     let result = timeout(WAIT, stream.read(&mut [0])).await.unwrap();
     assert!(matches!(result, Ok(0) | Err(_)), "连接仍返回业务数据");

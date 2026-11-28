@@ -682,6 +682,30 @@ async fn receiver_enforces_ciphertext_limit_on_ipv6_before_queueing() {
 }
 
 #[tokio::test]
+async fn cancelled_receive_preserves_socket_and_exact_fit_buffer() {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut buffer = [9; 16];
+    assert!(
+        timeout(Duration::from_millis(20), receive(&socket, &mut buffer))
+            .await
+            .is_err()
+    );
+    for payload in [&[][..], &[7; 16][..]] {
+        sender
+            .send_to(payload, socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (length, truncated, _) = timeout(Duration::from_secs(1), receive(&socket, &mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(&buffer[..length], payload);
+    }
+}
+
+#[tokio::test]
 async fn recvmsg_reports_truncation_instead_of_accepting_prefix() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();

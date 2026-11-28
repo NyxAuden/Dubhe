@@ -81,7 +81,8 @@ async fn receive(socket: &UdpSocket, buffer: &mut [u8]) -> io::Result<(usize, bo
     loop {
         socket.readable().await?;
         match socket.try_io(tokio::io::Interest::READABLE, || {
-            // SAFETY: u8与MaybeUninit<u8>布局一致，socket2不读取或取消初始化输入。
+            // SAFETY: u8 与 MaybeUninit<u8> 布局相同；独占借用不跨 await。
+            // socket2 0.6.5 的 recv_from_vectored 继承 recv_vectored 的保证：不会写入未初始化字节。
             let bytes =
                 unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast(), buffer.len()) };
             let mut slices = [socket2::MaybeUninitSlice::new(bytes)];
